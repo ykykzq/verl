@@ -32,6 +32,10 @@ from verl.utils.device import get_device_id, get_device_name, get_torch_device, 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+# Bounds how long the sender waits for a bucket to be acknowledged. Generous, because one
+# ack covers a full bucket copy plus the receiver loading those weights into the model.
+_ACK_TIMEOUT_MS = int(os.getenv("VERL_WEIGHT_TRANSFER_ACK_TIMEOUT_S", "600")) * 1000
+
 
 class TensorMetadata(TypedDict):
     name: str
@@ -50,7 +54,41 @@ def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) ->
         # in case two processes have different CUDA_VISIBLE_DEVICES
         list_args[6] = device_id
     buffer = func(*list_args)
+    # Reached when the peer exported from an expandable segment: that switches the sender to
+    # the virtual-memory IPC path, whose handle is a variable-length shareable-handle
+    # descriptor rather than the fixed-size legacy one. A torch build without that path
+    # decodes it as a legacy handle and silently lands on a null pointer, which only crashes
+    # later, often as a hard abort inside a C++ consumer.
+    if buffer.numel() > 0 and buffer.data_ptr() == 0:
+        raise RuntimeError(
+            "Rebuilt IPC tensor has a null data pointer. The sending process most likely "
+            "allocated the buffer in an expandable segment, whose IPC handle format this torch "
+            "build cannot decode. Disable expandable segments on the sender (see "
+            "verl.utils.device.set_expandable_segments), align the two torch versions, or fall "
+            "back to shared memory."
+        )
     return buffer
+
+
+def _assert_ipc_exportable(buffer: torch.Tensor) -> None:
+    """Reject a buffer the allocator served from an expandable segment.
+
+    Such memory is exported over the virtual-memory IPC path, producing a handle only a torch
+    build carrying that same path can rebuild. Receivers here may run a different version, so
+    refuse before publishing the handle rather than let it fail at the far end.
+    """
+    addr = buffer.data_ptr()
+    segment = next(
+        (s for s in get_torch_device().memory_snapshot() if s["address"] <= addr < s["address"] + s["total_size"]),
+        None,
+    )
+    if segment is not None and segment.get("is_expandable"):
+        raise RuntimeError(
+            "Weight-transfer buffer was allocated in an expandable segment, whose IPC handle "
+            "format only a matching torch build can rebuild. Disable expandable segments in "
+            "this process (see verl.utils.device.set_expandable_segments) before the buffer is "
+            "allocated, or set use_shm=True to transfer through shared memory instead."
+        )
 
 
 def create_shared_memory(size: int, name: str):
@@ -129,7 +167,7 @@ class BucketedWeightSender:
                 if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
                     get_torch_device().synchronize()
                     self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
-                    self.socket.recv()
+                    self._recv_ack()
                     bucket_meta = {}
                     offset = 0
 
@@ -156,7 +194,7 @@ class BucketedWeightSender:
             # send the last bucket
             get_torch_device().synchronize()
             self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
-            self.socket.recv()
+            self._recv_ack()
         finally:
             self._cleanup()
 
@@ -169,13 +207,28 @@ class BucketedWeightSender:
             except OSError:
                 pass
         self.socket = self.zmq_context.socket(zmq.REQ)
+        # Without a deadline, a receiver that dies mid-transfer leaves this side blocked
+        # forever: its exception lives in an unawaited task, so nothing reports the failure.
+        self.socket.setsockopt(zmq.RCVTIMEO, _ACK_TIMEOUT_MS)
         self.socket.bind(self.zmq_handle)
+
+    def _recv_ack(self):
+        """Wait for the receiver to acknowledge, failing loudly if it went away."""
+        try:
+            return self.socket.recv()
+        except zmq.Again as e:
+            raise RuntimeError(
+                f"Weight-transfer receiver did not acknowledge within {_ACK_TIMEOUT_MS // 1000}s. "
+                "It most likely raised; check the receiving actor's task error (a device OOM "
+                "during the weight update is the usual cause)."
+            ) from e
 
     def _init_buffer(self):
         """build communication buffer"""
         buffer, shm = None, None
         if not self.use_shm:
             buffer = torch.empty(self.bucket_size, dtype=torch.uint8, device=f"{get_device_name()}:{get_device_id()}")
+            _assert_ipc_exportable(buffer)
             handle = reduce_tensor(buffer)
             self.socket.send_pyobj(handle)
         else:
@@ -189,7 +242,7 @@ class BucketedWeightSender:
             comm_metadata = {"name": shm_name, "size": self.bucket_size}
             self.socket.send_pyobj(comm_metadata)
 
-        self.socket.recv()
+        self._recv_ack()
         self.buffer = buffer
         self.shm = shm
 
@@ -230,7 +283,7 @@ class BucketedWeightSender:
             "handle": handle,
         }
         self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
-        self.socket.recv()
+        self._recv_ack()
 
 
 class BucketedWeightReceiver:

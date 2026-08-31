@@ -19,6 +19,7 @@ and because CUDA IPC requires distinct processes.
 
 import asyncio
 import multiprocessing as mp
+import os
 import uuid
 
 import pytest
@@ -289,3 +290,194 @@ class TestBucketedWeightTransferIPC:
         specs.append(("lm_head", (1024, 1024), torch.float32))  # 4MB
 
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=False)
+
+
+# ---------------------------------------------------------------------------
+# Buffer-reuse contract
+# ---------------------------------------------------------------------------
+# Half a 1 MB bucket in bfloat16, so exactly two tensors fill one bucket.
+_PAIRED_NUMEL = (1 << 19) // 2
+# Interleaved so every pair straddles a bucket boundary except the last, which
+# serves as the in-bucket control.
+_PAIRED_NAMES = ["a0", "b0", "a1", "b1", "c0", "c1"]
+_PAIRS = [("a0", "a1"), ("b0", "b1"), ("c0", "c1")]
+
+
+def _paired_sender_fn(zmq_handle, use_shm):
+    """Sender process: each tensor is filled with its own index so it is self-identifying."""
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+
+    device = torch.device(f"{get_device_name()}:0")
+    weights = [
+        (name, torch.full((_PAIRED_NUMEL,), float(i), dtype=torch.bfloat16, device=device))
+        for i, name in enumerate(_PAIRED_NAMES)
+    ]
+    sender = BucketedWeightSender(zmq_handle=zmq_handle, bucket_size_mb=1, use_shm=use_shm)
+    asyncio.run(sender.async_send_weights(iter(weights)))
+
+
+def _paired_receiver_fn(zmq_handle, use_shm, copy_retained, result_queue):
+    """Receiver process: hold each pair's first member until its partner arrives."""
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+    device = torch.device(f"{get_device_name()}:0")
+    receiver = BucketedWeightReceiver(zmq_handle=zmq_handle, device=device, use_shm=use_shm)
+    pending, observed = {}, {}
+
+    def on_bucket_received(weights, is_last):
+        pending.update(weights)
+        for left, right in _PAIRS:
+            if left in pending and right in pending:
+                for name in (left, right):
+                    observed[name] = pending.pop(name).min().item()
+        if copy_retained:
+            for name in list(pending):
+                pending[name] = pending[name].clone()
+
+    receiver.receive_weights(on_bucket_received)
+    result_queue.put(observed)
+
+
+def _run_paired_transfer(use_shm, copy_retained):
+    zmq_handle = _unique_zmq_handle()
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    sender_p = ctx.Process(target=_paired_sender_fn, args=(zmq_handle, use_shm))
+    receiver_p = ctx.Process(target=_paired_receiver_fn, args=(zmq_handle, use_shm, copy_retained, result_queue))
+    sender_p.start()
+    receiver_p.start()
+    sender_p.join(timeout=PROCESS_TIMEOUT)
+    receiver_p.join(timeout=PROCESS_TIMEOUT)
+    assert sender_p.exitcode == 0, f"Sender failed with exit code {sender_p.exitcode}"
+    assert receiver_p.exitcode == 0, f"Receiver failed with exit code {receiver_p.exitcode}"
+    return result_queue.get(timeout=5)
+
+
+@pytest.mark.skipif(not HAS_ACCELERATOR, reason="Requires an accelerator")
+@pytest.mark.parametrize("use_shm", [True, False])
+def test_consumer_must_copy_tensors_retained_across_buckets(use_shm):
+    """A consumer that fuses several source tensors has to hold the ones that arrived first.
+
+    On the IPC path those are views into a buffer the sender refills for the next bucket, so
+    holding one without copying silently reads the next bucket's contents. The shared-memory
+    path stages each tensor onto the device first, so its tensors are already private.
+    """
+    if not use_shm and not is_support_ipc():
+        pytest.skip("Requires IPC support")
+
+    expected = {name: float(i) for i, name in enumerate(_PAIRED_NAMES)}
+
+    assert _run_paired_transfer(use_shm, copy_retained=True) == expected
+
+    without_copy = _run_paired_transfer(use_shm, copy_retained=False)
+    corrupted = {name for name, value in without_copy.items() if value != expected[name]}
+    # a0 and b0 are the members whose partner only arrives in the next bucket.
+    assert corrupted == (set() if use_shm else {"a0", "b0"}), (
+        f"unexpected corruption pattern for use_shm={use_shm}: {without_copy}"
+    )
+
+
+def _multi_round_sender_fn(zmq_handle, use_shm, rounds):
+    """Sender process that stays alive across rounds, as the real trainer does."""
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+
+    device = torch.device(f"{get_device_name()}:0")
+    for r in range(rounds):
+        weights = [
+            (name, torch.full((_PAIRED_NUMEL,), float(i + 100 * r), dtype=torch.bfloat16, device=device))
+            for i, name in enumerate(_PAIRED_NAMES)
+        ]
+        sender = BucketedWeightSender(zmq_handle=zmq_handle, bucket_size_mb=1, use_shm=use_shm)
+        asyncio.run(sender.async_send_weights(iter(weights)))
+
+
+def _multi_round_receiver_fn(zmq_handle, use_shm, rounds, result_queue):
+    """Receiver process that stays alive across rounds, as the real rollout server does."""
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+    device = torch.device(f"{get_device_name()}:0")
+    per_round = []
+    for _ in range(rounds):
+        receiver = BucketedWeightReceiver(zmq_handle=zmq_handle, device=device, use_shm=use_shm)
+        observed = {}
+        receiver.receive_weights(lambda w, is_last, into=observed: into.update({n: t.min().item() for n, t in w}))
+        per_round.append(observed)
+    result_queue.put(per_round)
+
+
+@pytest.mark.skipif(not HAS_ACCELERATOR, reason="Requires an accelerator")
+@pytest.mark.parametrize("use_shm", [True, False])
+def test_consecutive_rounds_reuse_one_socket_path(use_shm):
+    """Weight sync runs once per training step, reusing the same endpoint every time.
+
+    The sender unlinks and rebinds the socket each round while the receiver reconnects, so a
+    round can only be trusted if the previous one left no state behind.
+    """
+    if not use_shm and not is_support_ipc():
+        pytest.skip("Requires IPC support")
+
+    rounds = 3
+    zmq_handle = _unique_zmq_handle()
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    sender_p = ctx.Process(target=_multi_round_sender_fn, args=(zmq_handle, use_shm, rounds))
+    receiver_p = ctx.Process(target=_multi_round_receiver_fn, args=(zmq_handle, use_shm, rounds, result_queue))
+    sender_p.start()
+    receiver_p.start()
+    sender_p.join(timeout=PROCESS_TIMEOUT)
+    receiver_p.join(timeout=PROCESS_TIMEOUT)
+
+    assert sender_p.exitcode == 0, f"Sender failed with exit code {sender_p.exitcode}"
+    assert receiver_p.exitcode == 0, f"Receiver failed with exit code {receiver_p.exitcode}"
+
+    per_round = result_queue.get(timeout=5)
+    assert per_round == [{name: float(i + 100 * r) for i, name in enumerate(_PAIRED_NAMES)} for r in range(rounds)]
+
+
+def _failing_receiver_fn(zmq_handle, use_shm):
+    """Receiver that completes the handshake and then raises, never acknowledging a bucket."""
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+    device = torch.device(f"{get_device_name()}:0")
+    receiver = BucketedWeightReceiver(zmq_handle=zmq_handle, device=device, use_shm=use_shm)
+
+    def explode(weights, is_last):
+        raise RuntimeError("simulated receiver failure")
+
+    receiver.receive_weights(explode)
+
+
+def _timeout_sender_fn(zmq_handle, use_shm, timeout_s, result_queue):
+    # Set before the module is imported, since the deadline is a module-level constant.
+    os.environ["VERL_WEIGHT_TRANSFER_ACK_TIMEOUT_S"] = str(timeout_s)
+    try:
+        _multi_round_sender_fn(zmq_handle, use_shm, rounds=1)
+    except Exception as e:
+        result_queue.put((type(e).__name__, str(e)))
+        return
+    result_queue.put(None)
+
+
+@pytest.mark.skipif(not HAS_ACCELERATOR, reason="Requires an accelerator")
+def test_sender_fails_instead_of_hanging_when_receiver_dies():
+    """A receiver's exception lives in an unawaited task, so the sender must not wait forever."""
+    if not is_support_ipc():
+        pytest.skip("Requires IPC support")
+
+    zmq_handle = _unique_zmq_handle()
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    receiver_p = ctx.Process(target=_failing_receiver_fn, args=(zmq_handle, False))
+    sender_p = ctx.Process(target=_timeout_sender_fn, args=(zmq_handle, False, 5, result_queue))
+    sender_p.start()
+    receiver_p.start()
+
+    sender_p.join(timeout=PROCESS_TIMEOUT)
+    receiver_p.join(timeout=PROCESS_TIMEOUT)
+
+    assert sender_p.exitcode is not None, "Sender hung instead of timing out on the missing ack"
+    raised = result_queue.get(timeout=5)
+    assert raised is not None, "Sender reported success even though no ack ever arrived"
+    exc_name, message = raised
+    assert exc_name == "RuntimeError", f"unexpected failure from the sender: {exc_name}: {message}"
+    assert "did not acknowledge" in message, message
