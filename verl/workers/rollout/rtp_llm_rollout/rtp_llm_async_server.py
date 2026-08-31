@@ -148,6 +148,7 @@ class RTPLLMHttpServer:
         self._generation_allowed = asyncio.Event()
         self._generation_allowed.set()
         self._abort_requested = False
+        self._request_admission_lock = asyncio.Lock()
         self._inflight: dict[str, asyncio.Future] = {}
         self._request_counter = itertools.count(1)
 
@@ -420,8 +421,9 @@ class RTPLLMHttpServer:
             return_logits=False,
             return_hidden_states=False,
             ignore_eos=False,
-            # Weights change every sync, so KV computed under older weights must not be reused.
-            reuse_cache=False,
+            # Reuse is valid within one weight version; release_kv_cache() clears
+            # all reusable entries before the next weight sync.
+            reuse_cache=True,
             # An unset timeout falls back to rtp-llm's 2h max_rpc_timeout_ms, so a stall would
             # only surface after two hours; bound it so failures are visible quickly.
             timeout_ms=int(float(os.environ.get("VERL_RTP_LLM_GENERATE_TIMEOUT_S", "3600")) * 1000),
@@ -441,8 +443,6 @@ class RTPLLMHttpServer:
             raise NotImplementedError("rtp-llm rollout does not support multimodal inputs yet.")
 
         from rtp_llm.utils.base_model_datatypes import GenerateInput
-
-        await self._generation_allowed.wait()
 
         requested = sampling_params.get("max_tokens") or sampling_params.get("max_new_tokens")
         max_tokens = requested if requested else self.config.response_length
@@ -472,10 +472,19 @@ class RTPLLMHttpServer:
             finally:
                 await stream.aclose()
 
-        # Consume in a task so abort_all_requests can cancel it: a request still queued
-        # for kv cache blocks never yields, so a cooperative flag would not reach it.
-        task = asyncio.ensure_future(consume())
-        self._inflight[request_id] = task
+        # Admission and registration are one atomic operation with abort_all_requests.
+        # Without this lock, a coroutine that already passed Event.wait() could enqueue
+        # after the drain snapshot and race the weight transition.
+        while True:
+            async with self._request_admission_lock:
+                if self._generation_allowed.is_set() and not self._abort_requested:
+                    # Consume in a task so abort_all_requests can cancel it: a request
+                    # still queued for kv cache blocks never yields, so a cooperative
+                    # flag would not reach it.
+                    task = asyncio.ensure_future(consume())
+                    self._inflight[request_id] = task
+                    break
+            await self._generation_allowed.wait()
         aborted = False
         try:
             await task
@@ -487,7 +496,8 @@ class RTPLLMHttpServer:
             aborted = True
             logger.warning(f"rtp-llm generate {request_id} failed after {len(token_ids)} tokens: {e}")
         finally:
-            self._inflight.pop(request_id, None)
+            async with self._request_admission_lock:
+                self._inflight.pop(request_id, None)
 
         # A completed request must expose its generated response. An aborted request may
         # legitimately have no token yet and will be resumed by the fully-async client.
@@ -520,29 +530,67 @@ class RTPLLMHttpServer:
         Cancelling each consumer task propagates a gRPC cancel, which frees the stream's
         kv cache blocks even when it was still queued and never produced a token.
         """
-        self._generation_allowed.clear()
-        self._abort_requested = True
-        tasks = list(self._inflight.values())
+        async with self._request_admission_lock:
+            self._generation_allowed.clear()
+            self._abort_requested = True
+            tasks = list(self._inflight.values())
         for task in tasks:
             task.cancel()
         if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=120)
+            _, pending = await asyncio.wait(tasks, timeout=120)
             if pending:
-                logger.warning(f"abort_all_requests: {len(pending)} requests did not wind down in 120s")
+                logger.error(f"abort_all_requests: {len(pending)} requests did not wind down in 120s")
+                raise RuntimeError(
+                    f"cannot clear KV cache while {len(pending)} request(s) remain pending after drain"
+                )
+        # Let cancelled consumer continuations run their finally blocks before checking
+        # the registry. New admissions are already blocked by the state set above.
+        await asyncio.sleep(0)
+        async with self._request_admission_lock:
+            if self._inflight:
+                raise RuntimeError(
+                    f"cannot clear KV cache while {len(self._inflight)} request(s) remain registered"
+                )
 
     async def resume_generation(self):
-        self._abort_requested = False
-        self._generation_allowed.set()
+        async with self._request_admission_lock:
+            self._abort_requested = False
+            self._generation_allowed.set()
 
     async def clear_kv_cache(self):
-        # reuse_cache is off for RL, so there is no cross-request prefix cache to invalidate.
-        pass
+        """Clear reusable device-cache entries after generation has drained.
+
+        The C++ cache manager removes BlockCache mappings and returns only
+        unreferenced blocks to the existing pool. It covers every cache group,
+        including the linear-attention state group used by Qwen3.5.
+        """
+        async with self._request_admission_lock:
+            if self._generation_allowed.is_set() or not self._abort_requested:
+                raise RuntimeError("clear_kv_cache requires generation to be paused after abort/drain")
+            if self._inflight:
+                raise RuntimeError(
+                    f"clear_kv_cache refused while {len(self._inflight)} request(s) remain in flight"
+                )
+        if self.engine is None:
+            raise RuntimeError("clear_kv_cache called before the rtp-llm engine was initialized")
+        clear_fn = getattr(self.engine, "clear_kv_cache", None)
+        if clear_fn is None:
+            raise RuntimeError("the rtp-llm engine binding does not expose clear_kv_cache")
+        await asyncio.to_thread(clear_fn)
+        logger.info("rtp-llm reusable KV cache cleared; backing KV pool retained")
 
     async def release_kv_cache(self):
-        pass
+        """Drop reusable KV entries before the checkpoint engine writes weights.
+
+        rtp-llm keeps the backing KV pool allocated across steps, so release is
+        only the cache-mapping/resource transition described by clear_kv_cache.
+        """
+        await self.clear_kv_cache()
 
     async def resume_kv_cache(self):
-        pass
+        # clear_kv_cache() retains the pool and the allocator will lazily reuse
+        # its free blocks on the first request after the weight transition.
+        return None
 
     async def wake_up(self, tags: Optional[list[str]] = None):
         if self.rollout_mode != RolloutMode.STANDALONE:

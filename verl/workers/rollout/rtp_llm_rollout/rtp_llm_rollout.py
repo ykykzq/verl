@@ -169,7 +169,6 @@ class ServerAdapter(BaseRollout):
         await sender.async_send_weights(prepared())
         await future
 
-        await self.server_handle.clear_kv_cache.remote()
         if global_steps is not None:
             await self.server_handle.set_global_steps.remote(global_steps)
 

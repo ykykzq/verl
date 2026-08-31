@@ -176,7 +176,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=True \
-    actor_rollout_ref.rollout.enable_prefix_caching=False \
+    actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k=${top_k} \
