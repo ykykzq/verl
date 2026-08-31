@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -664,6 +665,9 @@ class vLLMHttpServer:
                 extra_fields=extra_fields,
             )
 
+        # Prefix-cache hit count for this request; consumers surface it as
+        # OpenAI usage.prompt_tokens_details.cached_tokens.
+        extra_fields["num_cached_tokens"] = getattr(final_res, "num_cached_tokens", None)
         extract_prompt_logprobs(
             output=final_res,
             num_prompt_logprobs=sampling_params.prompt_logprobs,
@@ -835,16 +839,23 @@ class vLLMHttpServer:
             await self.engine.reset_encoder_cache()
 
     async def release_kv_cache(self):
-        """Release only kv_cache GPU memory, keeping model weights intact.
-        # TODO: support true release of kv_cache
-        """
+        """Free the kv_cache pool for the duration of a weight sync."""
+        # TODO: use the real release_kv_cache() method after vllm supports it (vllm#44890/46438)
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
+        if self.rollout_mode == RolloutMode.COLOCATED:
+            return
+        await self.engine.sleep(level=self._resolve_sleep_level())
+        await self.engine.wake_up(tags=["weights"])
 
     async def resume_kv_cache(self):
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
-        if self.node_rank != 0:
+        if self.node_rank != 0 or not self.config.free_cache_engine:
             return
+        if self.rollout_mode == RolloutMode.COLOCATED:
+            return
+        await self.engine.wake_up(tags=["kv_cache"])
+        await self.engine.reset_prefix_cache(reset_connector=True)
 
     def _should_profile(self) -> bool:
         """Whether this replica drives the engine profiler."""
@@ -920,9 +931,11 @@ class vLLMHttpServer:
             logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
-        except Exception as e:
-            logger.error(f"Error aborting requests: {e}")
-            return {"aborted_count": 0, "request_ids": [], "error": str(e)}
+        except Exception:
+            # Weight updates must not proceed unless every in-flight request was
+            # actually aborted and the old-weight caches were cleared.
+            logger.exception("Error aborting requests")
+            raise
 
     async def resume_generation(self):
         """Resume generation after abort_all_requests (pause_generation)."""
@@ -1013,6 +1026,62 @@ class vLLMHttpServer:
             # Work around multimodal processor cache desync across pause/resume.
             # See: https://github.com/vllm-project/vllm/pull/43001/
             engine_kwargs.setdefault("mm_processor_cache_gb", 0)
+
+        checkpoint_config = getattr(self.config, "checkpoint_engine", None)
+        if getattr(checkpoint_config, "backend", None) == "delta_sharded":
+            from verl.workers.rollout.vllm_rollout.delta_weight_transfer import (
+                VERL_DELTA_WEIGHT_TRANSFER_BACKEND,
+                is_moe_model,
+                require_vllm_delta_support,
+            )
+
+            require_vllm_delta_support()
+            delta_engine_kwargs = getattr(checkpoint_config, "engine_kwargs", {}).get("delta_sharded", {})
+            if int(delta_engine_kwargs.get("verify_every", 0)) > 0:
+                raise NotImplementedError("delta_sharded with vLLM does not support verify_every > 0")
+            if self.config.data_parallel_size != 1:
+                raise NotImplementedError("delta_sharded with vLLM requires data_parallel_size=1")
+            if self.config.disaggregation.enabled:
+                raise NotImplementedError("delta_sharded with vLLM does not support PD disaggregation")
+            # config.pipeline_model_parallel_size > 1 is already rejected globally;
+            # engine_kwargs is forwarded verbatim to vLLM, so close topology
+            # override paths that would bypass VERL's worker and IPC mapping.
+            if int(engine_kwargs.get("data_parallel_size") or 1) > 1:
+                raise NotImplementedError("delta_sharded with vLLM requires data_parallel_size=1")
+            if int(engine_kwargs.get("pipeline_parallel_size") or 1) > 1:
+                raise NotImplementedError("delta_sharded with vLLM requires pipeline_parallel_size=1")
+            engine_tp_size = engine_kwargs.get("tensor_parallel_size")
+            if engine_tp_size is not None and int(engine_tp_size) != self.config.tensor_model_parallel_size:
+                raise NotImplementedError(
+                    "delta_sharded with vLLM requires engine_kwargs tensor_parallel_size to match "
+                    "rollout.tensor_model_parallel_size"
+                )
+
+            if is_moe_model(self.model_config.hf_config):
+                moe_backend = engine_kwargs.get("moe_backend")
+                if moe_backend not in {None, "auto", "triton"}:
+                    raise NotImplementedError(
+                        f"delta_sharded with vLLM MoE requires moe_backend='triton'; got {moe_backend!r}"
+                    )
+                engine_kwargs["moe_backend"] = "triton"
+                if engine_kwargs.get("enable_eplb", False):
+                    raise NotImplementedError("delta_sharded with vLLM MoE does not support EPLB")
+
+            weight_transfer_config = engine_kwargs.get("weight_transfer_config")
+            if weight_transfer_config is None:
+                weight_transfer_backend = None
+            elif isinstance(weight_transfer_config, Mapping):
+                weight_transfer_backend = weight_transfer_config.get("backend")
+            else:
+                raise TypeError("weight_transfer_config must be a mapping when using delta_sharded")
+
+            if weight_transfer_backend not in {None, VERL_DELTA_WEIGHT_TRANSFER_BACKEND}:
+                raise ValueError(
+                    "checkpoint_engine.backend='delta_sharded' requires vLLM "
+                    f"weight transfer backend {VERL_DELTA_WEIGHT_TRANSFER_BACKEND!r}, "
+                    f"but got {weight_transfer_backend!r}"
+                )
+            engine_kwargs["weight_transfer_config"] = {"backend": VERL_DELTA_WEIGHT_TRANSFER_BACKEND}
 
     def _get_override_generation_config(self) -> dict:
         """Return the override_generation_config dict."""
@@ -1106,6 +1175,24 @@ class vLLMHttpServer:
         """Return the tags passed to engine.wake_up(). Default includes kv_cache."""
         return ["kv_cache", "weights"]
 
+    def _resolve_sleep_level(self) -> int:
+        """Deepest sleep level whose discarded state a subsequent weight sync can restore.
+
+        MTP drafter-only weights are initialized by vLLM and are not guaranteed
+        to be restored by actor weight sync after level 2 sleep discards them.
+        lora only update adapter weights, so set sleep level to 1.
+        vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
+        """
+        mtp_config = getattr(self.config, "mtp", None)
+        mtp_rollout_enabled = (
+            mtp_config is not None
+            and getattr(mtp_config, "enable", False)
+            and getattr(mtp_config, "enable_rollout", False)
+        )
+        if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
+            return 1
+        return 2
+
     async def _sleep_hybrid(self):
         """HYBRID sleep: adapters and MTP need level=1; full weights need level=2.
 
@@ -1115,21 +1202,7 @@ class vLLMHttpServer:
         leaving other DP shards' weights unreleased, which causes OOM during
         FSDP training backward when DP > 1.
         """
-        mtp_config = getattr(self.config, "mtp", None)
-        mtp_rollout_enabled = (
-            mtp_config is not None
-            and getattr(mtp_config, "enable", False)
-            and getattr(mtp_config, "enable_rollout", False)
-        )
-        # MTP drafter-only weights are initialized by vLLM and are not guaranteed
-        # to be restored by actor weight sync after level 2 sleep discards them.
-        # lora only update adapter weights, so set sleep level to 1
-        # vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
-        if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
-            sleep_level = 1
-        else:
-            sleep_level = 2
-        await self.engine.sleep(level=sleep_level)
+        await self.engine.sleep(level=self._resolve_sleep_level())
         await self.engine.reset_encoder_cache()
 
 
