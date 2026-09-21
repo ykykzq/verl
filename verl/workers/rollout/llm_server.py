@@ -20,12 +20,13 @@ Utility classes for manage and request LLM servers:
 import asyncio
 import logging
 import os
+from dataclasses import asdict, is_dataclass
 from typing import Any, Optional
 from uuid import uuid4
 
 import numpy as np
 import ray
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import normalize_token_ids
@@ -38,6 +39,8 @@ from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_ROUTE_SERVER_ID_FIELD = "_verl_route_server_id"
 
 
 class LLMServerClient:
@@ -67,6 +70,13 @@ class LLMServerClient:
         self._lb_require_acquire_fields: list[str] | None = None
         self._lb_require_release_fields: list[str] | None = None
 
+    def _trajectory_migration_config(self) -> Any | None:
+        rollout_config = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
+        migration_config = getattr(rollout_config, "trajectory_migration", None)
+        if migration_config is None or not bool(getattr(migration_config, "enabled", False)):
+            return None
+        return migration_config
+
     async def _acquire_server(self, request_id: str, **extra) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
         # Only the declared fields are serialized.
@@ -91,9 +101,22 @@ class LLMServerClient:
         # request_id passed to vLLM. Default: a fresh uuid per turn so each turn
         # is an independent vLLM request. Under full_determinism the caller's
         # request_id is passed straight through so vLLM sees a stable id across runs.
-        if getattr(self.config.actor_rollout_ref.rollout, "full_determinism", False):
+        if (
+            getattr(self.config.actor_rollout_ref.rollout, "full_determinism", False)
+            or self._trajectory_migration_config() is not None
+        ):
             return request_id
         return uuid4().hex
+
+    async def abort_trajectory(self, request_id: str) -> dict[str, Any]:
+        """Stop one active trajectory on its currently routed replica."""
+        if self._trajectory_migration_config() is None:
+            return {
+                "aborted": False,
+                "request_id": request_id,
+                "reason": "trajectory migration is disabled",
+            }
+        return await self._load_balancer.abort_trajectory.remote(request_id)
 
     @rollout_trace_op
     async def generate(
@@ -160,6 +183,8 @@ class LLMServerClient:
             global_steps = output.extra_fields.get("global_steps")
             output.extra_fields.setdefault("min_global_steps", global_steps)
             output.extra_fields.setdefault("max_global_steps", global_steps)
+            if self._trajectory_migration_config() is not None:
+                output.extra_fields[_ROUTE_SERVER_ID_FIELD] = server_id
             return output
         finally:
             self._release_server(
@@ -221,6 +246,126 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             return response_length
         return None
 
+    async def _rollback_trajectory_migration(
+        self,
+        request_id: str,
+        decision_id: str,
+        target_server: ray.actor.ActorHandle,
+        ticket: dict[str, Any] | None,
+    ) -> None:
+        if ticket is not None and ticket.get("prefix_digest") is not None:
+            try:
+                await target_server.discard_trajectory_migration.remote(
+                    request_id=request_id,
+                    prefix_digest=ticket["prefix_digest"],
+                )
+            except Exception:
+                logger.exception("failed to discard target-side trajectory state for %s", request_id)
+        try:
+            await self._load_balancer.cancel_trajectory_migration.remote(
+                request_id=request_id,
+                decision_id=decision_id,
+            )
+        except Exception:
+            logger.exception("failed to cancel trajectory migration reservation for %s", request_id)
+
+    async def _try_migrate_trajectory(
+        self,
+        request_id: str,
+        source_server_id: str,
+        prompt_ids: list[int],
+        final_output: TokenOutput,
+        checkpoint_index: int,
+        source_weight_version: Any,
+        sampling_params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        migration_config = self._trajectory_migration_config()
+        if migration_config is None or self._load_balancer is None:
+            return None
+
+        trajectory_summary = {
+            "request_id": request_id,
+            "prompt_tokens": len(prompt_ids),
+            "generated_tokens": len(final_output.token_ids),
+            "prefix_tokens": len(prompt_ids) + len(final_output.token_ids),
+            "checkpoint_index": checkpoint_index,
+        }
+        source_metadata = {
+            "weight_version": "initial" if source_weight_version is None else source_weight_version,
+        }
+        decision = await self._load_balancer.plan_trajectory_migration.remote(
+            request_id=request_id,
+            source_server_id=source_server_id,
+            trajectory=trajectory_summary,
+            source_metadata=source_metadata,
+        )
+        if not decision.get("migrate", False):
+            return None
+
+        decision_id = decision["decision_id"]
+        timeout_s = float(getattr(migration_config, "transfer_timeout_s", 30.0))
+        trajectory_state = {
+            "request_id": request_id,
+            "prompt_ids": prompt_ids,
+            "generated_token_ids": list(final_output.token_ids),
+            "checkpoint_index": checkpoint_index,
+            "sampling_params": dict(sampling_params),
+        }
+        ticket = None
+        try:
+            ticket = await asyncio.wait_for(
+                decision["source_server"].prepare_trajectory_migration.remote(
+                    trajectory_state=trajectory_state,
+                    target_metadata=decision["target_metadata"],
+                    backend=str(getattr(migration_config, "kv_transfer_backend", "remote_prefix")),
+                    timeout_s=timeout_s,
+                ),
+                timeout=timeout_s,
+            )
+            accepted = await asyncio.wait_for(
+                decision["target_server"].accept_trajectory_migration.remote(
+                    ticket=ticket,
+                    trajectory_state=trajectory_state,
+                ),
+                timeout=timeout_s,
+            )
+            if not accepted.get("accepted", False):
+                raise RuntimeError(accepted.get("reason", "target rejected trajectory transfer"))
+            await self._load_balancer.commit_trajectory_migration.remote(
+                request_id=request_id,
+                decision_id=decision_id,
+            )
+            return {
+                "source_server_id": source_server_id,
+                "target_server_id": decision["target_server_id"],
+                "checkpoint_index": checkpoint_index,
+                "prefix_tokens": trajectory_summary["prefix_tokens"],
+                "backend": ticket["backend"],
+            }
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                self._rollback_trajectory_migration(
+                    request_id=request_id,
+                    decision_id=decision_id,
+                    target_server=decision["target_server"],
+                    ticket=ticket,
+                )
+            )
+            raise
+        except Exception:
+            await self._rollback_trajectory_migration(
+                request_id=request_id,
+                decision_id=decision_id,
+                target_server=decision["target_server"],
+                ticket=ticket,
+            )
+            logger.exception(
+                "trajectory migration failed; keeping %s on replica %s",
+                request_id,
+                source_server_id,
+            )
+            return None
+
     @rollout_trace_op
     async def generate(
         self,
@@ -261,6 +406,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         # turns, so never mutate the caller's copy.
         sampling_params = dict(sampling_params)
 
+        migration_config = self._trajectory_migration_config()
+        checkpoint_tokens = int(getattr(migration_config, "checkpoint_tokens", 0)) if migration_config else None
+
         if original_max_tokens is None:
             # Without an explicit limit each attempt falls back to the server-side default, which is
             # derived from len(prompt_ids) and is only correct on the first attempt: a resume passes
@@ -285,8 +433,18 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         # must carry it forward explicitly or the consumer sees 0. Take the first
         # (initial-prompt) prefill's hit count, matching single-prefill semantics.
         num_cached_tokens = None
+        migration_history: list[dict[str, Any]] = []
+        checkpoint_index = 0
 
         while True:
+            if migration_config is not None:
+                if original_max_tokens is None or limit_key is None:
+                    raise ValueError(
+                        "trajectory migration requires an explicit max_tokens/max_new_tokens or rollout.response_length"
+                    )
+                remaining_tokens = original_max_tokens - len(final_output.token_ids)
+                sampling_params[limit_key] = min(checkpoint_tokens, remaining_tokens)
+
             # 1. generate tokens
             output = await super().generate(
                 request_id=request_id,
@@ -322,6 +480,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
+            source_server_id = output.extra_fields.pop(_ROUTE_SERVER_ID_FIELD, None)
             if min_global_steps is None:
                 min_global_steps = global_steps
             max_global_steps = global_steps
@@ -332,6 +491,23 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 if len(final_output.token_ids) >= original_max_tokens:
                     final_output.stop_reason = "length"
                     break
+
+            if migration_config is not None and output.extra_fields.get("migration_checkpoint", False):
+                checkpoint_index += 1
+                if source_server_id is None:
+                    raise RuntimeError("rollout server response did not include its routed replica")
+                migration = await self._try_migrate_trajectory(
+                    request_id=request_id,
+                    source_server_id=source_server_id,
+                    prompt_ids=prompt_ids,
+                    final_output=final_output,
+                    checkpoint_index=checkpoint_index,
+                    source_weight_version=global_steps,
+                    sampling_params=sampling_params,
+                )
+                if migration is not None:
+                    migration_history.append(migration)
+                continue
 
             # 4. check stop reason
             # If partial rollout not enable, aborted samples will be dropped.
@@ -348,6 +524,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
         final_output.extra_fields["num_cached_tokens"] = num_cached_tokens
+        if migration_config is not None:
+            final_output.extra_fields["trajectory_migrations"] = migration_history
         return final_output
 
 
@@ -484,6 +662,14 @@ class LLMServerManager:
 
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
+        self.server_metadata = {}
+        migration_config = getattr(self.rollout_config, "trajectory_migration", None)
+        if getattr(migration_config, "enabled", False):
+            for address, handle in zip(self.server_addresses, self.server_handles, strict=True):
+                try:
+                    self.server_metadata[address] = await handle.get_trajectory_migration_capabilities.remote()
+                except AttributeError:
+                    self.server_metadata[address] = {}
         print(f"LLMServerManager: {self.server_addresses}")
 
         # Update Prometheus / rl-insight metrics with server addresses
@@ -506,11 +692,20 @@ class LLMServerManager:
     async def _init_global_load_balancer(self) -> None:
         from verl.workers.rollout.router import get_router_handle
 
+        migration_config = getattr(self.rollout_config, "trajectory_migration", None)
+        if isinstance(migration_config, DictConfig):
+            migration_config = OmegaConf.to_container(migration_config, resolve=True)
+        elif is_dataclass(migration_config):
+            migration_config = asdict(migration_config)
+        elif migration_config is not None:
+            migration_config = dict(migration_config)
         self.global_load_balancer = get_router_handle(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             router_config_path=getattr(self.rollout_config, "router_config_path", None),
             full_determinism=getattr(self.rollout_config, "full_determinism", False),
             load_balancer_cls=self._load_balancer_cls,
+            trajectory_migration_config=migration_config,
+            server_metadata=getattr(self, "server_metadata", {}),
         )
 
     def get_client(self, client_cls: type[LLMServerClient] | None = None, **kwargs) -> LLMServerClient:
@@ -518,13 +713,16 @@ class LLMServerManager:
 
         Args:
             client_cls: The client class to instantiate. Defaults to
-                :class:`LLMServerClient`. Pass a subclass to customize
+                :class:`FullyAsyncLLMServerClient` when trajectory migration is enabled,
+                otherwise :class:`LLMServerClient`. Pass a subclass to customize
                 request-id handling (e.g. a deterministic client that forwards
                 the caller's ``request_id`` straight to vLLM), or
                 :class:`FullyAsyncLLMServerClient` for abort-resume support.
             **kwargs: Forwarded to the client constructor.
         """
-        client_cls = client_cls or LLMServerClient
+        if client_cls is None:
+            migration_config = getattr(self.rollout_config, "trajectory_migration", None)
+            client_cls = FullyAsyncLLMServerClient if getattr(migration_config, "enabled", False) else LLMServerClient
         return client_cls(
             config=self.config,
             load_balancer_handle=self.global_load_balancer,

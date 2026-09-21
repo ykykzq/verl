@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import logging
 import os
 import random
 from typing import Any, Protocol
+from uuid import uuid4
 
 import ray
 from cachetools import LRUCache
 from omegaconf import OmegaConf
 
 from verl.utils.import_utils import load_class_from_fqn, resolve_config_path
+from verl.workers.rollout.trajectory_scheduler import ReplicaSnapshot, TrajectoryScheduler
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -158,6 +161,8 @@ class GlobalRequestLoadBalancer:
         servers: dict[str, ray.actor.ActorHandle],
         max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE,
         full_determinism: bool = False,
+        trajectory_migration_config: dict[str, Any] | None = None,
+        server_metadata: dict[str, dict[str, Any]] | None = None,
     ):
         # Allow empty initial servers: in dynamic-resource-scheduling mode all
         # replicas are hybrid and will be registered later via add_servers().
@@ -166,6 +171,13 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
         self._full_determinism = full_determinism
+        self._server_metadata = {sid: dict((server_metadata or {}).get(sid, {})) for sid in servers}
+        self._migration_config = dict(trajectory_migration_config or {})
+        self._trajectory_scheduler = (
+            TrajectoryScheduler(self._migration_config) if self._migration_config.get("enabled", False) else None
+        )
+        self._pending_migrations: dict[str, dict[str, Any]] = {}
+        self._migration_reservations: dict[str, int] = {sid: 0 for sid in servers}
 
     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
@@ -237,6 +249,8 @@ class GlobalRequestLoadBalancer:
         for sid, handle in servers.items():
             self._inflight_requests[sid] = 0
             self._servers[sid] = handle
+            self._server_metadata.setdefault(sid, {})
+            self._migration_reservations.setdefault(sid, 0)
         logger.info(f"[GlobalLoadBalancer] added {len(servers)} servers")
 
     def remove_servers(self, server_ids: list[str]) -> None:
@@ -250,7 +264,118 @@ class GlobalRequestLoadBalancer:
         for sid in server_ids:
             self._inflight_requests.pop(sid, None)
             self._servers.pop(sid, None)
+            self._server_metadata.pop(sid, None)
+            self._migration_reservations.pop(sid, None)
+        for request_id, pending in list(self._pending_migrations.items()):
+            if pending["source_server_id"] in server_ids or pending["target_server_id"] in server_ids:
+                self._drop_pending_migration(request_id)
         logger.info(f"[GlobalLoadBalancer] removed {len(server_ids)} servers")
+
+    def update_server_metadata(self, server_id: str, metadata: dict[str, Any]) -> None:
+        if server_id in self._servers:
+            self._server_metadata.setdefault(server_id, {}).update(metadata)
+
+    async def plan_trajectory_migration(
+        self,
+        request_id: str,
+        source_server_id: str,
+        trajectory: dict[str, Any],
+        source_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Score all trajectory x replica pairs and reserve an allowed target."""
+        if self._trajectory_scheduler is None:
+            return {"migrate": False, "reason": "trajectory migration is disabled"}
+        if request_id in self._pending_migrations:
+            return {"migrate": False, "reason": "a migration is already pending for this trajectory"}
+
+        capability_calls = []
+        capability_server_ids = []
+        for server_id, server in self._servers.items():
+            try:
+                capability_calls.append(server.get_trajectory_migration_capabilities.remote())
+                capability_server_ids.append(server_id)
+            except AttributeError:
+                continue
+        if capability_calls:
+            capabilities = await asyncio.gather(*capability_calls, return_exceptions=True)
+            for server_id, capability in zip(capability_server_ids, capabilities, strict=True):
+                if not isinstance(capability, BaseException):
+                    self.update_server_metadata(server_id, capability)
+        # Async capability refresh lets another plan for the same trajectory run.
+        # Recheck before reserving so a concurrent caller cannot overwrite it.
+        if request_id in self._pending_migrations:
+            return {"migrate": False, "reason": "a migration is already pending for this trajectory"}
+        if source_metadata:
+            self.update_server_metadata(source_server_id, source_metadata)
+
+        replicas = [
+            ReplicaSnapshot(
+                server_id=server_id,
+                inflight=self._inflight_requests[server_id] + self._migration_reservations.get(server_id, 0),
+                metadata=dict(self._server_metadata.get(server_id, {})),
+            )
+            for server_id in self._servers
+        ]
+        target, diagnostics = self._trajectory_scheduler.choose(trajectory, source_server_id, replicas)
+        if target is None:
+            return {"migrate": False, **diagnostics}
+
+        decision_id = uuid4().hex
+        pending = {
+            "decision_id": decision_id,
+            "source_server_id": source_server_id,
+            "target_server_id": target.server_id,
+        }
+        self._pending_migrations[request_id] = pending
+        self._migration_reservations[target.server_id] += 1
+        return {
+            "migrate": True,
+            **pending,
+            "source_server": self._servers[source_server_id],
+            "target_server": self._servers[target.server_id],
+            "source_metadata": dict(self._server_metadata[source_server_id]),
+            "target_metadata": dict(self._server_metadata[target.server_id]),
+            **diagnostics,
+        }
+
+    def commit_trajectory_migration(self, request_id: str, decision_id: str) -> dict[str, Any]:
+        pending = self._pending_migrations.get(request_id)
+        if pending is None or pending["decision_id"] != decision_id:
+            raise RuntimeError(f"stale or unknown migration decision for trajectory {request_id}")
+        target_server_id = pending["target_server_id"]
+        if target_server_id not in self._servers:
+            self._drop_pending_migration(request_id)
+            raise RuntimeError(f"migration target {target_server_id} is no longer registered")
+        self._request_id_to_server[request_id] = target_server_id
+        self._drop_pending_migration(request_id)
+        return {"migrated": True, "server_id": target_server_id}
+
+    def cancel_trajectory_migration(self, request_id: str, decision_id: str) -> dict[str, Any]:
+        pending = self._pending_migrations.get(request_id)
+        if pending is None or pending["decision_id"] != decision_id:
+            return {"cancelled": False}
+        self._drop_pending_migration(request_id)
+        return {"cancelled": True}
+
+    async def abort_trajectory(self, request_id: str) -> dict[str, Any]:
+        """Stop only the active backend request for one logical trajectory."""
+        server_id = self._request_id_to_server.get(request_id)
+        if server_id is None or server_id not in self._servers:
+            return {"aborted": False, "request_id": request_id, "reason": "trajectory route not found"}
+        server = self._servers[server_id]
+        try:
+            result = await server.abort_request.remote(request_id)
+        except AttributeError:
+            return {"aborted": False, "request_id": request_id, "reason": "replica has no targeted abort API"}
+        return {**result, "server_id": server_id}
+
+    def _drop_pending_migration(self, request_id: str) -> None:
+        pending = self._pending_migrations.pop(request_id, None)
+        if pending is None:
+            return
+        target = pending["target_server_id"]
+        if target in self._migration_reservations and self._migration_reservations[target] > 0:
+            self._migration_reservations[target] -= 1
 
     def get_inflight_count(self, server_id: str) -> int:
         """Get number of in-flight requests for a server."""
@@ -275,6 +400,8 @@ class GlobalRequestLoadBalancer:
         """
         cleared = len(self._request_id_to_server)
         self._request_id_to_server.clear()
+        for request_id in list(self._pending_migrations):
+            self._drop_pending_migration(request_id)
         logger.info(
             f"[GlobalLoadBalancer] Sticky cache cleared: {cleared} entries dropped. "
             f"Server loads: {dict(self._inflight_requests)}"
@@ -291,6 +418,8 @@ class GlobalRequestLoadBalancer:
             "total_inflight": sum(self._inflight_requests.values()),
             "active_servers": len(self._inflight_requests),
             "registered_handles": list(self._servers.keys()),
+            "server_metadata": {sid: dict(metadata) for sid, metadata in self._server_metadata.items()},
+            "pending_migrations": {request_id: dict(value) for request_id, value in self._pending_migrations.items()},
         }
 
     def get_total_inflight(self) -> int:
@@ -302,6 +431,8 @@ def _create_global_sticky_inflight(
     servers: dict[str, Any],
     full_determinism: bool = False,
     load_balancer_cls: type | None = None,
+    trajectory_migration_config: dict[str, Any] | None = None,
+    server_metadata: dict[str, dict[str, Any]] | None = None,
 ):
     """Factory for the default sticky-session + least-inflight strategy.
 
@@ -319,6 +450,8 @@ def _create_global_sticky_inflight(
     # full control of routing, so the flag is not forwarded to it.
     if load_balancer_cls is GlobalRequestLoadBalancer:
         kwargs["full_determinism"] = full_determinism
+        kwargs["trajectory_migration_config"] = trajectory_migration_config
+        kwargs["server_metadata"] = server_metadata
     return ray.remote(load_balancer_cls).remote(**kwargs)
 
 
@@ -399,6 +532,8 @@ def get_router_handle(
     router_config_path: str | None = None,
     full_determinism: bool = False,
     load_balancer_cls: type | None = None,
+    trajectory_migration_config: dict[str, Any] | None = None,
+    server_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> Any:
     """Create a load balancer instance from router configuration.
 
@@ -413,6 +548,10 @@ def get_router_handle(
             balancer. Takes precedence over the config-selected strategy; not
             applicable to the YAML plugin.
     """
+    migration_enabled = bool((trajectory_migration_config or {}).get("enabled", False))
+    if migration_enabled and (router_config_path or load_balancer_cls is not None):
+        raise ValueError("trajectory migration currently requires the built-in GlobalRequestLoadBalancer")
+
     if router_config_path and load_balancer_cls is None:
         return _create_plugin_extension(servers=servers, router_config_path=router_config_path)
 
@@ -430,4 +569,6 @@ def get_router_handle(
         servers=servers,
         full_determinism=full_determinism,
         load_balancer_cls=load_balancer_cls or GlobalRequestLoadBalancer,
+        trajectory_migration_config=trajectory_migration_config,
+        server_metadata=server_metadata,
     )

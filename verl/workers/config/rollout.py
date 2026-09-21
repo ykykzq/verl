@@ -32,6 +32,7 @@ __all__ = [
     "PrometheusConfig",
     "RolloutConfig",
     "CheckpointEngineConfig",
+    "TrajectoryMigrationConfig",
 ]
 
 
@@ -139,6 +140,35 @@ class CheckpointEngineConfig(BaseConfig):
     # backend is instantiated, allowing custom backends to register themselves
     # in CheckpointEngineRegistry.
     custom_backend_module: Optional[str] = None
+
+
+@dataclass
+class TrajectoryMigrationConfig(BaseConfig):
+    """Dynamic scheduling of an in-progress trajectory across rollout replicas."""
+
+    enabled: bool = False
+    checkpoint_tokens: int = 64
+    scorer_class: str = "verl.workers.rollout.trajectory_scheduler.LoadAwareTrajectoryReplicaScorer"
+    scorer_kwargs: dict = field(default_factory=dict)
+    gate_classes: list[str] = field(
+        default_factory=lambda: [
+            "verl.workers.rollout.trajectory_scheduler.DifferentReplicaGate",
+            "verl.workers.rollout.trajectory_scheduler.SameModelGate",
+            "verl.workers.rollout.trajectory_scheduler.SameWeightVersionGate",
+            "verl.workers.rollout.trajectory_scheduler.KVTransferCapabilityGate",
+        ]
+    )
+    gate_kwargs: dict = field(default_factory=dict)
+    min_score_improvement: float = 0.0
+    kv_transfer_backend: str = "remote_prefix"
+    transfer_timeout_s: float = 30.0
+    backend_options: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.checkpoint_tokens <= 0:
+            raise ValueError("trajectory_migration.checkpoint_tokens must be positive")
+        if self.transfer_timeout_s <= 0:
+            raise ValueError("trajectory_migration.transfer_timeout_s must be positive")
 
 
 @dataclass
@@ -275,6 +305,8 @@ class RolloutConfig(BaseConfig):
 
     router_config_path: Optional[str] = None
 
+    trajectory_migration: TrajectoryMigrationConfig = field(default_factory=TrajectoryMigrationConfig)
+
     def __post_init__(self):
         """Validate the rollout config"""
         # Deprecation warning for mode field - only async mode is supported
@@ -342,3 +374,29 @@ class RolloutConfig(BaseConfig):
             raise ValueError(
                 f"rollout.disaggregation.enabled=True requires rollout.name in ('sglang', 'vllm'); got {self.name!r}."
             )
+
+        if isinstance(self.trajectory_migration, dict):
+            object.__setattr__(
+                self,
+                "trajectory_migration",
+                TrajectoryMigrationConfig(**self.trajectory_migration),
+            )
+        elif not isinstance(self.trajectory_migration, TrajectoryMigrationConfig):
+            if not isinstance(self.trajectory_migration, DictConfig):
+                raise TypeError(
+                    "rollout.trajectory_migration must be dict, DictConfig, or TrajectoryMigrationConfig; "
+                    f"got {type(self.trajectory_migration).__name__}."
+                )
+            object.__setattr__(
+                self,
+                "trajectory_migration",
+                TrajectoryMigrationConfig(**OmegaConf.to_container(self.trajectory_migration, resolve=True)),
+            )
+
+        if self.trajectory_migration.enabled:
+            if self.name != "rtp_llm":
+                raise ValueError("trajectory migration currently supports rollout.name=rtp_llm only")
+            if self.trajectory_migration.kv_transfer_backend != "remote_prefix":
+                raise ValueError("rtp_llm trajectory migration currently requires kv_transfer_backend=remote_prefix")
+            if not self.enable_prefix_caching:
+                raise ValueError("rtp_llm trajectory migration requires rollout.enable_prefix_caching=True")

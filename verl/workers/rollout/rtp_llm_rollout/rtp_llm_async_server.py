@@ -21,6 +21,7 @@ in-process through ``WeightManager.update_from_hf_tensors``.
 import asyncio
 import gc
 import glob
+import hashlib
 import itertools
 import logging
 import math
@@ -156,6 +157,7 @@ class RTPLLMHttpServer:
         self._request_admission_lock = asyncio.Lock()
         self._inflight: dict[str, asyncio.Future] = {}
         self._request_counter = itertools.count(1)
+        self._accepted_migrations: dict[str, dict[str, Any]] = {}
         self._weight_update_lock = asyncio.Lock()
         self._weight_update: Optional[dict[str, Any]] = None
         self._weight_sync_error: Optional[str] = None
@@ -168,6 +170,64 @@ class RTPLLMHttpServer:
         logger.info(
             f"RTPLLMHttpServer replica_rank={replica_rank} node_rank={node_rank} devices={cuda_visible_devices}"
         )
+
+    def _trajectory_migration_config(self):
+        config = getattr(self.config, "trajectory_migration", None)
+        return config if config is not None and getattr(config, "enabled", False) else None
+
+    def _remote_prefix_migration_enabled(self) -> bool:
+        config = self._trajectory_migration_config()
+        return (
+            config is not None
+            and getattr(config, "kv_transfer_backend", None) == "remote_prefix"
+            and self.config.enable_prefix_caching
+        )
+
+    def _model_id(self) -> str:
+        architectures = getattr(self.model_config.hf_config, "architectures", None) or []
+        return f"{self.model_config.local_path}|{','.join(architectures)}"
+
+    def _kv_transfer_domain(self) -> str:
+        migration_config = self._trajectory_migration_config()
+        settings = {
+            str(key): str(value) for key, value in dict(getattr(migration_config, "backend_options", {})).items()
+        }
+        settings.update({key: value for key, value in os.environ.items() if key.startswith(("KVCM_", "RECO_"))})
+        payload = repr(sorted(settings.items())).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    def _cache_key_salt(self, weight_version: int | str | None = None) -> int:
+        version = "initial" if weight_version is None else str(weight_version)
+        payload = f"{self._kv_transfer_domain()}\0{self._model_id()}\0{version}".encode()
+        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
+
+    def _set_cache_key_salt(self, weight_version: int | str | None = None) -> None:
+        if not self._remote_prefix_migration_enabled():
+            return
+        set_salt = getattr(self.engine, "set_cache_key_salt", None)
+        if set_salt is None:
+            raise RuntimeError("the rtp-llm engine binding does not expose set_cache_key_salt")
+        set_salt(self._cache_key_salt(weight_version))
+
+    @staticmethod
+    def _prefix_digest(token_ids: list[int]) -> str:
+        digest = hashlib.sha256()
+        for token_id in token_ids:
+            digest.update(int(token_id).to_bytes(8, byteorder="little", signed=True))
+        return digest.hexdigest()
+
+    def get_trajectory_migration_capabilities(self) -> dict[str, Any]:
+        backends = ["remote_prefix"] if self._remote_prefix_migration_enabled() else []
+        weight_version = "initial" if self.global_steps is None else self.global_steps
+        return {
+            "backend": "rtp_llm",
+            "replica_rank": self.replica_rank,
+            "model_id": self._model_id(),
+            "weight_version": weight_version,
+            "kv_transfer_backends": backends,
+            "kv_transfer_domain": self._kv_transfer_domain() if backends else None,
+            "kv_transfer_namespace": self._cache_key_salt(self.global_steps) if backends else None,
+        }
 
     # ------------------------------------------------------------------ launch
 
@@ -318,6 +378,13 @@ class RTPLLMHttpServer:
             "--use_triton_pa",
             "1",
         ]
+        if self._remote_prefix_migration_enabled():
+            argv += ["--enable_remote_cache", "True"]
+            migration_config = self._trajectory_migration_config()
+            for key, value in dict(getattr(migration_config, "backend_options", {})).items():
+                if not key.startswith("kvcm_"):
+                    raise ValueError(f"RTP-LLM remote_prefix backend_options only accepts kvcm_* settings; got {key!r}")
+                argv += [f"--{key}", str(value)]
         if self.config.dtype in ("bfloat16", "bf16"):
             argv += ["--act_type", "bf16"]
         elif self.config.dtype in ("float16", "fp16", "half"):
@@ -385,6 +452,7 @@ class RTPLLMHttpServer:
         self.backend_manager = BackendManager(cfg)
         self.backend_manager.start()
         self.engine = self.backend_manager.engine
+        self._set_cache_key_salt(self.global_steps)
         self.weight_manager = self.engine.model.weight_manager
 
         rtp_model_config = ModelFactory.create_model_config(
@@ -435,6 +503,7 @@ class RTPLLMHttpServer:
             # Reuse is valid within one weight version; release_kv_cache() clears
             # all reusable entries before the next weight sync.
             reuse_cache=True,
+            enable_remote_cache=self._remote_prefix_migration_enabled(),
             # An unset timeout falls back to rtp-llm's 2h max_rpc_timeout_ms, so a stall would
             # only surface after two hours; bound it so failures are visible quickly.
             timeout_ms=int(float(os.environ.get("VERL_RTP_LLM_GENERATE_TIMEOUT_S", "3600")) * 1000),
@@ -452,6 +521,13 @@ class RTPLLMHttpServer:
     ) -> TokenOutput:
         if image_data or video_data or audio_data:
             raise NotImplementedError("rtp-llm rollout does not support multimodal inputs yet.")
+
+        accepted_migration = self._accepted_migrations.get(request_id)
+        if accepted_migration is not None:
+            if accepted_migration["prefix_tokens"] != len(prompt_ids):
+                raise RuntimeError(f"transferred trajectory {request_id} resumed with a different prefix length")
+            if accepted_migration["prefix_digest"] != self._prefix_digest(prompt_ids):
+                raise RuntimeError(f"transferred trajectory {request_id} resumed with different token ids")
 
         from rtp_llm.utils.base_model_datatypes import GenerateInput
 
@@ -501,6 +577,8 @@ class RTPLLMHttpServer:
                     # still queued for kv cache blocks never yields, so a cooperative
                     # flag would not reach it.
                     task = asyncio.ensure_future(consume())
+                    if accepted_migration is not None:
+                        self._accepted_migrations.pop(request_id, None)
                     self._inflight[request_id] = task
                     break
             await self._generation_allowed.wait()
@@ -530,17 +608,119 @@ class RTPLLMHttpServer:
                 f"rtp-llm log_probs/token_ids length mismatch for {request_id}: {len(log_probs)} vs {len(token_ids)}"
             )
 
+        migration_enabled = self._trajectory_migration_config() is not None
+        reached_eos = bool(token_ids) and token_ids[-1] == self.eos_token_id
+        migration_checkpoint = migration_enabled and not aborted and not reached_eos and len(token_ids) >= max_tokens
+        if aborted:
+            stop_reason = "aborted"
+        elif migration_enabled:
+            stop_reason = "length" if migration_checkpoint else "completed"
+        else:
+            stop_reason = None
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
-            stop_reason="aborted" if aborted else None,
-            extra_fields={"global_steps": self.global_steps},
+            stop_reason=stop_reason,
+            extra_fields={"global_steps": self.global_steps, "migration_checkpoint": migration_checkpoint},
         )
 
     # ----------------------------------------------------------------- control
 
     async def set_global_steps(self, global_steps: int):
+        await asyncio.to_thread(self._set_cache_key_salt, global_steps)
         self.global_steps = global_steps
+
+    async def abort_request(self, request_id: str, timeout_s: float = 120.0) -> dict[str, Any]:
+        """Cancel one trajectory without disturbing other requests on this replica."""
+        async with self._request_admission_lock:
+            task = self._inflight.get(request_id)
+        if task is None:
+            return {"aborted": False, "request_id": request_id, "reason": "request not found"}
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
+        except asyncio.CancelledError:
+            pass
+        except TimeoutError:
+            return {"aborted": False, "request_id": request_id, "reason": "abort timed out"}
+        return {"aborted": True, "request_id": request_id}
+
+    async def prepare_trajectory_migration(
+        self,
+        trajectory_state: dict[str, Any],
+        target_metadata: dict[str, Any],
+        backend: str,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        """Flush the completed prefix to KVCM and issue a verifiable transfer ticket."""
+        if backend != "remote_prefix" or not self._remote_prefix_migration_enabled():
+            raise RuntimeError(f"KV transfer backend {backend!r} is not enabled on the source replica")
+        source = self.get_trajectory_migration_capabilities()
+        if source["model_id"] != target_metadata.get("model_id"):
+            raise RuntimeError("source and target model identities differ")
+        if source["weight_version"] != target_metadata.get("weight_version"):
+            raise RuntimeError("source and target weight versions differ")
+        if source["kv_transfer_domain"] != target_metadata.get("kv_transfer_domain"):
+            raise RuntimeError("source and target KV transfer domains differ")
+        if source["kv_transfer_namespace"] != target_metadata.get("kv_transfer_namespace"):
+            raise RuntimeError("source and target KV transfer namespaces differ")
+        wait_fn = getattr(self.engine, "wait_remote_cache_idle", None)
+        if wait_fn is None:
+            raise RuntimeError("the rtp-llm engine binding does not expose wait_remote_cache_idle")
+        flushed = await asyncio.to_thread(wait_fn, int(timeout_s * 1000))
+        if not flushed:
+            raise TimeoutError(f"remote KV cache writes did not finish successfully within {timeout_s}s")
+
+        prefix = list(trajectory_state["prompt_ids"]) + list(trajectory_state["generated_token_ids"])
+        return {
+            "backend": backend,
+            "request_id": trajectory_state["request_id"],
+            "prefix_tokens": len(prefix),
+            "prefix_digest": self._prefix_digest(prefix),
+            "model_id": source["model_id"],
+            "weight_version": source["weight_version"],
+            "kv_transfer_domain": source["kv_transfer_domain"],
+            "kv_transfer_namespace": source["kv_transfer_namespace"],
+            "source_replica_rank": self.replica_rank,
+        }
+
+    async def accept_trajectory_migration(
+        self,
+        ticket: dict[str, Any],
+        trajectory_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Validate transferred trajectory state before the router commits movement."""
+        capabilities = self.get_trajectory_migration_capabilities()
+        if ticket.get("backend") not in capabilities["kv_transfer_backends"]:
+            return {"accepted": False, "reason": "target does not support the ticket's KV backend"}
+        if ticket.get("model_id") != capabilities["model_id"]:
+            return {"accepted": False, "reason": "target model identity differs"}
+        if ticket.get("weight_version") != capabilities["weight_version"]:
+            return {"accepted": False, "reason": "target weight version differs"}
+        if ticket.get("kv_transfer_domain") != capabilities["kv_transfer_domain"]:
+            return {"accepted": False, "reason": "target KV transfer domain differs"}
+        if ticket.get("kv_transfer_namespace") != capabilities["kv_transfer_namespace"]:
+            return {"accepted": False, "reason": "target KV transfer namespace differs"}
+        if ticket.get("request_id") != trajectory_state.get("request_id"):
+            return {"accepted": False, "reason": "trajectory request id differs"}
+        prefix = list(trajectory_state["prompt_ids"]) + list(trajectory_state["generated_token_ids"])
+        if ticket.get("prefix_tokens") != len(prefix) or ticket.get("prefix_digest") != self._prefix_digest(prefix):
+            return {"accepted": False, "reason": "trajectory prefix does not match the KV transfer ticket"}
+        capacity = max(1, self.config.max_num_seqs * 2)
+        if ticket["request_id"] not in self._accepted_migrations and len(self._accepted_migrations) >= capacity:
+            return {"accepted": False, "reason": "target trajectory transfer queue is full"}
+        self._accepted_migrations[ticket["request_id"]] = {
+            "prefix_tokens": ticket["prefix_tokens"],
+            "prefix_digest": ticket["prefix_digest"],
+        }
+        return {"accepted": True, "request_id": ticket["request_id"]}
+
+    async def discard_trajectory_migration(self, request_id: str, prefix_digest: str) -> dict[str, Any]:
+        pending = self._accepted_migrations.get(request_id)
+        if pending is None or pending["prefix_digest"] != prefix_digest:
+            return {"discarded": False, "request_id": request_id}
+        del self._accepted_migrations[request_id]
+        return {"discarded": True, "request_id": request_id}
 
     async def abort_all_requests(self, reject_request: bool = False):
         """Stop in-flight generation and hold off new requests until resume_generation().
@@ -894,3 +1074,10 @@ class RTPLLMReplica(RolloutReplica):
             if is_valid_ipv6_address(server_address)
             else f"{server_address}:{server_port}"
         )
+
+    async def abort_request(self, request_id: str) -> dict[str, Any]:
+        results = await asyncio.gather(*[server.abort_request.remote(request_id) for server in self.servers])
+        for result in results:
+            if result.get("aborted", False):
+                return result
+        return {"aborted": False, "request_id": request_id, "reason": "request not found on this replica"}

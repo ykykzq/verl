@@ -14,6 +14,7 @@
 
 import asyncio
 import unittest
+from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -31,10 +32,12 @@ class TestRTPLLMKVCacheTransition(unittest.IsolatedAsyncioTestCase):
         server._rejecting = False
         server._request_admission_lock = asyncio.Lock()
         server._inflight = {} if inflight is None else inflight
+        server._accepted_migrations = {}
         clear_kv_cache = Mock()
         server.engine = SimpleNamespace(
             clear_kv_cache=clear_kv_cache,
             onflight_request_num=Mock(return_value=0),
+            set_cache_key_salt=Mock(),
         )
         return server, clear_kv_cache
 
@@ -102,3 +105,76 @@ class TestRTPLLMKVCacheTransition(unittest.IsolatedAsyncioTestCase):
         await server.abort_all_requests()
 
         self.assertFalse(server._rejecting)
+
+    async def test_abort_request_only_cancels_matching_task(self):
+        matching = asyncio.create_task(asyncio.Event().wait())
+        other = asyncio.create_task(asyncio.Event().wait())
+        server, _ = self._server(
+            generation_allowed=True,
+            abort_requested=False,
+            inflight={"request-1": matching, "request-2": other},
+        )
+
+        result = await server.abort_request("request-1")
+
+        self.assertTrue(result["aborted"])
+        self.assertTrue(matching.cancelled())
+        self.assertFalse(other.done())
+        other.cancel()
+        with suppress(asyncio.CancelledError):
+            await other
+
+    async def test_transfer_ticket_waits_for_remote_cache_and_covers_prefix(self):
+        server, _ = self._server(generation_allowed=True, abort_requested=False)
+        server.replica_rank = 0
+        server.global_steps = 9
+        server.config = SimpleNamespace(
+            trajectory_migration=SimpleNamespace(enabled=True, kv_transfer_backend="remote_prefix"),
+            max_num_seqs=8,
+            enable_prefix_caching=True,
+        )
+        server.model_config = SimpleNamespace(
+            local_path="/model",
+            hf_config=SimpleNamespace(architectures=["ModelForCausalLM"]),
+        )
+        wait_remote_cache_idle = Mock(return_value=True)
+        server.engine.wait_remote_cache_idle = wait_remote_cache_idle
+        state = {
+            "request_id": "trajectory-1",
+            "prompt_ids": [1, 2],
+            "generated_token_ids": [3, 4],
+        }
+        target = server.get_trajectory_migration_capabilities()
+
+        ticket = await server.prepare_trajectory_migration(state, target, "remote_prefix", timeout_s=2.0)
+        accepted = await server.accept_trajectory_migration(ticket, state)
+
+        wait_remote_cache_idle.assert_called_once_with(2000)
+        self.assertEqual(ticket["prefix_tokens"], 4)
+        self.assertTrue(accepted["accepted"])
+        self.assertIn("trajectory-1", server._accepted_migrations)
+
+    async def test_weight_version_updates_cache_key_namespace_before_publication(self):
+        server, _ = self._server(generation_allowed=False, abort_requested=True)
+        server.replica_rank = 0
+        server.global_steps = None
+        server.config = SimpleNamespace(
+            trajectory_migration=SimpleNamespace(
+                enabled=True,
+                kv_transfer_backend="remote_prefix",
+                backend_options={"instance_group": "training-job"},
+            ),
+            max_num_seqs=8,
+            enable_prefix_caching=True,
+        )
+        server.model_config = SimpleNamespace(
+            local_path="/model",
+            hf_config=SimpleNamespace(architectures=["ModelForCausalLM"]),
+        )
+
+        expected_salt = server._cache_key_salt(10)
+        await server.set_global_steps(10)
+
+        server.engine.set_cache_key_salt.assert_called_once_with(expected_salt)
+        self.assertEqual(server.global_steps, 10)
+        self.assertEqual(server.get_trajectory_migration_capabilities()["kv_transfer_namespace"], expected_salt)

@@ -173,6 +173,41 @@ val_kwargs:
 # Relative paths resolve against the working directory, then the verl package root.
 router_config_path: null
 
+# Move an in-progress trajectory between replicas at bounded decode checkpoints.
+# The feature is disabled by default. With the RTP-LLM remote_prefix backend,
+# all replicas must point at the same KVCM deployment and enable_prefix_caching
+# must remain True.
+trajectory_migration:
+
+  _target_: verl.workers.config.TrajectoryMigrationConfig
+
+  enabled: False
+
+  # End the current decode request normally after this many tokens, then
+  # reconsider placement. Normal completion is required to publish its KV prefix.
+  checkpoint_tokens: 64
+
+  # Pluggable trajectory x replica scoring policy.
+  scorer_class: verl.workers.rollout.trajectory_scheduler.LoadAwareTrajectoryReplicaScorer
+  scorer_kwargs: {}
+
+  # Ordered, fail-closed migration gates. Custom gates implement evaluate(context).
+  gate_classes:
+    - verl.workers.rollout.trajectory_scheduler.DifferentReplicaGate
+    - verl.workers.rollout.trajectory_scheduler.SameModelGate
+    - verl.workers.rollout.trajectory_scheduler.SameWeightVersionGate
+    - verl.workers.rollout.trajectory_scheduler.KVTransferCapabilityGate
+  gate_kwargs: {}
+
+  min_score_improvement: 0.0
+  kv_transfer_backend: remote_prefix
+  transfer_timeout_s: 30.0
+
+  # Passed to RTP-LLM as matching --<key> <value> arguments. Typical KVCM
+  # settings include kvcm_server_address and kvcm_instance_group. Environment
+  # variables understood by RTP-LLM may be used instead.
+  backend_options: {}
+
 # Multi-turn tool config.
 multi_turn:
 
