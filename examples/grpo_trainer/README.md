@@ -99,6 +99,7 @@ bash examples/grpo_trainer/run_qwen3_8b_fsdp.sh
 
 LoRA variants live in `examples/tuning/lora/`, profiling variants in `examples/profile/`.
 Scale / hardware-specific demos (e.g. `run_qwen3_8b_fsdp_gb200.sh`, FP8 variants, VeOmni) keep a trailing suffix to stay discoverable.
+The RTP-LLM fully-async Qwen3.5-27B recipe for one 8x GB200 node is `run_qwen3_5_27b_fsdp2.sh` (4 trainer GPUs + 4 rollout GPUs).
 
 ## Reference
 
