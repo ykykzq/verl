@@ -77,6 +77,49 @@ class TestRTPLLMKVCacheTransition(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server.engine.onflight_request_num.call_count, 3)
         clear_kv_cache.assert_called_once_with()
 
+    async def test_clear_waits_for_cache_references_after_rpc_drain(self):
+        server, clear_kv_cache = self._server(generation_allowed=False, abort_requested=True)
+        server.global_steps = 6
+        clear_kv_cache.side_effect = [
+            RuntimeError("clear_kv_cache refused: active/resident cache resources remain"),
+            RuntimeError("clear_kv_cache refused while requests are in flight: 1"),
+            None,
+        ]
+        await server.clear_kv_cache(interval_s=0)
+        self.assertEqual(clear_kv_cache.call_count, 3)
+        self.assertFalse(server._generation_allowed.is_set())
+        self.assertEqual(server.global_steps, 6)
+
+    async def test_clear_cache_resource_timeout_fails_closed(self):
+        server, clear_kv_cache = self._server(generation_allowed=False, abort_requested=True)
+        server.global_steps = 6
+        clear_kv_cache.side_effect = RuntimeError("clear_kv_cache refused: active/resident cache resources remain")
+        with self.assertRaisesRegex(RuntimeError, "cache resources did not drain"):
+            await server.clear_kv_cache(timeout_s=0, interval_s=0)
+        clear_kv_cache.assert_called_once_with()
+        self.assertFalse(server._generation_allowed.is_set())
+        self.assertEqual(server.global_steps, 6)
+
+    async def test_clear_does_not_retry_unrelated_errors(self):
+        server, clear_kv_cache = self._server(generation_allowed=False, abort_requested=True)
+        clear_kv_cache.side_effect = RuntimeError("binding unavailable")
+        with self.assertRaisesRegex(RuntimeError, "binding unavailable"):
+            await server.clear_kv_cache()
+        clear_kv_cache.assert_called_once_with()
+        self.assertFalse(server._generation_allowed.is_set())
+
+    async def test_clear_cache_wait_propagates_cancellation(self):
+        server, clear_kv_cache = self._server(generation_allowed=False, abort_requested=True)
+        clear_kv_cache.side_effect = RuntimeError("clear_kv_cache refused: active/resident cache resources remain")
+        task = asyncio.create_task(server.clear_kv_cache(interval_s=60))
+        while not clear_kv_cache.called:
+            await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(server._generation_allowed.is_set())
+        self.assertFalse(server._request_admission_lock.locked())
+
     async def test_engine_drain_timeout_fails_closed(self):
         server, clear_kv_cache = self._server(generation_allowed=False, abort_requested=True)
         server.engine.onflight_request_num.return_value = 1

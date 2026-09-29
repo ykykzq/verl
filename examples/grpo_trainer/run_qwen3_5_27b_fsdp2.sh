@@ -20,7 +20,8 @@ mkdir -p "${LOG_DIR}" "${CKPTS_DIR}"
 # Ray assigns disjoint devices to the trainer and rollout placement groups.
 unset CUDA_VISIBLE_DEVICES HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES XPU_VISIBLE_DEVICES
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+# CUDA IPC weight-transfer buffers must use exportable allocations.
+export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:False}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}

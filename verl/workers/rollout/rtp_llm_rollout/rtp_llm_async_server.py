@@ -777,7 +777,7 @@ class RTPLLMHttpServer:
                 raise RuntimeError(f"rtp-llm engine still has {request_count} request(s) in flight after {timeout_s}s")
             await asyncio.sleep(interval_s)
 
-    async def clear_kv_cache(self):
+    async def clear_kv_cache(self, timeout_s: float = 120, interval_s: float = 0.05):
         """Clear reusable device-cache entries after generation has drained.
 
         The C++ cache manager removes BlockTreeCache mappings and returns only
@@ -793,7 +793,29 @@ class RTPLLMHttpServer:
             clear_fn = getattr(self.engine, "clear_kv_cache", None)
             if clear_fn is None:
                 raise RuntimeError("the rtp-llm engine binding does not expose clear_kv_cache")
-            await asyncio.to_thread(clear_fn)
+            # RPC completion can precede scheduler-side stream/cache destruction.
+            deadline = time.monotonic() + timeout_s
+            retries = 0
+            while True:
+                try:
+                    await asyncio.to_thread(clear_fn)
+                except RuntimeError as error:
+                    detail = str(error)
+                    busy = detail == "clear_kv_cache refused: active/resident cache resources remain" or detail.startswith(
+                        "clear_kv_cache refused while requests are in flight:"
+                    )
+                    if not busy:
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"rtp-llm cache resources did not drain after {timeout_s}s: {detail}") from error
+                    retries += 1
+                    if retries == 1:
+                        logger.warning(f"Waiting for rtp-llm cache resources after RPC drain: {detail}")
+                    await asyncio.sleep(interval_s)
+                else:
+                    if retries:
+                        logger.info(f"rtp-llm cache resources drained after {retries} retries")
+                    break
         logger.info("rtp-llm reusable KV cache cleared; backing KV pool retained")
 
     async def release_kv_cache(self):
@@ -1032,8 +1054,16 @@ class RTPLLMReplica(RolloutReplica):
             env_vars = {
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
+                # CUDA may initialize while importing the actor module.
+                get_visible_devices_keyword(): node_visible_devices,
             }
-            for var in ("VERL_RTP_LLM_START_PORT", "RTP_LLM_LOG_LEVEL", "LOG_LEVEL", "PYTHONPATH"):
+            for var in (
+                "VERL_RTP_LLM_START_PORT",
+                "RTP_LLM_LOG_LEVEL",
+                "LOG_LEVEL",
+                "PYTHONPATH",
+                "ENABLE_FLASHINFER_TRTLLM_GEN",
+            ):
                 if value := os.environ.get(var):
                     env_vars[var] = value
 
@@ -1043,6 +1073,9 @@ class RTPLLMReplica(RolloutReplica):
             # interpreter rather than sharing the trainer's.
             if conda_env := os.environ.get("VERL_RTP_LLM_CONDA_ENV"):
                 runtime_env["conda"] = conda_env
+                if os.path.isabs(conda_env):
+                    # A trainer venv can shadow conda's activate script on PATH.
+                    runtime_env["py_executable"] = os.path.join(conda_env, "bin", "python")
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
@@ -1051,7 +1084,7 @@ class RTPLLMReplica(RolloutReplica):
                 ),
                 runtime_env=runtime_env,
                 name=name,
-                max_concurrency=self.max_concurrency,
+                max_concurrency=self.config.ray_actor_max_concurrency,
             ).remote(
                 config=self.config,
                 model_config=self.model_config,
