@@ -527,6 +527,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Get rollout worker group"""
         return self.llm_server_manager.get_replicas()
 
+    def get_load_balancer(self):
+        """Share the authoritative replica lifecycle router with the trainer."""
+        return self.llm_server_manager.global_load_balancer
+
     def get_max_queue_size(self):
         return self.max_queue_size
 

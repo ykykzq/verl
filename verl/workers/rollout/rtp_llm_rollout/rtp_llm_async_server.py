@@ -518,16 +518,17 @@ class RTPLLMHttpServer:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        migration_ticket: Optional[dict[str, Any]] = None,
+        expected_source_version: int | str | None = None,
     ) -> TokenOutput:
         if image_data or video_data or audio_data:
             raise NotImplementedError("rtp-llm rollout does not support multimodal inputs yet.")
 
-        accepted_migration = self._accepted_migrations.get(request_id)
-        if accepted_migration is not None:
-            if accepted_migration["prefix_tokens"] != len(prompt_ids):
-                raise RuntimeError(f"transferred trajectory {request_id} resumed with a different prefix length")
-            if accepted_migration["prefix_digest"] != self._prefix_digest(prompt_ids):
-                raise RuntimeError(f"transferred trajectory {request_id} resumed with different token ids")
+        # The client carries the ticket across accept/commit/enqueue. An update can
+        # clear the accepted queue before this RPC arrives, so absence is not consent.
+        accepted_migration = (
+            migration_ticket if migration_ticket is not None else self._accepted_migrations.get(request_id)
+        )
 
         from rtp_llm.utils.base_model_datatypes import GenerateInput
 
@@ -564,6 +565,26 @@ class RTPLLMHttpServer:
         # after the drain snapshot and race the weight transition.
         while True:
             async with self._request_admission_lock:
+                reason = None
+                if accepted_migration is not None:
+                    pending = self._accepted_migrations.get(request_id)
+                    reason = self._validate_trajectory_migration(accepted_migration, request_id, prompt_ids)
+                    if pending != accepted_migration:
+                        reason = "trajectory migration acceptance is no longer valid"
+                elif expected_source_version is not None:
+                    weight_version = "initial" if self.global_steps is None else self.global_steps
+                    if expected_source_version != weight_version:
+                        reason = "continuation weight version changed without a migration ticket"
+                if reason is not None:
+                    if accepted_migration is not None and pending == accepted_migration:
+                        self._accepted_migrations.pop(request_id, None)
+                    logger.debug("rejecting migrated request %s: %s", request_id, reason)
+                    return TokenOutput(
+                        token_ids=[],
+                        log_probs=None,
+                        stop_reason="aborted",
+                        extra_fields={"global_steps": self.global_steps, "migration_rejected": True},
+                    )
                 if self._rejecting:
                     logger.debug("rejecting request %s: replica left rotation while generation is paused", request_id)
                     return TokenOutput(
@@ -573,6 +594,10 @@ class RTPLLMHttpServer:
                         extra_fields={"global_steps": self.global_steps},
                     )
                 if self._generation_allowed.is_set() and not self._abort_requested:
+                    admitted_global_steps = self.global_steps
+                    if accepted_migration is not None and accepted_migration.get("mode") == "recompute":
+                        generate_config.reuse_cache = False
+                        generate_config.enable_remote_cache = False
                     # Consume in a task so abort_all_requests can cancel it: a request
                     # still queued for kv cache blocks never yields, so a cooperative
                     # flag would not reach it.
@@ -617,11 +642,15 @@ class RTPLLMHttpServer:
             stop_reason = "length" if migration_checkpoint else "completed"
         else:
             stop_reason = None
+        extra_fields = {"global_steps": admitted_global_steps, "migration_checkpoint": migration_checkpoint}
+        if token_ids and accepted_migration is not None and accepted_migration.get("mode") == "recompute":
+            # Empty aborts do not establish that the forced prefill ran.
+            extra_fields["forced_prefill_tokens"] = len(prompt_ids)
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             stop_reason=stop_reason,
-            extra_fields={"global_steps": self.global_steps, "migration_checkpoint": migration_checkpoint},
+            extra_fields=extra_fields,
         )
 
     # ----------------------------------------------------------------- control
@@ -690,30 +719,54 @@ class RTPLLMHttpServer:
         trajectory_state: dict[str, Any],
     ) -> dict[str, Any]:
         """Validate transferred trajectory state before the router commits movement."""
-        capabilities = self.get_trajectory_migration_capabilities()
-        if ticket.get("backend") not in capabilities["kv_transfer_backends"]:
-            return {"accepted": False, "reason": "target does not support the ticket's KV backend"}
-        if ticket.get("model_id") != capabilities["model_id"]:
-            return {"accepted": False, "reason": "target model identity differs"}
-        if ticket.get("weight_version") != capabilities["weight_version"]:
-            return {"accepted": False, "reason": "target weight version differs"}
-        if ticket.get("kv_transfer_domain") != capabilities["kv_transfer_domain"]:
-            return {"accepted": False, "reason": "target KV transfer domain differs"}
-        if ticket.get("kv_transfer_namespace") != capabilities["kv_transfer_namespace"]:
-            return {"accepted": False, "reason": "target KV transfer namespace differs"}
-        if ticket.get("request_id") != trajectory_state.get("request_id"):
-            return {"accepted": False, "reason": "trajectory request id differs"}
         prefix = list(trajectory_state["prompt_ids"]) + list(trajectory_state["generated_token_ids"])
+        async with self._request_admission_lock:
+            reason = self._validate_trajectory_migration(ticket, trajectory_state.get("request_id"), prefix)
+            if reason is not None:
+                return {"accepted": False, "reason": reason}
+            capacity = max(1, self.config.max_num_seqs * 2)
+            if ticket["request_id"] not in self._accepted_migrations and len(self._accepted_migrations) >= capacity:
+                return {"accepted": False, "reason": "target trajectory transfer queue is full"}
+            self._accepted_migrations[ticket["request_id"]] = dict(ticket)
+            return {"accepted": True, "request_id": ticket["request_id"]}
+
+    def _validate_trajectory_migration(
+        self, ticket: dict[str, Any], request_id: str, prefix: list[int]
+    ) -> Optional[str]:
+        if self._rejecting or self._abort_requested or not self._generation_allowed.is_set():
+            return "target generation admission is closed"
+        capabilities = self.get_trajectory_migration_capabilities()
+        backend = ticket.get("backend")
+        if ticket.get("mode", backend) != backend:
+            return "trajectory migration mode differs from its backend"
+        if backend == "recompute":
+            if ticket.get("mode") != "recompute":
+                return "recompute requires an explicit migration mode"
+            config = self._trajectory_migration_config()
+            if config is None or not getattr(config, "allow_cross_version_recompute", False):
+                return "target does not support cross-version recompute"
+            if os.environ.get("RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES", "0").lower() not in {"", "0", "false"}:
+                return "target engine overrides per-request cache switches"
+            if ticket.get("source_version") is None or ticket["source_version"] == ticket.get("target_version"):
+                return "recompute requires distinct source and target weight versions"
+            target_version = ticket.get("target_version")
+        else:
+            if backend not in capabilities["kv_transfer_backends"]:
+                return "target does not support the ticket's KV backend"
+            target_version = ticket.get("weight_version")
+            if ticket.get("kv_transfer_domain") != capabilities["kv_transfer_domain"]:
+                return "target KV transfer domain differs"
+            if ticket.get("kv_transfer_namespace") != capabilities["kv_transfer_namespace"]:
+                return "target KV transfer namespace differs"
+        if ticket.get("model_id") != capabilities["model_id"]:
+            return "target model identity differs"
+        if target_version != capabilities["weight_version"]:
+            return "target weight version differs"
+        if ticket.get("request_id") != request_id:
+            return "trajectory request id differs"
         if ticket.get("prefix_tokens") != len(prefix) or ticket.get("prefix_digest") != self._prefix_digest(prefix):
-            return {"accepted": False, "reason": "trajectory prefix does not match the KV transfer ticket"}
-        capacity = max(1, self.config.max_num_seqs * 2)
-        if ticket["request_id"] not in self._accepted_migrations and len(self._accepted_migrations) >= capacity:
-            return {"accepted": False, "reason": "target trajectory transfer queue is full"}
-        self._accepted_migrations[ticket["request_id"]] = {
-            "prefix_tokens": ticket["prefix_tokens"],
-            "prefix_digest": ticket["prefix_digest"],
-        }
-        return {"accepted": True, "request_id": ticket["request_id"]}
+            return "trajectory prefix does not match the transfer ticket"
+        return None
 
     async def discard_trajectory_migration(self, request_id: str, prefix_digest: str) -> dict[str, Any]:
         pending = self._accepted_migrations.get(request_id)
@@ -736,6 +789,7 @@ class RTPLLMHttpServer:
             self._generation_allowed.clear()
             self._abort_requested = True
             self._rejecting = reject_request
+            self._accepted_migrations.clear()
             tasks = list(self._inflight.values())
         for task in tasks:
             task.cancel()
@@ -801,13 +855,16 @@ class RTPLLMHttpServer:
                     await asyncio.to_thread(clear_fn)
                 except RuntimeError as error:
                     detail = str(error)
-                    busy = detail == "clear_kv_cache refused: active/resident cache resources remain" or detail.startswith(
-                        "clear_kv_cache refused while requests are in flight:"
+                    busy = (
+                        detail == "clear_kv_cache refused: active/resident cache resources remain"
+                        or detail.startswith("clear_kv_cache refused while requests are in flight:")
                     )
                     if not busy:
                         raise
                     if time.monotonic() >= deadline:
-                        raise RuntimeError(f"rtp-llm cache resources did not drain after {timeout_s}s: {detail}") from error
+                        raise RuntimeError(
+                            f"rtp-llm cache resources did not drain after {timeout_s}s: {detail}"
+                        ) from error
                     retries += 1
                     if retries == 1:
                         logger.warning(f"Waiting for rtp-llm cache resources after RPC drain: {detail}")
@@ -921,11 +978,13 @@ class RTPLLMHttpServer:
             self._weight_sync_error = None
             return result
 
-    async def abort_weight_update_from_ipc(self, round_id: str):
+    async def abort_weight_update_from_ipc(self, round_id: Optional[str] = None):
         """Release IPC resources while keeping generation failed closed."""
         async with self._weight_update_lock:
             if self._weight_update is None:
                 return
+            if round_id is None:
+                round_id = self._weight_update["round_id"]
             state = self._require_weight_update(round_id)
             abort_fn = getattr(self.weight_manager, "abort_hf_update", None)
             try:

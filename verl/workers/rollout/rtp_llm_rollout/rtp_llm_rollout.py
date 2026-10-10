@@ -131,25 +131,36 @@ class ServerAdapter(BaseRollout):
         start_time = time.time()
         num_sent = 0
         num_skipped = 0
+        weight_iterator = ensure_async_iterator(weights)
 
         async def prepared() -> AsyncGenerator[tuple[str, torch.Tensor], None]:
             nonlocal num_sent, num_skipped
-            async for name, param in ensure_async_iterator(weights):
-                # The engine runs text-only (vit_separation=REMOTE), so it owns no vision
-                # tower receptors while the trainer's Qwen3.5 checkpoint still carries them.
-                if _VISION_PREFIX_RE.match(name):
-                    num_skipped += 1
-                    continue
-                payload = param.detach()
-                if payload.is_floating_point() and payload.dtype != self._engine_dtype:
-                    payload = payload.to(self._engine_dtype)
+            async for name, param in weight_iterator:
+                try:
+                    # The engine runs text-only (vit_separation=REMOTE), so it owns no vision
+                    # tower receptors while the trainer's Qwen3.5 checkpoint still carries them.
+                    if _VISION_PREFIX_RE.match(name):
+                        num_skipped += 1
+                        continue
+                    payload = param.detach()
+                    if payload.is_floating_point() and payload.dtype != self._engine_dtype:
+                        payload = payload.to(self._engine_dtype)
+                except Exception:
+                    # The sender cannot recover the raw collective iterator after
+                    # this adapter generator closes on a local conversion error.
+                    try:
+                        async for _ in weight_iterator:
+                            pass
+                    except Exception:
+                        logger.warning("Failed to drain weights after tensor preparation failed", exc_info=True)
+                    raise
                 num_sent += 1
                 yield name, payload
 
         if not self._ensure_server_handle():
             # The checkpoint engine backs `weights` with collectives, so every rank must
             # drain it even when it has no server to feed.
-            async for _ in prepared():
+            async for _ in weight_iterator:
                 pass
             return
 

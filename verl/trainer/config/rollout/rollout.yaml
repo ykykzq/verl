@@ -181,15 +181,27 @@ val_kwargs:
 # Relative paths resolve against the working directory, then the verl package root.
 router_config_path: null
 
+# Update one replica at a time while other replicas continue serving.
+fine_grained_weight_update:
+
+  _target_: verl.workers.config.FineGrainedWeightUpdateConfig
+
+  enabled: False
+  # Retry attempts after the initial complete weight transfer.
+  max_retries: 1
+  retry_backoff_s: 1.0
+  continue_on_failure: True
+
 # Move an in-progress trajectory between replicas at bounded decode checkpoints.
-# The feature is disabled by default. With the RTP-LLM remote_prefix backend,
-# all replicas must point at the same KVCM deployment and enable_prefix_caching
-# must remain True.
+# Same-version RTP-LLM remote_prefix migration requires a shared KVCM deployment
+# and enable_prefix_caching=True. Cross-version recompute bypasses KV reuse.
 trajectory_migration:
 
   _target_: verl.workers.config.TrajectoryMigrationConfig
 
   enabled: False
+  # Transfer tokens and force full prefill when source and target versions differ.
+  allow_cross_version_recompute: False
 
   # End the current decode request normally after this many tokens, then
   # reconsider placement. Normal completion is required to publish its KV prefix.

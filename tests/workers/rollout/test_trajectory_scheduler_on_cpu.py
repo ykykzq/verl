@@ -9,7 +9,10 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from verl.workers.rollout.router import GlobalRequestLoadBalancer
+from verl.workers.rollout.trajectory_scheduler import GateResult, ReplicaSnapshot, TrajectoryScheduler
 
 
 class _RemoteMethod:
@@ -146,3 +149,157 @@ def test_abort_trajectory_targets_only_its_sticky_replica():
 
     assert result == {"aborted": True, "server_id": "s0"}
     assert aborted == ["trajectory-1"]
+
+
+class _RejectAllGate:
+    def evaluate(self, context):
+        return GateResult(False, "custom placement policy rejected target")
+
+
+def _choose(source_metadata, target_metadata, **overrides):
+    config = {**_config(), **overrides}
+    return TrajectoryScheduler(config).choose(
+        {"request_id": "trajectory-1"},
+        "s0",
+        [ReplicaSnapshot("s0", 2, source_metadata), ReplicaSnapshot("s1", 0, target_metadata)],
+    )
+
+
+def test_enabled_cross_version_recompute_does_not_require_kv_capabilities():
+    target, diagnostics = _choose(
+        {"model_id": "model-a", "weight_version": 7},
+        {"model_id": "model-a", "weight_version": 8},
+        allow_cross_version_recompute=True,
+    )
+
+    assert target is not None
+    assert target.server_id == "s1"
+    assert diagnostics["mode"] == "recompute"
+    assert diagnostics["source_version"] == 7
+    assert diagnostics["target_version"] == 8
+
+
+def test_same_version_keeps_remote_prefix_mode_with_recompute_enabled():
+    target, diagnostics = _choose(_metadata(7), _metadata(7), allow_cross_version_recompute=True)
+
+    assert target is not None
+    assert diagnostics["mode"] == "remote_prefix"
+    assert diagnostics["source_version"] == diagnostics["target_version"] == 7
+
+
+def test_disabled_cross_version_recompute_cannot_be_bypassed_by_custom_gate_chain():
+    target, diagnostics = _choose(
+        _metadata(7),
+        _metadata(8),
+        gate_classes=["verl.workers.rollout.trajectory_scheduler.DifferentReplicaGate"],
+    )
+
+    assert target is None
+    assert diagnostics["rejected_by"].endswith("SameWeightVersionGate")
+
+
+@pytest.mark.parametrize(
+    "source_overrides,target_overrides,gate",
+    [
+        ({"weight_version": None}, {}, "SameWeightVersionGate"),
+        ({}, {"weight_version": None}, "SameWeightVersionGate"),
+        ({}, {"model_id": "another-model"}, "SameModelGate"),
+        ({"model_id": None}, {"model_id": None}, "SameModelGate"),
+    ],
+)
+def test_recompute_enforces_identity_and_known_versions_with_custom_gates(source_overrides, target_overrides, gate):
+    target, diagnostics = _choose(
+        {**_metadata(7), **source_overrides},
+        {**_metadata(8), **target_overrides},
+        allow_cross_version_recompute=True,
+        gate_classes=["verl.workers.rollout.trajectory_scheduler.DifferentReplicaGate"],
+    )
+
+    assert target is None
+    assert diagnostics["rejected_by"].endswith(gate)
+
+
+def test_recompute_preserves_custom_migration_gate(monkeypatch):
+    from verl.workers.rollout import trajectory_scheduler
+
+    original_loader = trajectory_scheduler.load_class_from_fqn
+    monkeypatch.setattr(
+        trajectory_scheduler,
+        "load_class_from_fqn",
+        lambda path, label: _RejectAllGate if path == "custom.RejectAllGate" else original_loader(path, label),
+    )
+
+    target, diagnostics = _choose(
+        _metadata(7),
+        _metadata(8),
+        allow_cross_version_recompute=True,
+        gate_classes=["custom.RejectAllGate"],
+    )
+
+    assert target is None
+    assert diagnostics["reason"] == "custom placement policy rejected target"
+
+
+def test_updated_single_replica_can_recompute_its_older_trajectory():
+    scheduler = TrajectoryScheduler({**_config(), "allow_cross_version_recompute": True})
+    replica = ReplicaSnapshot("s0", 0, _metadata(1))
+
+    target, diagnostics = scheduler.choose(
+        {"request_id": "trajectory-1"}, "s0", [replica], source_metadata={"weight_version": 0}
+    )
+
+    assert target is replica
+    assert diagnostics["mode"] == "recompute"
+    assert diagnostics["source_version"] == 0
+    assert diagnostics["target_version"] == 1
+    assert replica.metadata["weight_version"] == 1
+
+
+@pytest.mark.parametrize("lifecycle", ["UPDATING", "QUARANTINED"])
+def test_recompute_never_selects_isolated_replica(lifecycle):
+    scheduler = TrajectoryScheduler({**_config(), "allow_cross_version_recompute": True})
+    source = ReplicaSnapshot("s0", 2, _metadata(0), lifecycle_state="SERVING")
+    isolated = ReplicaSnapshot("s1", 0, _metadata(1), lifecycle_state=lifecycle)
+
+    target, _ = scheduler.choose({"request_id": "trajectory-1"}, "s0", [source, isolated])
+
+    assert target is None
+
+
+@pytest.mark.parametrize("same_replica", [False, True])
+def test_required_resume_ignores_load_threshold_but_discretionary_migration_does_not(same_replica):
+    scheduler = TrajectoryScheduler({**_config(), "allow_cross_version_recompute": True, "min_score_improvement": 2.0})
+    source = ReplicaSnapshot("s0", 0, _metadata(0), lifecycle_state="QUARANTINED")
+    available = ReplicaSnapshot("s0" if same_replica else "s1", 5, _metadata(1))
+    replicas = [available] if same_replica else [source, available]
+
+    target, _ = scheduler.choose(
+        {"request_id": "trajectory-1", "migration_required": True},
+        "s0",
+        replicas,
+        source_metadata={"weight_version": 0},
+    )
+    discretionary_target, _ = scheduler.choose(
+        {"request_id": "trajectory-1"}, "s0", replicas, source_metadata={"weight_version": 0}
+    )
+
+    assert target is available
+    assert discretionary_target is None
+
+
+def test_required_resume_can_return_to_unchanged_source_without_a_transfer():
+    source = ReplicaSnapshot("s0", 2, _metadata(7))
+    isolated = ReplicaSnapshot("s1", 0, _metadata(8), lifecycle_state="QUARANTINED")
+    scheduler = TrajectoryScheduler({**_config(), "allow_cross_version_recompute": True})
+
+    target, diagnostics = scheduler.choose(
+        {"request_id": "trajectory-1", "migration_required": True},
+        "s0",
+        [source, isolated],
+        source_metadata={"weight_version": 7},
+    )
+
+    assert target is source
+    assert diagnostics["resume_source"] is True
+    assert "mode" not in diagnostics
+    assert diagnostics["source_version"] == diagnostics["target_version"] == 7

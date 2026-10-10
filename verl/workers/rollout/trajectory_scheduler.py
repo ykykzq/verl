@@ -28,6 +28,7 @@ class ReplicaSnapshot:
     server_id: str
     inflight: int
     metadata: dict[str, Any]
+    lifecycle_state: str = "SERVING"
 
 
 @dataclass(frozen=True)
@@ -150,28 +151,62 @@ class TrajectoryScheduler:
                 kwargs.setdefault("backend", config.get("kv_transfer_backend", "remote_prefix"))
             self.gates.append(gate_type(**kwargs))
         self.min_score_improvement = float(config.get("min_score_improvement", 0.0))
+        self.allow_cross_version_recompute = bool(config.get("allow_cross_version_recompute", False))
 
     def choose(
         self,
         trajectory: dict[str, Any],
         source_server_id: str,
         replicas: list[ReplicaSnapshot],
+        source_metadata: dict[str, Any] | None = None,
     ) -> tuple[ReplicaSnapshot | None, dict[str, Any]]:
         by_id = {replica.server_id: replica for replica in replicas}
         source = by_id.get(source_server_id)
         if source is None:
             return None, {"reason": "source replica is no longer registered"}
+        if source_metadata:
+            source = ReplicaSnapshot(
+                source.server_id, source.inflight, {**source.metadata, **source_metadata}, source.lifecycle_state
+            )
+        source_version = source.metadata.get("weight_version")
 
         scores = {replica.server_id: self.scorer.score(trajectory, replica) for replica in replicas}
+        published_source = by_id[source_server_id]
+        if (
+            trajectory.get("migration_required", False)
+            and published_source.lifecycle_state == "SERVING"
+            and source_version is not None
+            and source_version == published_source.metadata.get("weight_version")
+            and SameModelGate().evaluate(MigrationContext(trajectory, source, published_source)).allowed
+        ):
+            return published_source, {
+                "resume_source": True,
+                "source_version": source_version,
+                "target_version": source_version,
+                "scores": scores,
+            }
         candidates = sorted(
-            (replica for replica in replicas if replica.server_id != source_server_id),
+            (
+                replica
+                for replica in replicas
+                if replica.lifecycle_state == "SERVING"
+                and (
+                    replica.server_id != source_server_id
+                    or (
+                        self.allow_cross_version_recompute
+                        and source_version is not None
+                        and replica.metadata.get("weight_version") is not None
+                        and source_version != replica.metadata["weight_version"]
+                    )
+                )
+            ),
             key=lambda replica: (scores[replica.server_id], replica.server_id),
             reverse=True,
         )
         rejections = []
         for target in candidates:
             improvement = scores[target.server_id] - scores[source.server_id]
-            if improvement < self.min_score_improvement:
+            if improvement < self.min_score_improvement and not trajectory.get("migration_required", False):
                 rejections.append(
                     {
                         "server_id": target.server_id,
@@ -181,7 +216,26 @@ class TrajectoryScheduler:
                 continue
 
             context = MigrationContext(trajectory=trajectory, source=source, target=target)
-            for gate in self.gates:
+            target_version = target.metadata.get("weight_version")
+            recompute = (
+                self.allow_cross_version_recompute
+                and source_version is not None
+                and target_version is not None
+                and source_version != target_version
+            )
+            mode = "recompute" if recompute else "remote_prefix"
+            # Custom placement policies cannot relax model or version compatibility.
+            gates = [SameModelGate()]
+            if not recompute:
+                gates.append(SameWeightVersionGate())
+            gates.extend(
+                gate
+                for gate in self.gates
+                if not (
+                    recompute and type(gate) in (DifferentReplicaGate, SameWeightVersionGate, KVTransferCapabilityGate)
+                )
+            )
+            for gate in gates:
                 result = gate.evaluate(context)
                 if not result.allowed:
                     rejections.append(
@@ -194,6 +248,9 @@ class TrajectoryScheduler:
                     break
             else:
                 return target, {
+                    "mode": mode,
+                    "source_version": source_version,
+                    "target_version": target_version,
                     "scores": scores,
                     "score_improvement": improvement,
                     "rejected_candidates": rejections,

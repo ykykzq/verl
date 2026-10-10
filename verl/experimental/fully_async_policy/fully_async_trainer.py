@@ -40,6 +40,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.tracking import Tracking
+from verl.workers.config import FineGrainedWeightUpdateConfig
 
 logger = logging.getLogger(__name__)
 
@@ -218,8 +219,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Setup checkpoint manager after rollouter is initialized"""
         replicas = await self.rollouter.get_replicas.remote()
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        fine_grained_config = omega_conf_to_dataclass(
+            self.config.actor_rollout_ref.rollout.get("fine_grained_weight_update", {}),
+            FineGrainedWeightUpdateConfig,
+        )
+        load_balancer = await self.rollouter.get_load_balancer.remote() if fine_grained_config.enabled else None
         self.checkpoint_manager = CheckpointEngineManager(
-            config=checkpoint_engine_config, actor_wg=self.actor_wg, replicas=replicas
+            config=checkpoint_engine_config,
+            actor_wg=self.actor_wg,
+            replicas=replicas,
+            fine_grained_config=fine_grained_config,
+            load_balancer_handle=load_balancer,
         )
         print(f"[FullyAsyncTrainer] Checkpoint manager initialized (backend={checkpoint_engine_config.backend})")
 

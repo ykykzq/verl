@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -25,7 +26,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.import_utils import import_external_libs
 from verl.utils.ray_utils import auto_await
-from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
+from verl.workers.config import CheckpointEngineConfig, FineGrainedWeightUpdateConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
 
@@ -148,6 +149,14 @@ class CheckpointEngine(ABC):
             A dictionary that contains the metadata of the worker group.
         """
         raise NotImplementedError
+
+    def prepare_temporary(self) -> dict[str, Any]:
+        """Prepare a group whose membership may change on every update.
+
+        Backends opt in by overriding this method and guaranteeing that finalize
+        tears down the group, including after partial prepare or initialization.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support temporary replica process groups")
 
     @classmethod
     @abstractmethod
@@ -411,13 +420,255 @@ class CheckpointEngineManager:
         config: CheckpointEngineConfig,
         actor_wg: RayWorkerGroup,
         replicas: list[RolloutReplica],
+        fine_grained_config: FineGrainedWeightUpdateConfig | None = None,
+        load_balancer_handle: Any = None,
     ) -> None:
+        self.fine_grained_config = fine_grained_config or FineGrainedWeightUpdateConfig()
+        self.load_balancer = load_balancer_handle
+        if self.fine_grained_config.enabled:
+            if self.load_balancer is None:
+                raise ValueError("fine-grained weight updates require a Router load_balancer_handle")
+            if config.backend == "naive":
+                raise ValueError("fine-grained weight updates require a standalone checkpoint engine")
+        self._weight_update_lock = asyncio.Lock()
         self.config = config
         self.backend = config.backend
         import_external_libs(self.config.custom_backend_module or None)
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
+        if self.fine_grained_config.enabled and (
+            getattr(self.backend_cls, "prepare_temporary", CheckpointEngine.prepare_temporary)
+            is CheckpointEngine.prepare_temporary
+        ):
+            raise ValueError(f"checkpoint engine {self.backend!r} does not support temporary replica process groups")
         self.actor_wg = actor_wg
         self.replicas = replicas
+
+    def _require_fine_grained(self) -> None:
+        if not self.fine_grained_config.enabled or self.load_balancer is None:
+            raise ValueError("fine-grained weight updates must be enabled with a Router")
+
+    def _replica(self, replica_rank: int) -> RolloutReplica:
+        for replica in self.replicas:
+            if replica.replica_rank == replica_rank:
+                return replica
+        raise ValueError(f"unknown replica rank {replica_rank}")
+
+    @auto_await
+    async def get_replica_states(self) -> dict[int, dict]:
+        self._require_fine_grained()
+        states = await self.load_balancer.get_replica_states.remote()
+        return {r.replica_rank: states[r.server_address] for r in self.replicas}
+
+    @auto_await
+    async def pin_replica(self, replica_rank: int, reason: str) -> dict:
+        self._require_fine_grained()
+        return await self.load_balancer.pin_replica.remote(self._replica(replica_rank).server_address, reason=reason)
+
+    @auto_await
+    async def unpin_replica(self, replica_rank: int) -> dict:
+        self._require_fine_grained()
+        return await self.load_balancer.unpin_replica.remote(self._replica(replica_rank).server_address)
+
+    @auto_await
+    async def update_replica_weights(self, replica_rank: int, global_steps: int) -> dict:
+        self._require_fine_grained()
+        return await self.update_weights(global_steps=global_steps, replica_ranks=[replica_rank])
+
+    @auto_await
+    async def recover_replica(self, replica_rank: int, global_steps: int) -> dict:
+        self._require_fine_grained()
+        if global_steps is None:
+            raise ValueError("fine-grained weight updates require an explicit global_steps version")
+        async with self._weight_update_lock:
+            return await self._update_selected_replicas([self._replica(replica_rank)], global_steps, recovery=True)
+
+    @staticmethod
+    async def _run_worker_calls(*calls) -> list:
+        """Settle every dispatched RPC before finalization, including on cancellation."""
+        refs, errors = [], []
+        for call in calls:
+            try:
+                refs.extend(call())
+            except Exception as error:
+                errors.append(error)
+        pending = asyncio.gather(*refs, return_exceptions=True)
+        try:
+            results = await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            await pending
+            raise
+        errors.extend(result for result in results if isinstance(result, BaseException))
+        if errors:
+            raise errors[0]
+        return results
+
+    async def _transfer_replica_weights(self, replica: RolloutReplica, global_steps: int) -> dict:
+        rollout = RayWorkerGroup(
+            worker_handles=replica.workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls)
+        )
+        actor = self.actor_wg
+        try:
+            metadata = await self._run_worker_calls(
+                lambda: actor.execute_checkpoint_engine(["prepare_temporary"] * actor.world_size),
+                lambda: rollout.execute_checkpoint_engine(["prepare_temporary"] * rollout.world_size),
+            )
+            actor_kwargs, rollout_kwargs = self.backend_cls.build_topology(
+                actor.world_size, rollout.world_size, metadata
+            )
+            for group, kwargs in ((actor, actor_kwargs), (rollout, rollout_kwargs)):
+                for key, values in kwargs.items():
+                    if len(values) != group.world_size:
+                        raise ValueError(f"topology {key} must have length {group.world_size}")
+                kwargs["method"] = ["init_process_group"] * group.world_size
+            await self._run_worker_calls(
+                lambda: actor.execute_checkpoint_engine(**actor_kwargs),
+                lambda: rollout.execute_checkpoint_engine(**rollout_kwargs),
+            )
+            results = await self._run_worker_calls(
+                lambda: actor.update_weights(global_steps=global_steps, mode=self.backend),
+                lambda: rollout.update_weights(global_steps=global_steps),
+            )
+            metrics = {}
+            for result in results[: actor.world_size]:
+                if isinstance(result, dict):
+                    metrics.update(result)
+            return metrics
+        finally:
+            # Prepare may have partially succeeded before raising. Both sides must
+            # finalize even when topology creation, init, or the full stream fails.
+            await self._run_worker_calls(
+                lambda: actor.execute_checkpoint_engine(["finalize"] * actor.world_size),
+                lambda: rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size),
+            )
+
+    async def _close_failed_replica(self, replica: RolloutReplica) -> list[BaseException]:
+        errors = []
+        try:
+            await replica.abort_all_requests(reject_request=True)
+        except Exception as error:
+            errors.append(error)
+        calls = []
+        for server in replica.servers:
+            try:
+                calls.append(server.abort_weight_update_from_ipc.remote())
+            except Exception as error:
+                errors.append(error)
+        results = await asyncio.gather(*calls, return_exceptions=True)
+        errors.extend(result for result in results if isinstance(result, BaseException))
+        return errors
+
+    async def _quarantine_replica(self, replica: RolloutReplica, error: BaseException) -> str:
+        async def quarantine():
+            cleanup_errors = await self._close_failed_replica(replica)
+            detail = f"{type(error).__name__}: {error}"
+            if cleanup_errors:
+                detail += f"; cleanup errors: {cleanup_errors}"
+            await self.load_balancer.fail_replica_update.remote(replica.server_address, detail)
+            return detail
+
+        # Keep the transfer lock until isolation completes, even on cancellation.
+        cleanup = asyncio.create_task(quarantine())
+        try:
+            return await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+            raise
+
+    async def _update_one_replica(self, replica: RolloutReplica, global_steps: int, recovery: bool) -> dict:
+        server_id = replica.server_address
+        begin = self.load_balancer.begin_replica_recovery if recovery else self.load_balancer.begin_replica_update
+        begin_call = asyncio.ensure_future(begin.remote(server_id, global_steps))
+        try:
+            state = await asyncio.shield(begin_call)
+        except asyncio.CancelledError as error:
+            # A cancelled wait does not retract a Ray actor state transition.
+            # Resolve its outcome before deciding whether cleanup is required.
+            try:
+                await begin_call
+            except Exception:
+                raise error from None
+            await self._quarantine_replica(replica, error)
+            raise
+        except Exception:
+            # The begin operation checks pin and lifecycle atomically. A pin may
+            # have arrived after the caller selected this replica.
+            state = (await self.load_balancer.get_replica_states.remote())[server_id]
+            if state["pin"] is not None and not recovery:
+                return {"status": "pinned", "version": state["weight_version"], "attempts": 0}
+            raise
+        committed_version = state["weight_version"]
+        start = time.monotonic()
+        attempts = 0
+        published = False
+        try:
+            while True:
+                attempts += 1
+                try:
+                    await replica.abort_all_requests(reject_request=True)
+                    await replica.release_kv_cache()
+                    metrics = await self._transfer_replica_weights(replica, global_steps)
+                    await replica.resume_kv_cache()
+                    await replica.resume_generation()
+                    capabilities = await replica.server_handle.get_trajectory_migration_capabilities.remote()
+                    if capabilities.get("weight_version") != global_steps:
+                        raise RuntimeError("replica did not install the requested weight version")
+                    commit_call = asyncio.ensure_future(
+                        self.load_balancer.commit_replica_update.remote(server_id, global_steps, metadata=capabilities)
+                    )
+                    try:
+                        await asyncio.shield(commit_call)
+                    except asyncio.CancelledError:
+                        await commit_call
+                        published = True
+                        raise
+                    published = True
+                    return {
+                        "status": "updated",
+                        "version": global_steps,
+                        "attempts": attempts,
+                        "duration_s": time.monotonic() - start,
+                        "metrics": metrics,
+                    }
+                except Exception:
+                    if attempts > self.fine_grained_config.max_retries:
+                        raise
+                    cleanup_errors = await self._close_failed_replica(replica)
+                    if cleanup_errors:
+                        raise RuntimeError(f"replica update cleanup failed: {cleanup_errors}") from cleanup_errors[0]
+                    await asyncio.sleep(self.fine_grained_config.retry_backoff_s)
+        except BaseException as error:
+            if published:
+                raise
+            detail = await self._quarantine_replica(replica, error)
+            if not isinstance(error, Exception) or not self.fine_grained_config.continue_on_failure:
+                raise
+            return {
+                "status": "quarantined",
+                "version": committed_version,
+                "attempts": attempts,
+                "duration_s": time.monotonic() - start,
+                "error": detail,
+            }
+
+    async def _update_selected_replicas(
+        self, replicas: list[RolloutReplica], global_steps: int, recovery: bool = False
+    ) -> dict:
+        result = {"replicas": {}, "updated": 0, "pinned": 0, "quarantined": 0, "retried": 0}
+        for replica in replicas:
+            state = (await self.load_balancer.get_replica_states.remote())[replica.server_address]
+            if state["lifecycle_state"] == "QUARANTINED" and not recovery:
+                entry = {
+                    "status": "quarantined",
+                    "version": state["weight_version"],
+                    "attempts": 0,
+                    "error": state["last_update_error"],
+                }
+            else:
+                entry = await self._update_one_replica(replica, global_steps, recovery)
+            result["replicas"][replica.replica_rank] = entry
+            result[entry["status"]] += 1
+            result["retried"] += max(0, entry["attempts"] - 1)
+        return result
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
@@ -485,7 +736,18 @@ class CheckpointEngineManager:
 
     @auto_await
     async def resume_generation_replicas(self):
-        """Resume generation on all replicas after abort_all_requests."""
+        """Resume eligible replicas without reopening isolated weight updates."""
+        if self.fine_grained_config.enabled:
+            async with self._weight_update_lock:
+                states = await self.load_balancer.get_replica_states.remote()
+                await asyncio.gather(
+                    *[
+                        r.resume_generation()
+                        for r in self.replicas
+                        if states[r.server_address]["lifecycle_state"] == "SERVING"
+                    ]
+                )
+            return
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
 
     @auto_await
@@ -507,12 +769,31 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.resume_kv_cache() for r in self.replicas])
 
     @auto_await
-    async def update_weights(self, global_steps: int = None):
+    async def update_weights(self, global_steps: int = None, replica_ranks: list[int] | None = None):
         """Update weights from actor worker group to rollout replicas.
 
         Args:
             global_steps: The global steps of the actor worker group.
+            replica_ranks: Target ranks for fine-grained updates; omitted updates
+                all unpinned, non-quarantined replicas sequentially.
         """
+
+        if self.fine_grained_config.enabled:
+            self._require_fine_grained()
+            if global_steps is None:
+                raise ValueError("fine-grained weight updates require an explicit global_steps version")
+            selected = list(self.replicas) if replica_ranks is None else [self._replica(rank) for rank in replica_ranks]
+            if len({r.replica_rank for r in selected}) != len(selected):
+                raise ValueError("replica_ranks must not contain duplicate ranks")
+            async with self._weight_update_lock:
+                if replica_ranks is not None:
+                    states = await self.load_balancer.get_replica_states.remote()
+                    for replica in selected:
+                        if states[replica.server_address]["lifecycle_state"] == "QUARANTINED":
+                            raise RuntimeError(f"replica {replica.replica_rank} is quarantined; use recover_replica")
+                return await self._update_selected_replicas(selected, global_steps)
+        if replica_ranks is not None:
+            raise ValueError("replica_ranks requires fine-grained weight updates to be enabled")
 
         # 0. update weights for sync training with colocated actor and rollout
         if self.backend == "naive":

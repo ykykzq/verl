@@ -32,6 +32,7 @@ __all__ = [
     "PrometheusConfig",
     "RolloutConfig",
     "CheckpointEngineConfig",
+    "FineGrainedWeightUpdateConfig",
     "TrajectoryMigrationConfig",
 ]
 
@@ -143,10 +144,27 @@ class CheckpointEngineConfig(BaseConfig):
 
 
 @dataclass
+class FineGrainedWeightUpdateConfig(BaseConfig):
+    """Serial, independently recoverable weight updates for rollout replicas."""
+
+    enabled: bool = False
+    max_retries: int = 1
+    retry_backoff_s: float = 1.0
+    continue_on_failure: bool = True
+
+    def __post_init__(self):
+        if self.max_retries < 0:
+            raise ValueError("fine_grained_weight_update.max_retries must be non-negative")
+        if self.retry_backoff_s < 0:
+            raise ValueError("fine_grained_weight_update.retry_backoff_s must be non-negative")
+
+
+@dataclass
 class TrajectoryMigrationConfig(BaseConfig):
     """Dynamic scheduling of an in-progress trajectory across rollout replicas."""
 
     enabled: bool = False
+    allow_cross_version_recompute: bool = False
     checkpoint_tokens: int = 64
     scorer_class: str = "verl.workers.rollout.trajectory_scheduler.LoadAwareTrajectoryReplicaScorer"
     scorer_kwargs: dict = field(default_factory=dict)
@@ -276,6 +294,8 @@ class RolloutConfig(BaseConfig):
     # Checkpoint Engine config for update weights from trainer to rollout
     checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
 
+    fine_grained_weight_update: FineGrainedWeightUpdateConfig = field(default_factory=FineGrainedWeightUpdateConfig)
+
     profiler: Optional[ProfilerConfig] = None
 
     enable_chunked_prefill: bool = True
@@ -381,6 +401,27 @@ class RolloutConfig(BaseConfig):
                 f"rollout.disaggregation.enabled=True requires rollout.name in ('sglang', 'vllm'); got {self.name!r}."
             )
 
+        if isinstance(self.fine_grained_weight_update, dict):
+            object.__setattr__(
+                self,
+                "fine_grained_weight_update",
+                FineGrainedWeightUpdateConfig(**self.fine_grained_weight_update),
+            )
+        elif not isinstance(self.fine_grained_weight_update, FineGrainedWeightUpdateConfig):
+            if not isinstance(self.fine_grained_weight_update, DictConfig):
+                raise TypeError(
+                    "rollout.fine_grained_weight_update must be dict, DictConfig, or FineGrainedWeightUpdateConfig; "
+                    f"got {type(self.fine_grained_weight_update).__name__}."
+                )
+            object.__setattr__(
+                self,
+                "fine_grained_weight_update",
+                FineGrainedWeightUpdateConfig(**OmegaConf.to_container(self.fine_grained_weight_update, resolve=True)),
+            )
+
+        if self.fine_grained_weight_update.enabled and self.name != "rtp_llm":
+            raise ValueError("fine-grained weight updates currently support rollout.name=rtp_llm only")
+
         if isinstance(self.trajectory_migration, dict):
             object.__setattr__(
                 self,
@@ -404,7 +445,7 @@ class RolloutConfig(BaseConfig):
                 raise ValueError("trajectory migration currently supports rollout.name=rtp_llm only")
             if self.trajectory_migration.kv_transfer_backend != "remote_prefix":
                 raise ValueError("rtp_llm trajectory migration currently requires kv_transfer_backend=remote_prefix")
-            if not self.enable_prefix_caching:
+            if not self.enable_prefix_caching and not self.trajectory_migration.allow_cross_version_recompute:
                 raise ValueError("rtp_llm trajectory migration requires rollout.enable_prefix_caching=True")
 
         if self.topk_log_probs:

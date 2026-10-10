@@ -182,15 +182,26 @@ class NCCLCheckpointEngine(CheckpointEngine):
     def finalize(self):
         """Destroy the NCCL process group if rebuild_group is True."""
         if self.rebuild_group:
-            if self.rank >= 0:
+            if collective.is_group_initialized(self.group_name):
                 collective.destroy_collective_group(self.group_name)
             self.rank = None
             self.world_size = None
+            if not self.is_master and getattr(self, "socket", None) is not None:
+                context = self.socket.context
+                self.socket.close(linger=0)
+                self.socket = None
+                context.term()
 
         self.send_buf = None
         self.recv_buf = None
 
         torch.cuda.empty_cache()
+
+    def prepare_temporary(self) -> WorkerMetadata:
+        """Never reuse a communicator belonging to a previous rollout replica."""
+        self.rebuild_group = True
+        self.finalize()
+        return self.prepare()
 
     @staticmethod
     def _single_sender_ranks(actor_wg_world_size: int) -> list[int]:

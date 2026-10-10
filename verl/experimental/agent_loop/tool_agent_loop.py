@@ -260,14 +260,36 @@ class ToolAgentLoop(AgentLoopBase):
 
         if not agent_data.extra_fields:
             agent_data.extra_fields.update(output.extra_fields)
+            if not output.token_ids:
+                for key in ("min_global_steps", "max_global_steps", "global_steps"):
+                    agent_data.extra_fields.pop(key, None)
         else:
-            # Multi-round calls, only update the maximum max_global_steps.
-            max_global_steps = output.extra_fields.get("max_global_steps", None)
-            if max_global_steps:
-                agent_data.extra_fields["max_global_steps"] = max_global_steps
             for key in SPEC_DECODE_EXTRA_KEYS:
                 if key in output.extra_fields and key in agent_data.extra_fields:
                     agent_data.extra_fields[key] = int(agent_data.extra_fields[key]) + int(output.extra_fields[key])
+            if "trajectory_migrations" in output.extra_fields:
+                agent_data.extra_fields["trajectory_migrations"] = (
+                    agent_data.extra_fields.get("trajectory_migrations", [])
+                    + output.extra_fields["trajectory_migrations"]
+                )
+            if "trajectory_migration_counts" in output.extra_fields:
+                counts = dict(agent_data.extra_fields.get("trajectory_migration_counts", {}))
+                for mode, count in output.extra_fields["trajectory_migration_counts"].items():
+                    counts[mode] = counts.get(mode, 0) + count
+                agent_data.extra_fields["trajectory_migration_counts"] = counts
+            for key in ("trajectory_migration_replans", "forced_prefill_tokens"):
+                if key in output.extra_fields:
+                    agent_data.extra_fields[key] = agent_data.extra_fields.get(key, 0) + output.extra_fields[key]
+
+        if output.token_ids:
+            # Pinned replicas allow versions to move backward between tool turns.
+            for key, combine in (("min_global_steps", min), ("max_global_steps", max)):
+                version = output.extra_fields.get(key)
+                previous = agent_data.extra_fields.get(key)
+                if version is not None:
+                    agent_data.extra_fields[key] = version if previous is None else combine(previous, version)
+            if "global_steps" in output.extra_fields:
+                agent_data.extra_fields["global_steps"] = output.extra_fields["global_steps"]
 
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids

@@ -18,6 +18,7 @@ Utility classes for manage and request LLM servers:
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 from dataclasses import asdict, is_dataclass
@@ -76,6 +77,10 @@ class LLMServerClient:
         if migration_config is None or not bool(getattr(migration_config, "enabled", False)):
             return None
         return migration_config
+
+    def _fine_grained_weight_update_enabled(self) -> bool:
+        rollout_config = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
+        return bool(getattr(getattr(rollout_config, "fine_grained_weight_update", None), "enabled", False))
 
     async def _acquire_server(self, request_id: str, **extra) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
@@ -224,15 +229,27 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         # When only_hybrid is True, hybrid replicas are the sole rollout resource and
         # the LB may be temporarily empty during weight sync / scaling transitions.
         # In that case keep retrying every 1 s until a server becomes available.
-        # Otherwise raise immediately so callers see the error right away.
+        # Fine-grained updates also wait while a registered replica is updating.
         while True:
             try:
                 return await super()._acquire_server(request_id, **extra)
             except RuntimeError as e:
-                if "No available servers in load balancer" in str(e) and self._only_hybrid:
-                    await asyncio.sleep(1)
-                else:
+                if "No available servers in load balancer" not in str(e):
                     raise
+                if self._fine_grained_weight_update_enabled():
+                    await self._wait_for_fine_grained_replica()
+                    continue
+                if not self._only_hybrid:
+                    raise
+                await asyncio.sleep(1)
+
+    async def _wait_for_fine_grained_replica(self) -> None:
+        states = await self._load_balancer.get_replica_states.remote()
+        if states and all(state["lifecycle_state"] == "QUARANTINED" for state in states.values()):
+            raise RuntimeError("All rollout replicas are quarantined; recover a replica before retrying")
+        if not any(state["lifecycle_state"] in ("SERVING", "UPDATING") for state in states.values()):
+            raise RuntimeError("No available servers in load balancer")
+        await asyncio.sleep(1)
 
     def _configured_response_length(self) -> Optional[int]:
         """Per-response token budget from the rollout config, or ``None`` when unavailable.
@@ -278,6 +295,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         checkpoint_index: int,
         source_weight_version: Any,
         sampling_params: dict[str, Any],
+        migration_required: bool = False,
     ) -> dict[str, Any] | None:
         migration_config = self._trajectory_migration_config()
         if migration_config is None or self._load_balancer is None:
@@ -290,6 +308,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             "prefix_tokens": len(prompt_ids) + len(final_output.token_ids),
             "checkpoint_index": checkpoint_index,
         }
+        if migration_required:
+            trajectory_summary["migration_required"] = True
         source_metadata = {
             "weight_version": "initial" if source_weight_version is None else source_weight_version,
         }
@@ -313,15 +333,39 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         }
         ticket = None
         try:
-            ticket = await asyncio.wait_for(
-                decision["source_server"].prepare_trajectory_migration.remote(
-                    trajectory_state=trajectory_state,
-                    target_metadata=decision["target_metadata"],
-                    backend=str(getattr(migration_config, "kv_transfer_backend", "remote_prefix")),
-                    timeout_s=timeout_s,
-                ),
-                timeout=timeout_s,
-            )
+            if decision.get("resume_source", False):
+                await self._load_balancer.commit_trajectory_migration.remote(
+                    request_id=request_id,
+                    decision_id=decision_id,
+                )
+                return {"resume_source": True}
+            mode = decision.get("mode", "remote_prefix")
+            source_version = decision.get("source_version", source_metadata["weight_version"])
+            target_version = decision.get("target_version", decision["target_metadata"].get("weight_version"))
+            if mode == "recompute":
+                digest = hashlib.sha256()
+                for token_id in prompt_ids + final_output.token_ids:
+                    digest.update(int(token_id).to_bytes(8, byteorder="little", signed=True))
+                ticket = {
+                    "backend": "recompute",
+                    "mode": mode,
+                    "model_id": decision["source_metadata"]["model_id"],
+                    "request_id": request_id,
+                    "prefix_tokens": trajectory_summary["prefix_tokens"],
+                    "prefix_digest": digest.hexdigest(),
+                    "source_version": source_version,
+                    "target_version": target_version,
+                }
+            else:
+                ticket = await asyncio.wait_for(
+                    decision["source_server"].prepare_trajectory_migration.remote(
+                        trajectory_state=trajectory_state,
+                        target_metadata=decision["target_metadata"],
+                        backend=str(getattr(migration_config, "kv_transfer_backend", "remote_prefix")),
+                        timeout_s=timeout_s,
+                    ),
+                    timeout=timeout_s,
+                )
             accepted = await asyncio.wait_for(
                 decision["target_server"].accept_trajectory_migration.remote(
                     ticket=ticket,
@@ -341,6 +385,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 "checkpoint_index": checkpoint_index,
                 "prefix_tokens": trajectory_summary["prefix_tokens"],
                 "backend": ticket["backend"],
+                "mode": mode,
+                "source_version": source_version,
+                "target_version": target_version,
+                "migration_ticket": ticket,
             }
         except asyncio.CancelledError:
             await asyncio.shield(
@@ -408,6 +456,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
         migration_config = self._trajectory_migration_config()
         checkpoint_tokens = int(getattr(migration_config, "checkpoint_tokens", 0)) if migration_config else None
+        versioned_continuation = migration_config is not None and (
+            self._fine_grained_weight_update_enabled()
+            or bool(getattr(migration_config, "allow_cross_version_recompute", False))
+        )
 
         if original_max_tokens is None:
             # Without an explicit limit each attempt falls back to the server-side default, which is
@@ -434,9 +486,37 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         # (initial-prompt) prefill's hit count, matching single-prefill semantics.
         num_cached_tokens = None
         migration_history: list[dict[str, Any]] = []
+        migration_replans = 0
+        forced_prefill_tokens = None
+        migration_ticket = None
+        pending_migration = None
+        replan_migration = False
+        last_source_server_id = None
+        last_source_version = None
         checkpoint_index = 0
 
         while True:
+            if replan_migration:
+                migration = await self._try_migrate_trajectory(
+                    request_id=request_id,
+                    source_server_id=last_source_server_id,
+                    prompt_ids=prompt_ids,
+                    final_output=final_output,
+                    checkpoint_index=checkpoint_index,
+                    source_weight_version=last_source_version,
+                    sampling_params=sampling_params,
+                    migration_required=True,
+                )
+                if migration is None:
+                    if self._fine_grained_weight_update_enabled():
+                        await self._wait_for_fine_grained_replica()
+                    else:
+                        await asyncio.sleep(1)
+                    continue
+                migration_ticket = migration.pop("migration_ticket", None)
+                pending_migration = None if migration.get("resume_source", False) else migration
+                replan_migration = False
+
             if migration_config is not None:
                 if original_max_tokens is None or limit_key is None:
                     raise ValueError(
@@ -444,6 +524,14 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     )
                 remaining_tokens = original_max_tokens - len(final_output.token_ids)
                 sampling_params[limit_key] = min(checkpoint_tokens, remaining_tokens)
+
+            continuation_kwargs = {}
+            if versioned_continuation and final_output.token_ids:
+                continuation_kwargs["expected_source_version"] = (
+                    "initial" if last_source_version is None else last_source_version
+                )
+            if migration_ticket is not None:
+                continuation_kwargs["migration_ticket"] = migration_ticket
 
             # 1. generate tokens
             output = await super().generate(
@@ -454,8 +542,20 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 video_data=video_data,
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
+                **continuation_kwargs,
                 **kwargs,
             )
+            migration_ticket = None
+            if migration_config is not None and output.extra_fields.get("migration_rejected", False):
+                # A cleared acceptance or a reroute to newer weights must be planned again.
+                migration_replans += 1
+                pending_migration = None
+                replan_migration = versioned_continuation
+                sampling_params[limit_key] = original_max_tokens - len(final_output.token_ids)
+                continue
+            if pending_migration is not None:
+                migration_history.append(pending_migration)
+                pending_migration = None
 
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
@@ -486,13 +586,18 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             # carry the initial prefill's prefix-cache hit count forward
             if num_cached_tokens is None:
                 num_cached_tokens = output.extra_fields.get("num_cached_tokens")
+            if "forced_prefill_tokens" in output.extra_fields:
+                forced_prefill_tokens = (forced_prefill_tokens or 0) + output.extra_fields["forced_prefill_tokens"]
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
             source_server_id = output.extra_fields.pop(_ROUTE_SERVER_ID_FIELD, None)
-            if min_global_steps is None:
-                min_global_steps = global_steps
-            max_global_steps = global_steps
+            if output.token_ids:
+                last_source_server_id = source_server_id
+                last_source_version = global_steps
+                if global_steps is not None:
+                    min_global_steps = global_steps if min_global_steps is None else min(min_global_steps, global_steps)
+                    max_global_steps = global_steps if max_global_steps is None else max(max_global_steps, global_steps)
 
             # 3. update max_new_tokens
             if original_max_tokens is not None:
@@ -515,7 +620,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     sampling_params=sampling_params,
                 )
                 if migration is not None:
-                    migration_history.append(migration)
+                    migration_ticket = migration.pop("migration_ticket")
+                    pending_migration = migration
                 continue
 
             # 4. check stop reason
@@ -529,12 +635,20 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
             await asyncio.sleep(1)
 
-        final_output.extra_fields["global_steps"] = global_steps
+        final_output.extra_fields["global_steps"] = last_source_version if final_output.token_ids else global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
         final_output.extra_fields["num_cached_tokens"] = num_cached_tokens
+        if forced_prefill_tokens is not None:
+            final_output.extra_fields["forced_prefill_tokens"] = forced_prefill_tokens
         if migration_config is not None:
+            final_output.extra_fields["forced_prefill_tokens"] = forced_prefill_tokens or 0
             final_output.extra_fields["trajectory_migrations"] = migration_history
+            final_output.extra_fields["trajectory_migration_counts"] = {
+                mode: sum(migration["mode"] == mode for migration in migration_history)
+                for mode in ("remote_prefix", "recompute")
+            }
+            final_output.extra_fields["trajectory_migration_replans"] = migration_replans
         return final_output
 
 
@@ -673,7 +787,8 @@ class LLMServerManager:
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
         self.server_metadata = {}
         migration_config = getattr(self.rollout_config, "trajectory_migration", None)
-        if getattr(migration_config, "enabled", False):
+        fine_grained_config = getattr(self.rollout_config, "fine_grained_weight_update", None)
+        if getattr(migration_config, "enabled", False) or getattr(fine_grained_config, "enabled", False):
             for address, handle in zip(self.server_addresses, self.server_handles, strict=True):
                 try:
                     self.server_metadata[address] = await handle.get_trajectory_migration_capabilities.remote()

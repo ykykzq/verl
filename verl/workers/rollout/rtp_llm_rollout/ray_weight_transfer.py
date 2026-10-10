@@ -88,19 +88,37 @@ class RayIpcWeightSender:
 
     async def async_send_weights(self, weights) -> None:
         round_id = uuid.uuid4().hex
-        descriptor = self._init_buffer()
+        weight_iterator = ensure_async_iterator(weights)
+        next_weight = None
+        iterator_failed = False
+        failed = False
         began = False
         try:
+            descriptor = self._init_buffer()
+            began = True
             await self.server_handle.begin_weight_update_from_ipc.remote(
                 round_id=round_id,
                 descriptor=descriptor,
             )
-            began = True
-
             sequence = 0
             offset = 0
             entries: list[dict[str, Any]] = []
-            async for name, weight in ensure_async_iterator(weights):
+            while True:
+                # A cancelled sender must not close a generator in a collective.
+                next_weight = asyncio.ensure_future(anext(weight_iterator))
+                try:
+                    item = await asyncio.shield(next_weight)
+                except StopAsyncIteration:
+                    next_weight = None
+                    break
+                except asyncio.CancelledError:
+                    iterator_failed = next_weight.cancelled()
+                    raise
+                except BaseException:
+                    iterator_failed = True
+                    raise
+                next_weight = None
+                name, weight = item
                 alignment = weight.element_size()
                 offset = (offset + alignment - 1) // alignment * alignment
                 if offset + weight.nbytes > self.bucket_size and entries:
@@ -134,14 +152,42 @@ class RayIpcWeightSender:
             await self._send_bucket(round_id, sequence, entries, is_last=True)
             await self.server_handle.finish_weight_update_from_ipc.remote(round_id=round_id)
         except BaseException:
-            if began:
+            failed = True
+
+            async def drain_and_abort():
+                if not iterator_failed:
+                    try:
+                        if next_weight is not None:
+                            await next_weight
+                        # Every checkpoint rank must consume the same collectives,
+                        # even after this replica can no longer apply their tensors.
+                        async for _ in weight_iterator:
+                            pass
+                    except StopAsyncIteration:
+                        pass
+                    except BaseException:
+                        logger.warning("Failed to drain weight-update round %s", round_id, exc_info=True)
+                if began:
+                    try:
+                        await self.server_handle.abort_weight_update_from_ipc.remote(round_id=round_id)
+                    except BaseException:
+                        logger.warning("Failed to abort rtp-llm weight-update round %s", round_id, exc_info=True)
+
+            recovery = asyncio.create_task(drain_and_abort())
+            while not recovery.done():
                 try:
-                    await asyncio.shield(self.server_handle.abort_weight_update_from_ipc.remote(round_id=round_id))
-                except BaseException:
-                    logger.warning("Failed to abort rtp-llm weight-update round %s", round_id, exc_info=True)
+                    await asyncio.shield(recovery)
+                except asyncio.CancelledError:
+                    pass
+            recovery.result()
             raise
         finally:
-            self._cleanup()
+            try:
+                self._cleanup()
+            except BaseException:
+                if not failed:
+                    raise
+                logger.warning("Failed to clean up weight-update round %s", round_id, exc_info=True)
 
     async def _send_bucket(
         self,

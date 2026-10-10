@@ -110,6 +110,9 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.ref.use_torch_compile=False \
     actor_rollout_ref.rollout.name=rtp_llm \
     actor_rollout_ref.rollout.mode=async \
+    actor_rollout_ref.rollout.fine_grained_weight_update.enabled=True \
+    actor_rollout_ref.rollout.trajectory_migration.enabled=True \
+    actor_rollout_ref.rollout.trajectory_migration.allow_cross_version_recompute=True \
     actor_rollout_ref.rollout.n=${N_RESPONSES} \
     actor_rollout_ref.rollout.prompt_length=${MAX_PROMPT_LENGTH} \
     actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH} \

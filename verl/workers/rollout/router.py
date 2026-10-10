@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import random
+from copy import deepcopy
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -150,8 +151,8 @@ class GlobalRequestLoadBalancer:
     - **Least-loaded Selection**: When no sticky session exists, selects the
       server with the fewest in-flight requests.
     - **Deterministic Routing**: When ``full_determinism=True``, routes every
-      request by ``hash(request_id) % len(servers)`` over the full pool so the
-      same request always routes to the same replica across runs.
+      request by its hash over the serving pool so the same request routes to
+      the same replica while that pool remains unchanged.
     - **Dynamic Server Management**: Supports add/remove servers at runtime
       for hybrid scaling.
     """
@@ -171,7 +172,19 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
         self._full_determinism = full_determinism
-        self._server_metadata = {sid: dict((server_metadata or {}).get(sid, {})) for sid in servers}
+        self._server_metadata = {sid: deepcopy((server_metadata or {}).get(sid, {})) for sid in servers}
+        self._replica_states = {
+            sid: {
+                "lifecycle_state": "SERVING",
+                "weight_version": self._server_metadata[sid].get("weight_version"),
+                "desired_weight_version": None,
+                "pin": None,
+                "last_update_error": None,
+            }
+            for sid in servers
+        }
+        self._managed_versions: set[str] = set()
+        self._metadata_epochs = {sid: object() for sid in servers}
         self._migration_config = dict(trajectory_migration_config or {})
         self._trajectory_scheduler = (
             TrajectoryScheduler(self._migration_config) if self._migration_config.get("enabled", False) else None
@@ -192,24 +205,24 @@ class GlobalRequestLoadBalancer:
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
             # Check if server is still in the active pool
-            if server_id in self._inflight_requests:
+            if self._is_serving(server_id):
                 self._inflight_requests[server_id] += 1
                 return server_id, self._servers[server_id]
             # Server was removed, clear stale cache entry and re-select
             del self._request_id_to_server[request_id]
 
         # Select new server (least-loaded among available)
-        if not self._inflight_requests:
+        serving = {sid: count for sid, count in self._inflight_requests.items() if self._is_serving(sid)}
+        if not serving:
             raise RuntimeError("No available servers in load balancer")
 
         if self._full_determinism:
-            # Full-hash routing: same request_id always lands on the same replica
-            # across runs. Least-loaded selection depends on async arrival timing,
-            # which varies run-to-run, so it is bypassed entirely here.
-            server_id = list(self._servers)[hash(request_id) % len(self._servers)]
+            # Hash only the serving pool; isolation takes precedence over affinity.
+            # Least-loaded selection depends on async arrival timing, so bypass it.
+            server_id = list(serving)[hash(request_id) % len(serving)]
         else:
-            min_count = min(self._inflight_requests.values())
-            candidates = [sid for sid, count in self._inflight_requests.items() if count == min_count]
+            min_count = min(serving.values())
+            candidates = [sid for sid, count in serving.items() if count == min_count]
             server_id = random.choice(candidates)
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
@@ -251,6 +264,17 @@ class GlobalRequestLoadBalancer:
             self._servers[sid] = handle
             self._server_metadata.setdefault(sid, {})
             self._migration_reservations.setdefault(sid, 0)
+            self._replica_states.setdefault(
+                sid,
+                {
+                    "lifecycle_state": "SERVING",
+                    "weight_version": None,
+                    "desired_weight_version": None,
+                    "pin": None,
+                    "last_update_error": None,
+                },
+            )
+            self._metadata_epochs[sid] = object()
         logger.info(f"[GlobalLoadBalancer] added {len(servers)} servers")
 
     def remove_servers(self, server_ids: list[str]) -> None:
@@ -262,18 +286,112 @@ class GlobalRequestLoadBalancer:
             server_ids: List of server identifiers to remove.
         """
         for sid in server_ids:
+            self._invalidate_replica_routes(sid)
             self._inflight_requests.pop(sid, None)
             self._servers.pop(sid, None)
             self._server_metadata.pop(sid, None)
             self._migration_reservations.pop(sid, None)
-        for request_id, pending in list(self._pending_migrations.items()):
-            if pending["source_server_id"] in server_ids or pending["target_server_id"] in server_ids:
-                self._drop_pending_migration(request_id)
+            self._replica_states.pop(sid, None)
+            self._managed_versions.discard(sid)
+            self._metadata_epochs.pop(sid, None)
         logger.info(f"[GlobalLoadBalancer] removed {len(server_ids)} servers")
 
     def update_server_metadata(self, server_id: str, metadata: dict[str, Any]) -> None:
-        if server_id in self._servers:
-            self._server_metadata.setdefault(server_id, {}).update(metadata)
+        if server_id not in self._servers:
+            return
+        state = self._replica_states[server_id]
+        metadata = deepcopy(metadata)
+        version = metadata.get("weight_version", state["weight_version"])
+        # Legacy global updates discover versions through capabilities. Once a
+        # replica has explicit updates, only commit may publish its version.
+        if server_id in self._managed_versions or state["pin"] is not None:
+            if version != state["weight_version"]:
+                return
+        else:
+            state["weight_version"] = version
+        metadata["weight_version"] = state["weight_version"]
+        self._server_metadata.setdefault(server_id, {}).update(metadata)
+
+    def _is_serving(self, server_id: str) -> bool:
+        return self._replica_states.get(server_id, {}).get("lifecycle_state") == "SERVING"
+
+    def _require_lifecycle(self, server_id: str, expected: str) -> dict[str, Any]:
+        if server_id not in self._replica_states:
+            raise ValueError(f"Unknown rollout replica {server_id!r}")
+        state = self._replica_states[server_id]
+        if state["lifecycle_state"] != expected:
+            raise RuntimeError(f"Replica {server_id} is {state['lifecycle_state']}; operation requires {expected}")
+        return state
+
+    def pin_replica(self, server_id: str, weight_version=None, reason: str = "") -> dict[str, Any]:
+        """Pin the currently committed version while leaving request admission open."""
+        state = self._require_lifecycle(server_id, "SERVING")
+        if weight_version is not None and weight_version != state["weight_version"]:
+            raise ValueError(f"Replica {server_id} is not serving weight version {weight_version!r}")
+        state["pin"] = {"weight_version": state["weight_version"], "reason": reason}
+        self._metadata_epochs[server_id] = object()
+        return deepcopy(state)
+
+    def unpin_replica(self, server_id: str) -> dict[str, Any]:
+        state = self._require_lifecycle(server_id, "SERVING")
+        state["pin"] = None
+        self._metadata_epochs[server_id] = object()
+        return deepcopy(state)
+
+    def _begin_replica_update(self, server_id: str, weight_version, expected: str) -> dict[str, Any]:
+        state = self._require_lifecycle(server_id, expected)
+        if state["pin"] is not None:
+            raise RuntimeError(f"Replica {server_id} is pinned to weight version {state['weight_version']!r}")
+        if weight_version is None:
+            raise ValueError("A replica update requires an explicit weight version")
+        state["lifecycle_state"] = "UPDATING"
+        state["desired_weight_version"] = weight_version
+        self._managed_versions.add(server_id)
+        self._metadata_epochs[server_id] = object()
+        self._invalidate_replica_routes(server_id)
+        return deepcopy(state)
+
+    def begin_replica_update(self, server_id: str, weight_version) -> dict[str, Any]:
+        """Atomically check pins and isolate a serving replica for an update."""
+        return self._begin_replica_update(server_id, weight_version, "SERVING")
+
+    def begin_replica_recovery(self, server_id: str, weight_version) -> dict[str, Any]:
+        """Explicitly retry a complete weight stream for a quarantined replica."""
+        return self._begin_replica_update(server_id, weight_version, "QUARANTINED")
+
+    def commit_replica_update(self, server_id: str, weight_version, metadata=None) -> dict[str, Any]:
+        """Publish a completely installed version and reopen routing atomically."""
+        state = self._require_lifecycle(server_id, "UPDATING")
+        if weight_version != state["desired_weight_version"]:
+            raise ValueError(f"Replica {server_id} update does not target weight version {weight_version!r}")
+        self._server_metadata[server_id].update(deepcopy(metadata or {}))
+        self._server_metadata[server_id]["weight_version"] = weight_version
+        state.update(
+            lifecycle_state="SERVING",
+            weight_version=weight_version,
+            desired_weight_version=None,
+            last_update_error=None,
+        )
+        self._metadata_epochs[server_id] = object()
+        return deepcopy(state)
+
+    def fail_replica_update(self, server_id: str, error) -> dict[str, Any]:
+        state = self._require_lifecycle(server_id, "UPDATING")
+        state.update(lifecycle_state="QUARANTINED", desired_weight_version=None, last_update_error=str(error))
+        self._metadata_epochs[server_id] = object()
+        self._invalidate_replica_routes(server_id)
+        return deepcopy(state)
+
+    def get_replica_states(self) -> dict[str, dict[str, Any]]:
+        return deepcopy(self._replica_states)
+
+    def _invalidate_replica_routes(self, server_id: str) -> None:
+        for request_id, routed_server in list(self._request_id_to_server.items()):
+            if routed_server == server_id:
+                del self._request_id_to_server[request_id]
+        for request_id, pending in list(self._pending_migrations.items()):
+            if server_id in (pending["source_server_id"], pending["target_server_id"]):
+                self._drop_pending_migration(request_id)
 
     async def plan_trajectory_migration(
         self,
@@ -290,33 +408,43 @@ class GlobalRequestLoadBalancer:
 
         capability_calls = []
         capability_server_ids = []
+        capability_epochs = []
         for server_id, server in self._servers.items():
             try:
                 capability_calls.append(server.get_trajectory_migration_capabilities.remote())
                 capability_server_ids.append(server_id)
+                capability_epochs.append(self._metadata_epochs[server_id])
             except AttributeError:
                 continue
         if capability_calls:
             capabilities = await asyncio.gather(*capability_calls, return_exceptions=True)
-            for server_id, capability in zip(capability_server_ids, capabilities, strict=True):
-                if not isinstance(capability, BaseException):
+            for server_id, epoch, capability in zip(
+                capability_server_ids, capability_epochs, capabilities, strict=True
+            ):
+                if not isinstance(capability, BaseException) and self._metadata_epochs.get(server_id) is epoch:
                     self.update_server_metadata(server_id, capability)
         # Async capability refresh lets another plan for the same trajectory run.
         # Recheck before reserving so a concurrent caller cannot overwrite it.
         if request_id in self._pending_migrations:
             return {"migrate": False, "reason": "a migration is already pending for this trajectory"}
-        if source_metadata:
-            self.update_server_metadata(source_server_id, source_metadata)
-
+        # A completed segment can predate a replica update. Its version belongs
+        # to this migration decision, never to the router's published state.
+        snapshot_metadata = {sid: deepcopy(metadata) for sid, metadata in self._server_metadata.items()}
+        source_snapshot_metadata = deepcopy(snapshot_metadata.get(source_server_id, {}))
+        source_snapshot_metadata.update(deepcopy(source_metadata or {}))
         replicas = [
             ReplicaSnapshot(
                 server_id=server_id,
                 inflight=self._inflight_requests[server_id] + self._migration_reservations.get(server_id, 0),
-                metadata=dict(self._server_metadata.get(server_id, {})),
+                metadata=snapshot_metadata[server_id],
+                lifecycle_state=self._replica_states[server_id]["lifecycle_state"],
             )
             for server_id in self._servers
+            if self._is_serving(server_id) or server_id == source_server_id
         ]
-        target, diagnostics = self._trajectory_scheduler.choose(trajectory, source_server_id, replicas)
+        target, diagnostics = self._trajectory_scheduler.choose(
+            trajectory, source_server_id, replicas, source_metadata=source_metadata
+        )
         if target is None:
             return {"migrate": False, **diagnostics}
 
@@ -333,8 +461,8 @@ class GlobalRequestLoadBalancer:
             **pending,
             "source_server": self._servers[source_server_id],
             "target_server": self._servers[target.server_id],
-            "source_metadata": dict(self._server_metadata[source_server_id]),
-            "target_metadata": dict(self._server_metadata[target.server_id]),
+            "source_metadata": source_snapshot_metadata,
+            "target_metadata": deepcopy(snapshot_metadata[target.server_id]),
             **diagnostics,
         }
 
@@ -343,9 +471,9 @@ class GlobalRequestLoadBalancer:
         if pending is None or pending["decision_id"] != decision_id:
             raise RuntimeError(f"stale or unknown migration decision for trajectory {request_id}")
         target_server_id = pending["target_server_id"]
-        if target_server_id not in self._servers:
+        if not self._is_serving(target_server_id):
             self._drop_pending_migration(request_id)
-            raise RuntimeError(f"migration target {target_server_id} is no longer registered")
+            raise RuntimeError(f"migration target {target_server_id} is no longer serving")
         self._request_id_to_server[request_id] = target_server_id
         self._drop_pending_migration(request_id)
         return {"migrated": True, "server_id": target_server_id}
@@ -382,7 +510,7 @@ class GlobalRequestLoadBalancer:
         return self._inflight_requests.get(server_id, 0)
 
     def get_all_servers(self) -> list[str]:
-        """Get list of all active server IDs."""
+        """Get all registered server IDs, including isolated replicas."""
         return list(self._inflight_requests.keys())
 
     def clear_sticky_cache(self) -> dict:
@@ -416,9 +544,16 @@ class GlobalRequestLoadBalancer:
         return {
             "servers": dict(self._inflight_requests),
             "total_inflight": sum(self._inflight_requests.values()),
-            "active_servers": len(self._inflight_requests),
+            "active_servers": sum(self._is_serving(sid) for sid in self._servers),
             "registered_handles": list(self._servers.keys()),
-            "server_metadata": {sid: dict(metadata) for sid, metadata in self._server_metadata.items()},
+            "server_metadata": deepcopy(self._server_metadata),
+            "replica_states": self.get_replica_states(),
+            "serving_replicas": sum(state["lifecycle_state"] == "SERVING" for state in self._replica_states.values()),
+            "updating_replicas": sum(state["lifecycle_state"] == "UPDATING" for state in self._replica_states.values()),
+            "quarantined_replicas": sum(
+                state["lifecycle_state"] == "QUARANTINED" for state in self._replica_states.values()
+            ),
+            "pinned_replicas": sum(state["pin"] is not None for state in self._replica_states.values()),
             "pending_migrations": {request_id: dict(value) for request_id, value in self._pending_migrations.items()},
         }
 
