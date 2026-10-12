@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import logging
 import os
 import socket
 import threading
@@ -23,7 +24,10 @@ import ray
 from omegaconf import OmegaConf
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
-from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+from verl.experimental.fully_async_policy.fully_async_trainer import (
+    FullyAsyncTrainer,
+    validate_weight_publication_config,
+)
 from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
@@ -45,13 +49,28 @@ class FullyAsyncTaskRunner:
 
     def run(self, config):
         print("[ASYNC MAIN] Starting fully async PPO training...")
-        self._initialize_components(config)
-        self._run_training_loop()
+        failed = False
+        try:
+            self._initialize_components(config)
+            self._run_training_loop()
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            trainer = self.components.get("trainer")
+            if trainer is not None:
+                try:
+                    ray.get(trainer.shutdown_weight_publisher.remote())
+                except BaseException:
+                    if not failed:
+                        raise
+                    logging.getLogger(__name__).exception("Weight publisher shutdown failed during task cleanup")
 
     def _initialize_components(self, config) -> None:
         print(f"[ASYNC MAIN] TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        validate_weight_publication_config(config)
 
         print("[ASYNC MAIN] Initializing model and tokenizer...")
         local_path = copy_to_local(
@@ -108,6 +127,7 @@ class FullyAsyncTaskRunner:
 
         print("[ASYNC MAIN] Param sync before fit..")
         ray.get(self.components["trainer"]._fit_update_weights.remote())
+        ray.get(self.components["trainer"].wait_for_weight_publication.remote())
 
         if config.trainer.get("val_before_train", True):
             ray.get(self.components["trainer"]._fit_validate.remote(True))
@@ -129,6 +149,7 @@ class FullyAsyncTaskRunner:
             ray.get(rollouter.set_hybrid_worker_group.remote(self.components["hybrid_worker_group"]))
             print("[ASYNC MAIN] Hybrid worker group injected into rollouter")
 
+        self.components["rollouter"] = rollouter
         ray.get(rollouter.init_workers.remote())
         ray.get(rollouter.set_max_required_samples.remote())
 
@@ -152,8 +173,8 @@ class FullyAsyncTaskRunner:
             device_name=config.trainer.device,
         )
 
-        ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
+        ray.get(trainer.init_workers.remote())
         print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
 
     def _setup_hybrid_worker_group(self, config) -> None:
@@ -191,6 +212,11 @@ class FullyAsyncTaskRunner:
         trainer_future = self.components["trainer"].fit.remote()
 
         futures = [rollouter_future, trainer_future]
+        publisher = ray.get(self.components["trainer"].get_weight_publisher.remote())
+        if publisher is not None:
+            # A background transfer can fail while training waits on an empty queue.
+            # Monitor the coordinator directly so that such failures cannot deadlock fit.
+            futures.append(publisher.watch_health.remote())
 
         try:
             while futures:

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import warnings
 from dataclasses import dataclass, field
 from typing import Optional
@@ -33,6 +34,7 @@ __all__ = [
     "RolloutConfig",
     "CheckpointEngineConfig",
     "FineGrainedWeightUpdateConfig",
+    "WeightPublicationConfig",
     "TrajectoryMigrationConfig",
 ]
 
@@ -157,6 +159,18 @@ class FineGrainedWeightUpdateConfig(BaseConfig):
             raise ValueError("fine_grained_weight_update.max_retries must be non-negative")
         if self.retry_backoff_s < 0:
             raise ValueError("fine_grained_weight_update.retry_backoff_s must be non-negative")
+
+
+@dataclass
+class WeightPublicationConfig(BaseConfig):
+    """Publish immutable CPU snapshots independently of training workers."""
+
+    enabled: bool = False
+    wait_timeout_s: float = 600.0
+
+    def __post_init__(self):
+        if not math.isfinite(self.wait_timeout_s) or self.wait_timeout_s <= 0:
+            raise ValueError("weight_publication.wait_timeout_s must be finite and positive")
 
 
 @dataclass
@@ -295,6 +309,7 @@ class RolloutConfig(BaseConfig):
     checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
 
     fine_grained_weight_update: FineGrainedWeightUpdateConfig = field(default_factory=FineGrainedWeightUpdateConfig)
+    weight_publication: WeightPublicationConfig = field(default_factory=WeightPublicationConfig)
 
     profiler: Optional[ProfilerConfig] = None
 
@@ -421,6 +436,19 @@ class RolloutConfig(BaseConfig):
 
         if self.fine_grained_weight_update.enabled and self.name != "rtp_llm":
             raise ValueError("fine-grained weight updates currently support rollout.name=rtp_llm only")
+
+        if isinstance(self.weight_publication, (dict, DictConfig)):
+            publication = self.weight_publication
+            if isinstance(publication, DictConfig):
+                publication = OmegaConf.to_container(publication, resolve=True)
+            object.__setattr__(self, "weight_publication", WeightPublicationConfig(**publication))
+        elif not isinstance(self.weight_publication, WeightPublicationConfig):
+            raise TypeError("rollout.weight_publication must be dict, DictConfig, or WeightPublicationConfig")
+        if self.weight_publication.enabled:
+            if self.name != "rtp_llm":
+                raise ValueError("weight_publication requires rollout.name=rtp_llm")
+            if not self.fine_grained_weight_update.enabled:
+                raise ValueError("weight_publication requires fine_grained_weight_update.enabled=True")
 
         if isinstance(self.trajectory_migration, dict):
             object.__setattr__(

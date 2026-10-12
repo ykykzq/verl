@@ -23,6 +23,7 @@ import torch
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+from verl.utils.device import get_device_id
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.import_utils import import_external_libs
 from verl.utils.ray_utils import auto_await
@@ -367,6 +368,18 @@ class CheckpointEngineWorker(Worker):
             global_steps=global_steps,
             wire_format=getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
         )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_weights_from_snapshot(self, snapshot):
+        """Install an immutable export without involving any training worker."""
+        from verl.checkpoint_engine.weight_snapshot import iter_snapshot_weights
+
+        async def weights():
+            async for name, tensor in iter_snapshot_weights(snapshot):
+                # Large tensors bypass the IPC bucket and need device storage too.
+                yield name, tensor.to(device=get_device_id())
+
+        await self.server_adapter.update_weights(weights(), global_steps=snapshot.version, wire_format="named_tensors")
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

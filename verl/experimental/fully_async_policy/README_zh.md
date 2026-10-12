@@ -39,7 +39,8 @@ rollout的训练， 通过合理设置资源分配情况、参数同步频率等
 * **PartialRollout**: Rollouter推理过程支持partial rollout逻辑，通过参数同步时，添加`sleep()`和`resume()`
   逻辑，保存进行中的rollout的样本，并在下一次rollout中继续使用，减少参数同步等待进行中的任务结束时间。
 
-目前支持使用模式为 megatron/fsdp+vllm。vllm必须使用基于AgentLoop的server模式。
+目前支持使用模式包括 megatron/fsdp+vllm，以及本分支的 FSDP/FSDP2 + standalone RTP-LLM 适配。
+vllm必须使用基于AgentLoop的server模式。
 
 ## 设计
 
@@ -60,6 +61,77 @@ https://github.com/ArronHZG/verl-community/blob/main/docs/fully_async_policy_str
 
 ![fully_async_policy_revenue](
 https://github.com/ArronHZG/verl-community/blob/main/docs/fully_async_policy_revenue.svg?raw=true)
+
+## RTP-LLM 独立权重发布
+
+通过以下参数启用独立发布器。未开启时继续使用原有权重同步路径。
+
+```yaml
+actor_rollout_ref:
+  hybrid_engine: false
+  actor:
+    strategy: fsdp2
+  rollout:
+    name: rtp_llm
+    checkpoint_engine:
+      backend: nccl
+      update_weights_bucket_megabytes: 512
+    fine_grained_weight_update:
+      enabled: true
+    weight_publication:
+      enabled: true
+      wait_timeout_s: 600
+    trajectory_migration:
+      enabled: true
+      allow_cross_version_recompute: true
+async_training:
+  partial_rollout: true
+  use_trainer_do_validate: false
+  use_dynamic_resource_scheduling: false
+```
+
+常规训练步只等待完整快照导出和发布准入确认。所有 FSDP ranks 参与已有的参数导出 collective，
+rank 0 将与训练参数脱离的 CPU tensor 按 bucket 写入 Ray object store，然后把包含对象引用的
+manifest 交给独立 Ray actor。训练随后可以修改参数，不会改变已经发布的快照。
+
+发布器一次更新一个 replica，优先处理版本最旧且未 pin 的正常 replica。新版本替换尚未开始的旧版本任务，
+正在执行的单 replica 更新则使用原快照完成，包括重试。发布器保留最新快照和正在使用的快照，
+训练导出期间还会暂时存在第三份。应为完整 CPU 权重、传输缓存及单个最大 tensor 预留足够内存；
+object store 容量不足或溢写可能增加快照导出耗时。
+
+目标 rollout worker 从 object store 逐 bucket 获取权重、搬到 GPU，再复用 RTP-LLM 的 IPC 安装流程。
+这条路径不让训练 workers 参与逐 replica 的通信组或重试，也不需要额外的发布 GPU；数据传输使用
+Ray object store，而不是原来的训练到 rollout NCCL 广播。其网络吞吐需要单独测量。
+
+每个目标仍执行准入关闭、请求中断和排空、KV 清理、完整权重安装、版本校验和恢复服务。
+最终失败的 replica 进入 `QUARANTINED`，其他 replica 继续运行。只有某版本第一次成功安装后，
+发布器才通知 rollouter 重置现有 staleness 预算。样本队列与 staleness 的背压机制继续生效。
+
+初始加载和显式验证等待目标版本发布完成；等待屏障跳过 pinned / quarantined replica，且至少需要一个
+已达到目标版本的 `SERVING` replica。因此 pin 旧版本时，验证结果可能包含多个版本的行为。
+关闭时会排空或取消发布任务并清理 actor。后台致命错误和所有 replica 均被隔离的情况会传播到训练任务。
+
+可从 trainer 获取发布器 handle，独立控制 pin、恢复和查看状态：
+
+```python
+publisher = ray.get(trainer.get_weight_publisher.remote())
+ray.get(publisher.pin_replica.remote(0, "finish long trajectories"))
+ray.get(publisher.unpin_replica.remote(0))  # Catch up to the retained latest snapshot.
+ray.get(publisher.recover_replica.remote(1))
+status = ray.get(publisher.get_status.remote())
+```
+
+状态包含最新发布版本、当前传输版本和 replica、已提交版本、各 replica 状态以及后台错误。
+训练侧分别记录 `timing_s/weight_snapshot_export` 和 `timing_s/weight_publication_admission`。
+快照是内存中的临时发布数据，不是持久化训练 checkpoint；训练导出进程或发布 actor 故障后不保证恢复。
+
+当前限定 FSDP/FSDP2 完整权重导出和 standalone RTP-LLM，不支持 hybrid / dynamic resource scheduling、
+trainer-side validation 或未合并的 LoRA。被中断 trajectory 的续跑继续使用已有 partial rollout 和
+跨版本 re-prefill 机制；独立发布不消除 off-policy，也不新增 staleness 剪枝算法。
+
+上线前应在 GPU 集群验证：训练步与慢 replica 安装确实重叠；多版本连续发布时显存和 object store 占用有界；
+pin/unpin 和失败恢复不误更新版本；续跑 trajectory 的版本元数据及 re-prefill 行为正确。
+CPU 单测和本地多 actor Ray 测试不代表已完成 GPU 吞吐或大模型内存验收。
 
 ## 使用方式
 

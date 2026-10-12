@@ -192,6 +192,16 @@ fine_grained_weight_update:
   retry_backoff_s: 1.0
   continue_on_failure: True
 
+# Export CPU snapshots, then publish to standalone RTP-LLM replicas in a separate actor.
+# Requires fine_grained_weight_update and FSDP/FSDP2 full-weight exports.
+weight_publication:
+
+  _target_: verl.workers.config.WeightPublicationConfig
+
+  enabled: False
+  # Startup and explicit validation wait for the requested version to serve.
+  wait_timeout_s: 600.0
+
 # Move an in-progress trajectory between replicas at bounded decode checkpoints.
 # Same-version RTP-LLM remote_prefix migration requires a shared KVCM deployment
 # and enable_prefix_caching=True. Cross-version recompute bypasses KV reuse.

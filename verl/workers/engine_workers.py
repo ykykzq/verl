@@ -29,6 +29,7 @@ from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl.checkpoint_engine import CheckpointEngineRegistry
+from verl.checkpoint_engine.weight_snapshot import WeightSnapshot, export_weight_snapshot
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
@@ -730,6 +731,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def export_weight_snapshot(self, global_steps: int) -> WeightSnapshot | None:
+        """Export full immutable CPU weights without joining rollout transfers.
+
+        All training ranks participate in the engine's collective iterator;
+        only global rank zero returns a manifest. The trainer must settle all
+        worker RPCs before propagating export errors or resuming training.
+        """
+        assert "actor" in self.role, "export_weight_snapshot only supports actor role"
+        weights, peft_config = self.actor.engine.get_per_tensor_param()
+        if peft_config is not None:
+            # The engine may already have started collective preparation. Drain
+            # its iterator on every rank before rejecting adapter-only exports.
+            for _ in weights:
+                pass
+            raise ValueError("Independent weight snapshots require full weights; nonmerged LoRA is unsupported")
+        bucket_size = self.config.rollout.checkpoint_engine.update_weights_bucket_megabytes << 20
+        return export_weight_snapshot(
+            weights, version=global_steps, bucket_size=bucket_size, is_master=torch.distributed.get_rank() == 0
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):

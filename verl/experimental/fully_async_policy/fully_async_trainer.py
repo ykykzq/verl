@@ -40,9 +40,38 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.tracking import Tracking
-from verl.workers.config import FineGrainedWeightUpdateConfig
+from verl.workers.config import FineGrainedWeightUpdateConfig, WeightPublicationConfig
 
 logger = logging.getLogger(__name__)
+
+
+def validate_weight_publication_config(config):
+    """Reject unsupported publication modes before allocating workers."""
+    actor_rollout = config.actor_rollout_ref
+    rollout = actor_rollout.rollout
+    publication = omega_conf_to_dataclass(rollout.get("weight_publication", {}), WeightPublicationConfig)
+    if not publication.enabled:
+        return
+    if rollout.get("name") != "rtp_llm":
+        raise ValueError("weight_publication requires rollout.name=rtp_llm")
+    if not rollout.get("fine_grained_weight_update", {}).get("enabled", False):
+        raise ValueError("weight_publication requires fine_grained_weight_update.enabled=True")
+    if actor_rollout.actor.get("strategy") not in ("fsdp", "fsdp2"):
+        raise ValueError("weight_publication supports FSDP/FSDP2 actors only")
+    if actor_rollout.get("hybrid_engine", False):
+        raise ValueError("weight_publication does not support hybrid_engine")
+    if config.async_training.get("use_trainer_do_validate", False):
+        raise ValueError("weight_publication does not support use_trainer_do_validate")
+    if config.async_training.get("use_dynamic_resource_scheduling", False):
+        raise ValueError("weight_publication does not support dynamic resource scheduling")
+    if config.get("rollout", rollout).get("nnodes", 0) <= 0:
+        raise ValueError("weight_publication requires standalone rollout nodes")
+    model = actor_rollout.model
+    lora = model.get("lora", {})
+    lora_enabled = lora.get("rank", 0) > 0 or model.get("lora_rank", 0) > 0
+    lora_enabled = lora_enabled or model.get("lora_adapter_path") is not None
+    if lora_enabled and not lora.get("merge", False):
+        raise ValueError("weight_publication requires merged LoRA (model.lora.merge=True)")
 
 
 class TrainingStopException(Exception):
@@ -72,6 +101,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
         self.config = config
+        validate_weight_publication_config(config)
+        self.weight_publication_enabled = config.actor_rollout_ref.rollout.get("weight_publication", {}).get(
+            "enabled", False
+        )
+        self.weight_publisher = None
+        self._last_published_version = None
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert not self.hybrid_engine
@@ -217,6 +252,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     async def _setup_checkpoint_manager(self):
         """Setup checkpoint manager after rollouter is initialized"""
+        validate_weight_publication_config(self.config)
         replicas = await self.rollouter.get_replicas.remote()
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         fine_grained_config = omega_conf_to_dataclass(
@@ -224,6 +260,20 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             FineGrainedWeightUpdateConfig,
         )
         load_balancer = await self.rollouter.get_load_balancer.remote() if fine_grained_config.enabled else None
+        if self.config.actor_rollout_ref.rollout.get("weight_publication", {}).get("enabled", False):
+            from verl.checkpoint_engine.weight_publication import WeightPublisherActor
+
+            self.checkpoint_manager = None
+            self.weight_publication_enabled = True
+            if getattr(self, "weight_publisher", None) is None:
+                self.weight_publisher = WeightPublisherActor.remote(
+                    checkpoint_config=checkpoint_engine_config,
+                    fine_grained_config=fine_grained_config,
+                    replicas=replicas,
+                    load_balancer_handle=load_balancer,
+                    rollouter=self.rollouter,
+                )
+            return
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             actor_wg=self.actor_wg,
@@ -232,6 +282,31 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             load_balancer_handle=load_balancer,
         )
         print(f"[FullyAsyncTrainer] Checkpoint manager initialized (backend={checkpoint_engine_config.backend})")
+
+    def get_weight_publisher(self):
+        """Return the publication coordinator for replica controls and health monitoring."""
+        return getattr(self, "weight_publisher", None)
+
+    async def wait_for_weight_publication(self, version=None, timeout_s=None):
+        publisher = getattr(self, "weight_publisher", None)
+        if publisher is None:
+            return None
+        if version is None:
+            version = self.current_param_version
+        if timeout_s is None:
+            timeout_s = self.config.actor_rollout_ref.rollout.weight_publication.wait_timeout_s
+        return await publisher.wait_for_version.remote(version, timeout_s)
+
+    async def shutdown_weight_publisher(self, drain=True, terminate=True):
+        publisher = getattr(self, "weight_publisher", None)
+        if publisher is None:
+            return
+        try:
+            await publisher.close.remote(drain=drain)
+        finally:
+            if terminate:
+                self.weight_publisher = None
+                ray.kill(publisher)
 
     async def _setup_hybrid_checkpoint_manager(self):
         """Setup hybrid checkpoint manager and perform initial sleep of hybrid replicas.
@@ -506,6 +581,23 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._init_models()
 
     async def fit(self):
+        failed = False
+        try:
+            await self._fit_loop()
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            try:
+                # Main waits for watch_health to observe closure before terminating
+                # the actor. Killing here would turn successful fit into ActorDiedError.
+                await self.shutdown_weight_publisher(terminate=False)
+            except BaseException:
+                if not failed:
+                    raise
+                logger.exception("Weight publisher shutdown failed during training cleanup")
+
+    async def _fit_loop(self):
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC
@@ -710,6 +802,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.local_trigger_step != 1:
             return None
 
+        if getattr(self, "weight_publication_enabled", False):
+            return await self._export_and_publish_weights()
+
         steps = self.config.global_profiler.steps
         last_profiler_step = self.current_param_version
         if steps is not None and last_profiler_step in steps:
@@ -797,6 +892,57 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         return timing_raw
 
+    async def _export_and_publish_weights(self):
+        """Settle every export rank, then send only the snapshot manifest."""
+        publisher = self.weight_publisher
+        status = await publisher.get_status.remote()
+        if status.get("fatal_error"):
+            raise RuntimeError(f"Weight publication failed: {status['fatal_error']}")
+        if status.get("closed"):
+            raise RuntimeError("Weight publisher is closed")
+        if getattr(self, "_last_published_version", None) == self.current_param_version:
+            return None
+
+        steps = self.config.global_profiler.steps
+        if steps is not None and self.current_param_version in steps:
+            await self.rollouter._stop_profiling.remote()
+        timing = {}
+        with marked_timer("timing_s/weight_snapshot_export", timing):
+            refs = self.actor_rollout_wg.export_weight_snapshot(global_steps=self.current_param_version)
+            # Never return to training until all FSDP collective participants settle,
+            # even when one rank fails while another is still draining its generator.
+            settled = asyncio.gather(*refs, return_exceptions=True)
+            cancelled = False
+            while True:
+                try:
+                    results = await asyncio.shield(settled)
+                    break
+                except asyncio.CancelledError:
+                    # Repeated cancellation must not let teardown race unfinished
+                    # FSDP collectives, which continue running in worker actors.
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            snapshots = [result for result in results if result is not None]
+            if len(snapshots) != 1:
+                raise RuntimeError(f"Snapshot export expected one rank-zero manifest, got {len(snapshots)}")
+            snapshot = snapshots[0]
+            if snapshot.version != self.current_param_version:
+                raise RuntimeError("Snapshot export returned the wrong parameter version")
+        with marked_timer("timing_s/weight_publication_admission", timing):
+            await publisher.publish.remote(snapshot)
+        self._last_published_version = self.current_param_version
+        if steps is not None and self.current_param_version + 1 in steps:
+            await self.rollouter._start_profiling.remote()
+        self.timing_raw.update(timing)
+        self._step_wait_times = []
+        self._step_wait_samples = []
+        self.logger.log(data=timing, step=self.current_param_version)
+        return timing
+
     def _fit_log_aggregated_training_metrics(self, rollout_reset_timing_raw: dict):
         """Log aggregated training metrics for the sync cycle just finished.
 
@@ -832,6 +978,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Skip validation if not needed and not validation before training
         if not need_validate and not val_before_train:
             return
+        if getattr(self, "weight_publication_enabled", False):
+            await self.wait_for_weight_publication()
         # Execute validation
         if self.config.async_training.use_trainer_do_validate:
             await self._trainer_side_validate()
