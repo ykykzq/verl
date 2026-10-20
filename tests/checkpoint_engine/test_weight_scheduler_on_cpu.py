@@ -166,7 +166,7 @@ async def test_barrier_waits_for_serving_commit_and_times_out_without_cancelling
     try:
         await scheduler.publish(Snapshot(1))
         await next_transfer(manager)
-        with pytest.raises(TimeoutError):
+        with pytest.raises(asyncio.TimeoutError):
             await scheduler.wait_for_version(1, timeout_s=0.01)
         assert manager.active == 1
         manager.release.set()
@@ -215,22 +215,52 @@ async def test_background_fatal_errors_are_observed_by_publish_status_and_wait(c
 
 
 @pytest.mark.asyncio
-async def test_cancel_close_awaits_transfer_cleanup_and_releases_snapshots():
-    manager = Manager((0,))
+@pytest.mark.parametrize("chained_cancellation", [False, True])
+async def test_cancel_close_awaits_transfer_cleanup_and_releases_snapshots(chained_cancellation):
+    class ChainedCancellationManager(Manager):
+        async def update_replica_from_snapshot(self, snapshot, replica_rank, recovery=False):
+            try:
+                return await super().update_replica_from_snapshot(snapshot, replica_rank, recovery=recovery)
+            except asyncio.CancelledError as error:
+                raise asyncio.CancelledError("transfer cleanup cancelled") from error
+
+    manager = (ChainedCancellationManager if chained_cancellation else Manager)((0,))
     manager.release.clear()
     scheduler = WeightPublicationScheduler(manager)
     snapshot = Snapshot(1)
     snapshot_ref = weakref.ref(snapshot)
     await scheduler.publish(snapshot)
     await next_transfer(manager)
+    worker = scheduler._worker
     del snapshot
     await scheduler.close(drain=False)
     gc.collect()
+    assert worker.cancelled()
     assert manager.cancelled.is_set()
     assert manager.active == 0
     assert snapshot_ref() is None
     with pytest.raises(RuntimeError, match="closed"):
         await scheduler.publish(Snapshot(2))
+
+
+@pytest.mark.asyncio
+async def test_cancel_close_reports_transfer_cleanup_failure():
+    class FailingCleanupManager(Manager):
+        async def update_replica_from_snapshot(self, snapshot, replica_rank, recovery=False):
+            try:
+                return await super().update_replica_from_snapshot(snapshot, replica_rank, recovery=recovery)
+            except asyncio.CancelledError as error:
+                raise RuntimeError("transfer cleanup failed") from error
+
+    manager = FailingCleanupManager((0,))
+    manager.release.clear()
+    scheduler = WeightPublicationScheduler(manager)
+    await scheduler.publish(Snapshot(1))
+    await next_transfer(manager)
+    with pytest.raises(RuntimeError, match="transfer cleanup failed"):
+        await scheduler.close(drain=False)
+    assert manager.active == 0
+    assert (await scheduler.get_status())["fatal_error"] == "transfer cleanup failed"
 
 
 @pytest.mark.asyncio
@@ -346,7 +376,7 @@ async def test_barrier_waits_for_commit_callback_and_recovery_does_not_repeat_it
     try:
         await scheduler.publish(Snapshot(1))
         await asyncio.wait_for(entered.wait(), 1)
-        with pytest.raises(TimeoutError):
+        with pytest.raises(asyncio.TimeoutError):
             await scheduler.wait_for_version(1, timeout_s=0.01)
         release.set()
         await scheduler.wait_for_version(1, timeout_s=1)

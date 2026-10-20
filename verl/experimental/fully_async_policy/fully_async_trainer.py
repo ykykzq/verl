@@ -56,6 +56,16 @@ def validate_weight_publication_config(config):
         raise ValueError("weight_publication requires rollout.name=rtp_llm")
     if not rollout.get("fine_grained_weight_update", {}).get("enabled", False):
         raise ValueError("weight_publication requires fine_grained_weight_update.enabled=True")
+    if publication.joint_scheduling.enabled:
+        if not config.async_training.get("partial_rollout", False):
+            raise ValueError("joint_scheduling requires async_training.partial_rollout=True")
+        migration = rollout.get("trajectory_migration", {})
+        if not migration.get("enabled", False):
+            raise ValueError("joint_scheduling requires trajectory_migration.enabled=True")
+        if not migration.get("allow_cross_version_recompute", False):
+            raise ValueError("joint_scheduling requires trajectory_migration.allow_cross_version_recompute=True")
+        if not rollout.get("enable_prefix_caching", True):
+            raise ValueError("joint_scheduling requires enable_prefix_caching=True for same-version migration")
     if actor_rollout.actor.get("strategy") not in ("fsdp", "fsdp2"):
         raise ValueError("weight_publication supports FSDP/FSDP2 actors only")
     if actor_rollout.get("hybrid_engine", False):
@@ -266,12 +276,27 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.checkpoint_manager = None
             self.weight_publication_enabled = True
             if getattr(self, "weight_publisher", None) is None:
+                publication_config = omega_conf_to_dataclass(
+                    self.config.actor_rollout_ref.rollout.weight_publication, WeightPublicationConfig
+                )
+                publisher_kwargs = (
+                    {"joint_scheduling_config": publication_config.joint_scheduling}
+                    if publication_config.joint_scheduling.enabled
+                    else {}
+                )
+                if publication_config.transport == "mooncake_rdma":
+                    node_ids = await asyncio.gather(*self.actor_rollout_wg.get_weight_publication_node_id())
+                    source_nodes = [node_id for node_id in node_ids if node_id is not None]
+                    if len(source_nodes) != 1 or not isinstance(source_nodes[0], str) or not source_nodes[0]:
+                        raise RuntimeError("RDMA publication requires exactly one snapshot export source node")
+                    publisher_kwargs.update(relay_config=publication_config.relay, source_node_id=source_nodes[0])
                 self.weight_publisher = WeightPublisherActor.remote(
                     checkpoint_config=checkpoint_engine_config,
                     fine_grained_config=fine_grained_config,
                     replicas=replicas,
                     load_balancer_handle=load_balancer,
                     rollouter=self.rollouter,
+                    **publisher_kwargs,
                 )
             return
         self.checkpoint_manager = CheckpointEngineManager(

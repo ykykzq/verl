@@ -174,6 +174,7 @@ class TrajectoryScheduler:
         published_source = by_id[source_server_id]
         if (
             trajectory.get("migration_required", False)
+            and trajectory.get("resume_source_allowed", True)
             and published_source.lifecycle_state == "SERVING"
             and source_version is not None
             and source_version == published_source.metadata.get("weight_version")
@@ -190,6 +191,10 @@ class TrajectoryScheduler:
                 replica
                 for replica in replicas
                 if replica.lifecycle_state == "SERVING"
+                and (
+                    trajectory.get("required_target_server_id") is None
+                    or replica.server_id == trajectory["required_target_server_id"]
+                )
                 and (
                     replica.server_id != source_server_id
                     or (
@@ -221,7 +226,7 @@ class TrajectoryScheduler:
                 self.allow_cross_version_recompute
                 and source_version is not None
                 and target_version is not None
-                and source_version != target_version
+                and (source_version != target_version or trajectory.get("force_recompute", False))
             )
             mode = "recompute" if recompute else "remote_prefix"
             # Custom placement policies cannot relax model or version compatibility.

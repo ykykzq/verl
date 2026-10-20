@@ -201,6 +201,36 @@ weight_publication:
   enabled: False
   # Startup and explicit validation wait for the requested version to serve.
   wait_timeout_s: 600.0
+  # mooncake_rdma stages CPU buckets through per-node relays before installation.
+  transport: ray
+  relay:
+    _target_: verl.workers.config.WeightRelayConfig
+    device_name: ""
+    max_staging_bytes: 4294967296
+    pipeline_depth: 2
+
+  joint_scheduling:
+    _target_: verl.workers.config.JointSchedulingConfig
+    enabled: False
+    # Required per-replica conservative capacity and profiled decode roofline.
+    kv_capacity_tokens: 0
+    max_batch_size: 0
+    kv_block_size_tokens: 16
+    poll_interval_s: 0.1
+    update_cooldown_s: 5.0
+    min_decode_window_s: 2.0
+    min_decode_tokens: 64
+    max_defer_s: 30.0
+    evacuation_timeout_s: 5.0
+    sparse_request_threshold: 1
+    staleness_version_gap: 2
+    tail_tokens: 32
+    # Sampled tail KL proxy, not full-vocabulary categorical KL.
+    tail_kl_threshold: 0.1
+    probe_interval_s: 5.0
+    probe_timeout_s: 2.0
+    max_concurrent_probes: 1
+    overload_threshold: 0.9
 
 # Move an in-progress trajectory between replicas at bounded decode checkpoints.
 # Same-version RTP-LLM remote_prefix migration requires a shared KVCM deployment

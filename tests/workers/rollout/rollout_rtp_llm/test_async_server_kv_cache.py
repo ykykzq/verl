@@ -18,10 +18,11 @@ import sys
 import unittest
 from contextlib import suppress
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import torch
 
+from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerClient
 from verl.workers.rollout.rtp_llm_rollout.rtp_llm_async_server import RTPLLMHttpServer
 
 
@@ -294,10 +295,161 @@ class TestRTPLLMTrajectoryAdmission(unittest.IsolatedAsyncioTestCase):
             if key not in {"mode", "source_version", "target_version"}
         }
 
+    def common_client(self, *, fully_async=False, migration_enabled=True):
+        # Only the transport is replaced: RPC keyword binding and both generation
+        # implementations run unchanged, without launching Ray or a GPU engine.
+        handle = SimpleNamespace(generate=SimpleNamespace(remote=self.server.generate))
+        balancer = SimpleNamespace(
+            require_acquire_fields=SimpleNamespace(remote=AsyncMock(return_value=[])),
+            require_release_fields=SimpleNamespace(remote=AsyncMock(return_value=["request_id"])),
+            acquire_server=SimpleNamespace(remote=AsyncMock(return_value=("s1", handle))),
+            release_server=SimpleNamespace(remote=Mock()),
+        )
+        config = SimpleNamespace(
+            actor_rollout_ref=SimpleNamespace(
+                rollout=SimpleNamespace(
+                    name="rtp_llm",
+                    response_length=8,
+                    trajectory_migration=SimpleNamespace(
+                        enabled=migration_enabled,
+                        allow_cross_version_recompute=True,
+                        checkpoint_tokens=8,
+                    ),
+                )
+            )
+        )
+        client_class = FullyAsyncLLMServerClient if fully_async else LLMServerClient
+        return client_class(config=config, load_balancer_handle=balancer)
+
+    async def test_common_client_generates_with_sticky_session_id(self):
+        self.server.config.trajectory_migration.enabled = False
+        client = self.common_client(migration_enabled=False)
+
+        result = await client.generate("session-1", prompt_ids=[1, 2], sampling_params={"max_tokens": 3})
+
+        self.assertEqual(result.token_ids, [5])
+        self.assertEqual(result.extra_fields["global_steps"], 10)
+        self.assertEqual(result.extra_fields["min_global_steps"], 10)
+        self.assertEqual(result.extra_fields["max_global_steps"], 10)
+        self.assertEqual(self.inputs[0].token_ids.tolist(), [1, 2])
+        self.assertEqual(self.inputs[0].generate_config.max_new_tokens, 3)
+        self.assertEqual(self.server._inflight, {})
+
+    async def test_common_fully_async_client_resumes_interrupted_stream(self):
+        async def enqueue(generate_input):
+            self.inputs.append(generate_input)
+            first_attempt = len(self.inputs) == 1
+
+            async def stream():
+                yield SimpleNamespace(
+                    generate_outputs=[
+                        SimpleNamespace(output_ids=torch.tensor([3, 4] if first_attempt else [5]), aux_info=None)
+                    ]
+                )
+                if first_attempt:
+                    raise RuntimeError("stream interrupted after partial output")
+
+            return stream()
+
+        self.server.visitor.enqueue = enqueue
+        client = self.common_client(fully_async=True)
+
+        result = await client.generate("trajectory-1", prompt_ids=[1, 2], sampling_params={"max_tokens": 8})
+
+        self.assertEqual(result.token_ids, [3, 4, 5])
+        self.assertEqual(result.stop_reason, "completed")
+        self.assertEqual([item.token_ids.tolist() for item in self.inputs], [[1, 2], [1, 2, 3, 4]])
+        self.assertEqual([item.generate_config.max_new_tokens for item in self.inputs], [8, 6])
+        self.assertEqual(result.extra_fields["min_global_steps"], 10)
+        self.assertEqual(result.extra_fields["max_global_steps"], 10)
+        self.assertEqual(self.server._inflight, {})
+
+    async def test_common_client_preserves_continuation_version_guard(self):
+        client = self.common_client()
+
+        result = await client.generate(
+            "trajectory-1",
+            prompt_ids=[1, 2, 3, 4],
+            sampling_params={"max_tokens": 4},
+            expected_source_version=9,
+        )
+
+        self.assertEqual(result.token_ids, [])
+        self.assertEqual(result.stop_reason, "aborted")
+        self.assertTrue(result.extra_fields["migration_rejected"])
+        self.assertEqual(self.inputs, [])
+
+    async def test_common_client_preserves_migration_ticket_and_request_identity(self):
+        for ticket in [self.ticket, self.remote_ticket()]:
+            with self.subTest(backend=ticket["backend"]):
+                accepted = await self.server.accept_trajectory_migration(ticket, self.state)
+                self.assertTrue(accepted["accepted"], accepted)
+                client = self.common_client()
+
+                result = await client.generate(
+                    "trajectory-1",
+                    prompt_ids=[1, 2, 3, 4],
+                    sampling_params={"max_tokens": 4},
+                    migration_ticket=ticket,
+                    expected_source_version=9,
+                )
+
+                self.assertEqual(result.token_ids, [5])
+                self.assertEqual(result.stop_reason, "completed")
+                self.assertEqual(result.extra_fields["_verl_route_server_id"], "s1")
+                self.assertEqual(self.server._accepted_migrations, {})
+                self.assertEqual(self.inputs[-1].token_ids.tolist(), [1, 2, 3, 4])
+                if ticket["backend"] == "recompute":
+                    self.assertEqual(result.extra_fields["forced_prefill_tokens"], 4)
+                    self.assertFalse(self.inputs[-1].generate_config.reuse_cache)
+                    self.assertFalse(self.inputs[-1].generate_config.enable_remote_cache)
+                else:
+                    self.assertNotIn("forced_prefill_tokens", result.extra_fields)
+                    self.assertTrue(self.inputs[-1].generate_config.reuse_cache)
+                    self.assertTrue(self.inputs[-1].generate_config.enable_remote_cache)
+
     async def test_recompute_accepts_without_remote_cache_support(self):
         self.server.config.enable_prefix_caching = False
         accepted = await self.server.accept_trajectory_migration(self.ticket, self.state)
         self.assertTrue(accepted["accepted"], accepted)
+
+    async def test_joint_same_version_recovery_requires_explicit_ticket_and_enabled_policy(self):
+        self.server.config.weight_publication = SimpleNamespace(
+            enabled=True, joint_scheduling=SimpleNamespace(enabled=True)
+        )
+        ticket = {**self.ticket, "source_version": 10, "recovery_recompute": True}
+        for publication_enabled, joint_enabled, recompute_enabled, recovery in [
+            (False, True, True, True),
+            (True, False, True, True),
+            (True, True, False, True),
+            (True, True, True, False),
+        ]:
+            with self.subTest(settings=(publication_enabled, joint_enabled, recompute_enabled, recovery)):
+                self.server.config.weight_publication.enabled = publication_enabled
+                self.server.config.weight_publication.joint_scheduling.enabled = joint_enabled
+                self.server.config.trajectory_migration.allow_cross_version_recompute = recompute_enabled
+                accepted = await self.server.accept_trajectory_migration(
+                    {**ticket, "recovery_recompute": recovery}, self.state
+                )
+                self.assertFalse(accepted["accepted"], accepted)
+        self.server.config.weight_publication.enabled = True
+        self.server.config.weight_publication.joint_scheduling.enabled = True
+        self.server.config.trajectory_migration.allow_cross_version_recompute = True
+        accepted = await self.server.accept_trajectory_migration(ticket, self.state)
+        self.assertTrue(accepted["accepted"], accepted)
+        output = await self.server.generate([1, 2, 3, 4], {"max_tokens": 1}, "trajectory-1", migration_ticket=ticket)
+        self.assertEqual(output.token_ids, [5])
+        self.assertEqual(output.extra_fields["forced_prefill_tokens"], 4)
+        self.assertFalse(self.inputs[0].generate_config.reuse_cache)
+        self.assertFalse(self.inputs[0].generate_config.enable_remote_cache)
+
+    async def test_targeted_abort_discards_accepted_ticket_before_generation(self):
+        accepted = await self.server.accept_trajectory_migration(self.ticket, self.state)
+        self.assertTrue(accepted["accepted"], accepted)
+        self.server._accepted_migrations["other"] = {"request_id": "other"}
+        await self.server.abort_request("trajectory-1")
+        self.assertNotIn("trajectory-1", self.server._accepted_migrations)
+        self.assertIn("other", self.server._accepted_migrations)
 
     async def test_recompute_ticket_rejects_invalid_identity_and_versions(self):
         for field, value, reason in [

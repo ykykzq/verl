@@ -23,6 +23,7 @@ import gc
 import glob
 import hashlib
 import itertools
+import json
 import logging
 import math
 import os
@@ -30,6 +31,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Optional
+from uuid import uuid4
 
 import ray
 import torch
@@ -187,6 +189,53 @@ class RTPLLMHttpServer:
         architectures = getattr(self.model_config.hf_config, "architectures", None) or []
         return f"{self.model_config.local_path}|{','.join(architectures)}"
 
+    def _rollout_config_fingerprint(self) -> str:
+        """Identify the model and cache layout independently of replica addresses."""
+        dtype = getattr(self.config, "dtype", None)
+        dtype = {"bf16": "bfloat16", "fp16": "float16", "half": "float16"}.get(dtype, dtype)
+        hf_config = self.model_config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        layout = {
+            "model_id": self._model_id(),
+            "dtype": dtype,
+            "tensor_model_parallel_size": getattr(self.config, "tensor_model_parallel_size", 1),
+            "pipeline_model_parallel_size": getattr(self.config, "pipeline_model_parallel_size", 1),
+            "expert_parallel_size": getattr(self.config, "expert_parallel_size", 1),
+            "seq_size_per_block": self._seq_size_per_block(),
+            "model_layout": {
+                key: getattr(text_config, key, None)
+                for key in (
+                    "num_hidden_layers",
+                    "num_attention_heads",
+                    "num_key_value_heads",
+                    "head_dim",
+                    "hidden_size",
+                    "layer_types",
+                    "rope_scaling",
+                    "rope_theta",
+                    "quantization_config",
+                )
+            },
+        }
+        engine_config = getattr(self, "_cfg", None)
+        cache_config = getattr(engine_config, "kv_cache_config", None)
+        layout["engine_cache_layout"] = {
+            key: getattr(cache_config, key, None)
+            for key in (
+                "seq_size_per_block",
+                "kernel_seq_size_per_block",
+                "fp8_kv_cache",
+                "linear_step",
+                "ssm_state_dtype",
+            )
+        }
+        quantization_config = getattr(engine_config, "quantization_config", None)
+        layout["engine_quantization"] = {
+            key: getattr(quantization_config, key, None) for key in ("int8_mode", "quantization")
+        }
+        payload = json.dumps(layout, sort_keys=True, separators=(",", ":"), default=str).encode()
+        return hashlib.sha256(payload).hexdigest()
+
     def _kv_transfer_domain(self) -> str:
         migration_config = self._trajectory_migration_config()
         settings = {
@@ -219,11 +268,24 @@ class RTPLLMHttpServer:
     def get_trajectory_migration_capabilities(self) -> dict[str, Any]:
         backends = ["remote_prefix"] if self._remote_prefix_migration_enabled() else []
         weight_version = "initial" if self.global_steps is None else self.global_steps
+        engine_config = getattr(self, "_cfg", None)
+        block_size = getattr(getattr(engine_config, "kv_cache_config", None), "seq_size_per_block", None)
+        if type(block_size) is not int or block_size <= 0:
+            block_size = self._seq_size_per_block()
+        sequence_limit = getattr(getattr(engine_config, "model_args", None), "max_seq_len", None)
+        if type(sequence_limit) is not int or sequence_limit <= 0:
+            lengths = [getattr(self.config, key, None) for key in ("max_model_len", "prompt_length", "response_length")]
+            sequence_limit = self._engine_max_seq_len() if all(type(n) is int and n > 0 for n in lengths) else None
+        batch_limit = getattr(getattr(engine_config, "concurrency_config", None), "concurrency_limit", None)
         return {
             "backend": "rtp_llm",
             "replica_rank": self.replica_rank,
             "model_id": self._model_id(),
             "weight_version": weight_version,
+            "rollout_config_fingerprint": self._rollout_config_fingerprint(),
+            "kv_block_size_tokens": block_size,
+            "max_sequence_tokens": sequence_limit,
+            "max_batch_size": batch_limit if type(batch_limit) is int and batch_limit > 0 else None,
             "kv_transfer_backends": backends,
             "kv_transfer_domain": self._kv_transfer_domain() if backends else None,
             "kv_transfer_namespace": self._cache_key_salt(self.global_steps) if backends else None,
@@ -473,6 +535,96 @@ class RTPLLMHttpServer:
 
     # -------------------------------------------------------------- generation
 
+    async def score_trajectory_tail(
+        self,
+        prefix_ids: list[int],
+        tail_tokens: int,
+        expected_weight_version: int | str,
+    ) -> dict[str, Any]:
+        """Teacher-force a prefix and return raw model logprobs for its tail.
+
+        RTP's per-token loss covers input positions 1..N-1. It requires a full
+        prefill even though only the tail scores are returned. Sampling warpers
+        are deliberately absent: these scores describe the raw model policy.
+        """
+        if (
+            not isinstance(prefix_ids, list)
+            or len(prefix_ids) < 2
+            or any(type(token) is not int or token < 0 for token in prefix_ids)
+        ):
+            raise ValueError("tail scoring requires at least two nonnegative integer prefix tokens")
+        if type(tail_tokens) is not int or not 0 < tail_tokens < len(prefix_ids):
+            raise ValueError("tail_tokens must fit the scored input positions")
+        if len(prefix_ids) >= self._engine_max_seq_len():
+            raise ValueError("tail scoring prefix leaves no room for RTP's final output token")
+
+        from rtp_llm.config.generate_config import GenerateConfig
+        from rtp_llm.utils.base_model_datatypes import GenerateInput
+
+        timeout_s = float(os.environ.get("VERL_RTP_LLM_TAIL_SCORE_TIMEOUT_S", "5"))
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("VERL_RTP_LLM_TAIL_SCORE_TIMEOUT_S must be finite and positive")
+        config = GenerateConfig(
+            max_new_tokens=1,
+            min_new_tokens=0,
+            num_beams=1,
+            num_return_sequences=0,
+            do_sample=False,
+            temperature=1.0,
+            top_k=0,
+            top_p=1.0,
+            repetition_penalty=1.0,
+            is_streaming=False,
+            calculate_loss=2,
+            return_output_ids=False,
+            reuse_cache=False,
+            enable_remote_cache=False,
+            can_use_pd_separation=False,
+            timeout_ms=max(1, int(timeout_s * 1000)),
+        )
+        generate_input = GenerateInput(
+            request_id=next(self._request_counter),
+            token_ids=torch.tensor(prefix_ids, dtype=torch.int32),
+            mm_inputs=[],
+            generate_config=config,
+        )
+
+        async def consume():
+            loss = None
+            stream = await self.visitor.enqueue(generate_input)
+            try:
+                async for outputs in stream:
+                    output = outputs.generate_outputs[0]
+                    if output.loss is not None:
+                        loss = output.loss
+            finally:
+                await stream.aclose()
+            if loss is None or loss.numel() != len(prefix_ids) - 1:
+                raise RuntimeError("tail scoring did not return aligned per-token loss")
+            loss = loss.detach().reshape(-1).float().cpu()
+            if not torch.isfinite(loss).all() or (loss < 0).any():
+                raise RuntimeError("tail scoring returned invalid per-token loss")
+            return (-loss[-tail_tokens:]).tolist()
+
+        registration = f"__tail_score__:{uuid4().hex}"
+        async with self._request_admission_lock:
+            admitted_version = "initial" if self.global_steps is None else self.global_steps
+            if admitted_version != expected_weight_version:
+                raise RuntimeError("tail scoring weight version changed before admission")
+            if self._rejecting or self._abort_requested or not self._generation_allowed.is_set():
+                raise RuntimeError("tail scoring is unavailable while generation is paused")
+            task = asyncio.create_task(consume())
+            self._inflight[registration] = task
+        try:
+            log_probs = await asyncio.wait_for(task, timeout=timeout_s)
+            current_version = "initial" if self.global_steps is None else self.global_steps
+            if current_version != admitted_version:
+                raise RuntimeError("tail scoring weight version changed during execution")
+            return {"weight_version": admitted_version, "log_probs": log_probs}
+        finally:
+            async with self._request_admission_lock:
+                self._inflight.pop(registration, None)
+
     def _build_generate_config(self, sampling_params: dict[str, Any], max_tokens: int):
         from rtp_llm.config.generate_config import GenerateConfig
 
@@ -520,7 +672,14 @@ class RTPLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         migration_ticket: Optional[dict[str, Any]] = None,
         expected_source_version: int | str | None = None,
+        session_id: Optional[str] = None,
     ) -> TokenOutput:
+        """Generate one request using the common rollout RPC contract.
+
+        ``session_id`` is the client's sticky routing key. Routing is already
+        resolved before this single-engine server is called; request tracking
+        and migration continue to use ``request_id``.
+        """
         if image_data or video_data or audio_data:
             raise NotImplementedError("rtp-llm rollout does not support multimodal inputs yet.")
 
@@ -662,6 +821,7 @@ class RTPLLMHttpServer:
     async def abort_request(self, request_id: str, timeout_s: float = 120.0) -> dict[str, Any]:
         """Cancel one trajectory without disturbing other requests on this replica."""
         async with self._request_admission_lock:
+            self._accepted_migrations.pop(request_id, None)
             task = self._inflight.get(request_id)
         if task is None:
             return {"aborted": False, "request_id": request_id, "reason": "request not found"}
@@ -747,7 +907,15 @@ class RTPLLMHttpServer:
                 return "target does not support cross-version recompute"
             if os.environ.get("RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES", "0").lower() not in {"", "0", "false"}:
                 return "target engine overrides per-request cache switches"
-            if ticket.get("source_version") is None or ticket["source_version"] == ticket.get("target_version"):
+            publication = getattr(self.config, "weight_publication", None)
+            recovery = (
+                ticket.get("recovery_recompute") is True
+                and getattr(publication, "enabled", False)
+                and getattr(getattr(publication, "joint_scheduling", None), "enabled", False)
+            )
+            if ticket.get("source_version") is None or (
+                ticket["source_version"] == ticket.get("target_version") and not recovery
+            ):
                 return "recompute requires distinct source and target weight versions"
             target_version = ticket.get("target_version")
         else:

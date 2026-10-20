@@ -733,6 +733,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def get_weight_publication_node_id(self) -> str | None:
+        """Identify the rank-zero snapshot owner for master relay placement."""
+        import ray
+
+        assert "actor" in self.role, "weight publication source discovery only supports actor role"
+        return ray.get_runtime_context().get_node_id() if torch.distributed.get_rank() == 0 else None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def export_weight_snapshot(self, global_steps: int) -> WeightSnapshot | None:
         """Export full immutable CPU weights without joining rollout transfers.
 

@@ -34,6 +34,8 @@ __all__ = [
     "RolloutConfig",
     "CheckpointEngineConfig",
     "FineGrainedWeightUpdateConfig",
+    "JointSchedulingConfig",
+    "WeightRelayConfig",
     "WeightPublicationConfig",
     "TrajectoryMigrationConfig",
 ]
@@ -162,15 +164,121 @@ class FineGrainedWeightUpdateConfig(BaseConfig):
 
 
 @dataclass
+class JointSchedulingConfig(BaseConfig):
+    """Weight-centered admission, migration and independently paced updates."""
+
+    enabled: bool = False
+    kv_capacity_tokens: int = 0
+    max_batch_size: int = 0
+    kv_block_size_tokens: int = 16
+    poll_interval_s: float = 0.1
+    update_cooldown_s: float = 5.0
+    min_decode_window_s: float = 2.0
+    min_decode_tokens: int = 64
+    max_defer_s: float = 30.0
+    evacuation_timeout_s: float = 5.0
+    sparse_request_threshold: int = 1
+    staleness_version_gap: int = 2
+    tail_tokens: int = 32
+    tail_kl_threshold: float = 0.1
+    probe_interval_s: float = 5.0
+    probe_timeout_s: float = 2.0
+    max_concurrent_probes: int = 1
+    overload_threshold: float = 0.9
+
+    def __post_init__(self):
+        integer_minima = {
+            "kv_capacity_tokens": 1 if self.enabled else 0,
+            "max_batch_size": 1 if self.enabled else 0,
+            "kv_block_size_tokens": 1,
+            "min_decode_tokens": 0,
+            "sparse_request_threshold": 0,
+            "staleness_version_gap": 1,
+            "tail_tokens": 1,
+            "max_concurrent_probes": 1,
+        }
+        for name, minimum in integer_minima.items():
+            value = getattr(self, name)
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"joint_scheduling.{name} must be an integer >= {minimum}")
+        positive = {"poll_interval_s", "max_defer_s", "probe_timeout_s"}
+        for name in (
+            "poll_interval_s",
+            "update_cooldown_s",
+            "min_decode_window_s",
+            "max_defer_s",
+            "evacuation_timeout_s",
+            "tail_kl_threshold",
+            "probe_interval_s",
+            "probe_timeout_s",
+        ):
+            value = getattr(self, name)
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or value < 0
+                or (name in positive and value == 0)
+            ):
+                constraint = "positive" if name in positive else "non-negative"
+                raise ValueError(f"joint_scheduling.{name} must be finite and {constraint}")
+        if (
+            type(self.overload_threshold) not in (int, float)
+            or not math.isfinite(self.overload_threshold)
+            or not 0 < self.overload_threshold <= 1
+        ):
+            raise ValueError("joint_scheduling.overload_threshold must be in (0, 1]")
+
+
+@dataclass
+class WeightRelayConfig(BaseConfig):
+    """CPU staging limits for the Mooncake RDMA weight relay."""
+
+    device_name: str = ""
+    max_staging_bytes: int = 4 << 30
+    pipeline_depth: int = 2
+
+    def __post_init__(self):
+        if not isinstance(self.device_name, str):
+            raise ValueError("weight_publication.relay.device_name must be a string")
+        for name in ("max_staging_bytes", "pipeline_depth"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"weight_publication.relay.{name} must be a positive integer")
+
+
+@dataclass
 class WeightPublicationConfig(BaseConfig):
     """Publish immutable CPU snapshots independently of training workers."""
 
     enabled: bool = False
     wait_timeout_s: float = 600.0
+    transport: str = "ray"
+    relay: WeightRelayConfig = field(default_factory=WeightRelayConfig)
+    joint_scheduling: JointSchedulingConfig = field(default_factory=JointSchedulingConfig)
 
     def __post_init__(self):
         if not math.isfinite(self.wait_timeout_s) or self.wait_timeout_s <= 0:
             raise ValueError("weight_publication.wait_timeout_s must be finite and positive")
+        if self.transport not in ("ray", "mooncake_rdma"):
+            raise ValueError("weight_publication.transport must be 'ray' or 'mooncake_rdma'")
+        if self.transport == "mooncake_rdma" and not self.enabled:
+            raise ValueError("mooncake_rdma transport requires weight_publication.enabled=True")
+        if isinstance(self.relay, (dict, DictConfig)):
+            relay = self.relay
+            if isinstance(relay, DictConfig):
+                relay = OmegaConf.to_container(relay, resolve=True)
+            object.__setattr__(self, "relay", WeightRelayConfig(**relay))
+        elif not isinstance(self.relay, WeightRelayConfig):
+            raise TypeError("weight_publication.relay must be dict, DictConfig, or WeightRelayConfig")
+        if isinstance(self.joint_scheduling, (dict, DictConfig)):
+            joint = self.joint_scheduling
+            if isinstance(joint, DictConfig):
+                joint = OmegaConf.to_container(joint, resolve=True)
+            object.__setattr__(self, "joint_scheduling", JointSchedulingConfig(**joint))
+        elif not isinstance(self.joint_scheduling, JointSchedulingConfig):
+            raise TypeError("weight_publication.joint_scheduling must be dict, DictConfig, or JointSchedulingConfig")
+        if self.joint_scheduling.enabled and not self.enabled:
+            raise ValueError("joint_scheduling requires weight_publication.enabled=True")
 
 
 @dataclass
@@ -199,8 +307,12 @@ class TrajectoryMigrationConfig(BaseConfig):
     def __post_init__(self):
         if self.checkpoint_tokens <= 0:
             raise ValueError("trajectory_migration.checkpoint_tokens must be positive")
-        if self.transfer_timeout_s <= 0:
-            raise ValueError("trajectory_migration.transfer_timeout_s must be positive")
+        if (
+            type(self.transfer_timeout_s) not in (int, float)
+            or not math.isfinite(self.transfer_timeout_s)
+            or self.transfer_timeout_s <= 0
+        ):
+            raise ValueError("trajectory_migration.transfer_timeout_s must be finite and positive")
 
 
 @dataclass
@@ -475,6 +587,14 @@ class RolloutConfig(BaseConfig):
                 raise ValueError("rtp_llm trajectory migration currently requires kv_transfer_backend=remote_prefix")
             if not self.enable_prefix_caching and not self.trajectory_migration.allow_cross_version_recompute:
                 raise ValueError("rtp_llm trajectory migration requires rollout.enable_prefix_caching=True")
+
+        if self.weight_publication.joint_scheduling.enabled:
+            if not self.trajectory_migration.enabled:
+                raise ValueError("joint_scheduling requires trajectory_migration.enabled=True")
+            if not self.trajectory_migration.allow_cross_version_recompute:
+                raise ValueError("joint_scheduling requires trajectory_migration.allow_cross_version_recompute=True")
+            if not self.enable_prefix_caching:
+                raise ValueError("joint_scheduling requires enable_prefix_caching=True for same-version migration")
 
         if self.topk_log_probs:
             if self.name != "vllm":

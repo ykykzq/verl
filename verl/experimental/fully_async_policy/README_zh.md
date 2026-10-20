@@ -82,13 +82,17 @@ actor_rollout_ref:
       enabled: true
       wait_timeout_s: 600
     trajectory_migration:
-      enabled: true
-      allow_cross_version_recompute: true
+      enabled: false
 async_training:
   partial_rollout: true
   use_trainer_do_validate: false
   use_dynamic_resource_scheduling: false
 ```
+
+以上是单独验证权重发布的配置，不依赖外部 KVCM 服务。trajectory 迁移是可选功能；要验证迁移和
+跨版本续跑，再开启 `trajectory_migration.enabled=true` 和 `allow_cross_version_recompute=true`。
+默认 `remote_prefix` 迁移后端会启用 RTP remote cache，需要事先配置可用的 KVCM 服务及匹配的
+domain / namespace。未配置该服务时，不应直接套用 remote-prefix 迁移配置进行发布器 smoke 测试。
 
 常规训练步只等待完整快照导出和发布准入确认。所有 FSDP ranks 参与已有的参数导出 collective，
 rank 0 将与训练参数脱离的 CPU tensor 按 bucket 写入 Ray object store，然后把包含对象引用的
@@ -132,6 +136,138 @@ trainer-side validation 或未合并的 LoRA。被中断 trajectory 的续跑继
 上线前应在 GPU 集群验证：训练步与慢 replica 安装确实重叠；多版本连续发布时显存和 object store 占用有界；
 pin/unpin 和失败恢复不误更新版本；续跑 trajectory 的版本元数据及 re-prefill 行为正确。
 CPU 单测和本地多 actor Ray 测试不代表已完成 GPU 吞吐或大模型内存验收。
+GPU smoke 必须检查实际完成的 optimizer steps，不能只依据退出码或初始权重发布屏障判断成功。
+
+### 权重更新与 trajectory 联合调度
+
+在上述 standalone RTP-LLM 发布配置上增加以下配置。该算法默认关闭；开启前需要部署可用的 KVCM。
+`kv_capacity_tokens` 和 `max_batch_size` 必须根据实际 KV 容量和 decode roofline 测量填写，下面的
+数值只是配置示例，不代表某个模型的推荐值。
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    enable_prefix_caching: true
+    trajectory_migration:
+      enabled: true
+      allow_cross_version_recompute: true
+      checkpoint_tokens: 64
+      kv_transfer_backend: remote_prefix
+    weight_publication:
+      enabled: true
+      joint_scheduling:
+        enabled: true
+        kv_capacity_tokens: 65536
+        kv_block_size_tokens: 16
+        max_batch_size: 32
+        update_cooldown_s: 5.0
+        min_decode_window_s: 2.0
+        min_decode_tokens: 64
+        max_defer_s: 30.0
+        evacuation_timeout_s: 5.0
+        staleness_version_gap: 2
+        tail_tokens: 32
+        tail_kl_threshold: 0.1
+        probe_interval_s: 5.0
+        probe_timeout_s: 2.0
+        max_concurrent_probes: 1
+async_training:
+  partial_rollout: true
+```
+
+联合调度要求 `async_training.partial_rollout=true`，使更新中断的 trajectory 保留前缀并续跑；
+配置校验会拒绝关闭此选项，避免将更新中断误当作生成完成。
+
+每次发布先在 router 执行预请求，关闭所有旧版本 replica 的新 trajectory 准入。完整逻辑请求在
+checkpoint 间隙仍保持登记和容量占用，因此已有续跑不会被当作新请求。新请求只进入已安装最新
+发布版本的 replica；所有 replica 暂不可用时在客户端等待，所有可用 replica 被 pin 时发布健康检查
+会报错，提示 unpin/recover，避免训练静默等待数据。
+
+后台优先选择逻辑 trajectory 较少的 replica 进行排空。checkpoint 上的同版本迁移优先填入已有负载
+的兼容 replica，释放出的 replica 更新后恢复新请求准入。版本、模型、rollout 配置指纹、KVCM domain
+和 namespace 必须匹配。达到排空期限、最长延期，或只剩少量且无法迁移的请求时，执行原地更新；
+幸存请求保留 token ids，通过显式 recompute ticket 在新版本重新 prefill。高负载 replica 也可向同版本
+低负载 replica 分流。失效源可在兼容的同版本健康 replica 上显式 recompute 恢复。
+
+迁移目标与更新选择在 router 内预留，防止多条 trajectory 同时抢占剩余容量。容量按完整
+`prompt + max_new_tokens` 向 KV block 大小取整保守预留，同时约束逻辑请求数；它不是引擎实时显存
+使用率。并发上限还会受实际引擎上限约束。混合/线性注意力模型的实际 block 可能是 1024，必须对应
+设置 `kv_block_size_tokens`；配置的记账粒度必须是实际 block 大小的整数倍，否则拒绝运行。
+实际模型序列上限、权重和运行时工作区也必须纳入部署容量规划。
+
+每次更新后保留 `update_cooldown_s`，每次迁移后保证 `min_decode_window_s` 的连续解码时间。
+`min_decode_tokens` 提供额外的 token 进度保护，但最长延期到期后可放宽该 token 条件，防止停滞请求
+无限阻塞更新；时间窗口仍然保留。连续发布只替换待更新的快照，不重置最早等待时间。即将到达更新
+期限的旧 replica 不再接收迁入请求，避免尾部工作不断被转移到同一台 replica。
+
+版本差达到 `staleness_version_gap` 后，在两个版本上异步 teacher-force 当前完整前缀，只返回最后
+`tail_tokens` 个生成 token 的 raw logprob，计算非负 sampled k3 指标
+`mean(expm1(log_p_new - log_p_old) - (log_p_new - log_p_old))`。超过阈值后在后续 checkpoint 尝试迁到
+较新版本。这个指标是抽样 KL 代理，不是全词表精确 KL；temperature/top-p 等采样变换会影响其解释。
+它衡量当前两个策略在所选前缀上的偏离，不会清除历史 token 的 off-policy 属性，也不剪枝 GRPO 组。
+
+评分仍需要完整前缀前向，并非只计算尾部 token。两端都预留临时 KV 和一个请求槽；容量不足时跳过，
+发布调度不等待评分。超时或过期版本的结果不触发迁移；临时预留保留至两个后端 RPC 都结束，避免
+本地超时后后端仍计算却释放容量。后端另有 `VERL_RTP_LLM_TAIL_SCORE_TIMEOUT_S`（默认 5 秒）限制。
+生成请求取消时，也要先确认对应后端 RPC 退出，再释放逻辑请求容量。
+
+router 的 `get_status()` 增加 `joint_scheduling`，发布器状态增加 `scheduling_decision`。
+生成输出保存 `trajectory_segments`、迁移记录及 `forced_prefill_tokens`，保留各段行为版本和 logprob。
+默认使用 CPU snapshot/Ray object store 发布路径，也可开启下述 RDMA relay。两种方式都没有新增完整
+GPU 权重副本。实际 KVCM 传输、teacher-forcing 支持和端到端收益仍需在 GPU 集群验收。
+
+### CPU RDMA 权重 Relay
+
+在独立权重发布配置上启用：
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    weight_publication:
+      enabled: true
+      transport: mooncake_rdma
+      relay:
+        device_name: ""
+        max_staging_bytes: 4294967296
+        pipeline_depth: 2
+```
+
+数据路径为 `trainer CPU snapshot -> master relay -> node relay -> 本机 rollout worker -> GPU`。
+master 固定在实际导出权重的训练 rank 0 所在节点，每个 rollout worker 节点只创建一个 CPU relay。
+trainer 仍只等待快照导出与发布准入；打包、注册 CPU 内存、跨节点传输由后台执行。
+节点 relay 通过 Mooncake `transfer_sync_read` 从前驱读取 bucket；控制 RPC 只传描述符和引用，
+跨 relay 的权重字节走 RDMA。本机落地为不可变 Ray object-store bucket，再复用现有安装器。
+TP/PP 分片仍由 RTP-LLM 的现有 named-tensor 安装路径处理。
+
+`pipeline_depth` 个 bucket 可同时流过链路。任一节点收到完整版本后即可安装，无需等全部节点；
+安装前先确认该 replica 的所有 worker 节点就绪，再中断生成、释放 KV 并切版权重。
+中间节点失败时，下游尝试更早的前驱直到 master；同版本重试和显式恢复会重建失败的分发。
+已确认死亡的 relay 按节点隔离；存活节点的注销失败会保留注册内存并报告错误。
+CPU buffer 在所有依赖读取完成前不会注销，取消或关闭也要等待底层读取实际结束。
+底层原生读取超时由 Mooncake 配置控制，Python 不用强行释放 buffer 来模拟超时。
+
+内存需要按模型规模规划：训练侧保留 active/latest 的 CPU 快照；节点侧保留一个正在使用的完整
+CPU 版本，并占用流水线暂存内存和序列化临时内存。`max_staging_bytes` 只限制每个 relay 的注册
+暂存区，不限制 Ray object store。应至少覆盖流水深度乘以最大打包 bucket（含对齐填充）；
+单个大 tensor 可能超过 checkpoint bucket 配置值。增大此值不会新增完整 GPU 权重缓冲。
+连续发布合并为最新待处理版本，正在安装的版本持有租约，旧版本清理完成后才启动替代分发。
+
+所有参与节点需安装提供 `mooncake.engine.TransferEngine` 的 Mooncake，并具备可用的 RDMA NIC、
+网络连通和足够的内存注册权限。RDMA 初始化失败直接报错，不会静默退回 TCP/Ray 跨节点传权重。
+接口依据 [Mooncake Transfer Engine Python API](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/api-reference/python/transfer-engine.md)。
+默认 `transport: ray` 不要求安装 Mooncake。发布器 `get_status()` 的 `relay` 字段提供分发版本、
+就绪节点、节点错误和清理错误。
+
+真实 RDMA 集群验收（已有 Ray 集群至少两个存活节点）：
+
+```bash
+VERL_RUN_RDMA_RELAY_TEST=1 RAY_ADDRESS=auto \
+  python -m pytest tests/checkpoint_engine/test_rdma_relay_cluster.py -q
+```
+
+可用 `VERL_RDMA_DEVICE_NAME` 指定 NIC，用 `VERL_RDMA_TEST_TIMEOUT_S` 调整测试等待时间。
+该 smoke 检查混合 dtype、多 bucket 的逐值一致性及注册内存回收，不代表大模型吞吐验收。
+本地 CPU/Ray 测试使用测试专用的字节拷贝后端，不代表已经验证 RDMA 硬件性能。
 
 ## 使用方式
 

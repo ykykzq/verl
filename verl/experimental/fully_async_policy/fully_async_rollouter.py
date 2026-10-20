@@ -1031,6 +1031,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.feed_task = safe_create_task(self._feed_samples(), name="feed_task")
         self.processor_task = safe_create_task(self._processor_worker(), name="processor_task")
 
+        failed = False
         try:
             # Wait for sample feed to complete
             # Use asyncio.wait to monitor all tasks. If processor exits early,
@@ -1055,27 +1056,54 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             await self.pending_queue.join()
             print("[FullyAsyncRollouter] pending_queue joined")
 
-        except Exception as e:
-            print(f"[FullyAsyncRollouter] Streaming process exception: {e}")
-            raise e
+        except BaseException:
+            failed = True
+            raise
 
         finally:
-            if self.feed_task and not self.feed_task.done():
-                self.feed_task.cancel()
-                await asyncio.gather(self.feed_task, return_exceptions=True)
+            # A monitor failure or external cancellation can arrive while a
+            # generation failure is already unwinding. Keep cleanup alive.
+            cleanup = asyncio.create_task(self._cleanup_streaming_generation(failed))
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(cleanup)
+                    break
+                except asyncio.CancelledError:
+                    if cleanup.cancelled():
+                        raise
+                    cancelled = True
+            if cancelled and not failed:
+                raise asyncio.CancelledError
 
-            if self.processor_task and not self.processor_task.done():
-                self.processor_task.cancel()
-                await asyncio.gather(self.processor_task, return_exceptions=True)
+    async def _cleanup_streaming_generation(self, failed: bool):
+        # Stop the processor before collecting sample tasks so it cannot submit
+        # new generation work after cleanup takes ownership of the task set.
+        workers = [self.feed_task, self.processor_task]
+        for task in workers:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
-            self.feed_task = None
-            self.processor_task = None
+        samples = list(self.active_tasks)
+        for task in samples:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*samples, return_exceptions=True)
+        self.active_tasks.clear()
 
-            # Send a finish signal
+        self.feed_task = None
+        self.processor_task = None
+        async with self.lock:
+            self._record_active_count()
+            self.running = False
+
+        try:
             await self.message_queue_client.put_sample(sample=None)
-
-            async with self.lock:
-                self.running = False
+        except Exception:
+            if not failed:
+                raise
+            logger.exception("Failed to send the finish signal during rollout cleanup")
 
     async def fit(self):
         """
@@ -1099,10 +1127,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
 
         try:
-            # Run build and monitoring tasks concurrently
-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+            # Cancel children only in finally. Cancelling a gather here would
+            # cancel generation twice and could interrupt its cleanup awaits.
+            done, _pending = await asyncio.wait([generation_task, monitor_task], return_when=asyncio.FIRST_EXCEPTION)
+            for task in done:
+                task.result()
         except Exception as e:
             print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
+            raise
         finally:
             if not generation_task.done():
                 generation_task.cancel()
@@ -1111,6 +1143,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             # Wait for the task to complete
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+            async with self.lock:
+                self.running = False
 
         print("[FullyAsyncRollouter] Rollouter fit completed")
 

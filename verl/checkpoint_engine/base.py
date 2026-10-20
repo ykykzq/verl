@@ -372,6 +372,24 @@ class CheckpointEngineWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights_from_snapshot(self, snapshot):
         """Install an immutable export without involving any training worker."""
+        await self._install_weight_snapshot(snapshot)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_weights_from_relay(self, snapshot_by_node):
+        """Install only the complete snapshot staged on this worker's node."""
+        node_id = ray.get_runtime_context().get_node_id()
+        if not isinstance(snapshot_by_node, dict) or node_id not in snapshot_by_node:
+            raise ValueError(f"relay snapshot is missing the local node {node_id}")
+        versions = {snapshot.version for snapshot in snapshot_by_node.values()}
+        if len(versions) != 1:
+            raise ValueError("relay snapshots must all belong to the same weight version")
+        await self._install_weight_snapshot(snapshot_by_node[node_id])
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_weight_relay_node_id(self):
+        return ray.get_runtime_context().get_node_id()
+
+    async def _install_weight_snapshot(self, snapshot):
         from verl.checkpoint_engine.weight_snapshot import iter_snapshot_weights
 
         async def weights():
@@ -515,6 +533,9 @@ class CheckpointEngineManager:
             raise errors[0]
         return results
 
+    async def _prepare_replica_weights(self, replica: RolloutReplica, global_steps: int) -> None:
+        """Stage a transport's immutable weights before interrupting generation."""
+
     async def _transfer_replica_weights(self, replica: RolloutReplica, global_steps: int) -> dict:
         rollout = RayWorkerGroup(
             worker_handles=replica.workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls)
@@ -617,6 +638,7 @@ class CheckpointEngineManager:
             while True:
                 attempts += 1
                 try:
+                    await self._prepare_replica_weights(replica, global_steps)
                     await replica.abort_all_requests(reject_request=True)
                     await replica.release_kv_cache()
                     metrics = await self._transfer_replica_weights(replica, global_steps)

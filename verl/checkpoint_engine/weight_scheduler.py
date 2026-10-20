@@ -6,6 +6,7 @@
 
 import asyncio
 import math
+import traceback
 from collections import deque
 
 
@@ -17,9 +18,20 @@ class WeightPublicationScheduler:
     installation, retries and quarantine. No transfer runs in an admission RPC.
     """
 
-    def __init__(self, manager, on_commit=None):
+    def __init__(self, manager, on_commit=None, joint_scheduling_config=None):
         self.manager = manager
         self.on_commit = on_commit
+        self._joint_config = dict(joint_scheduling_config or {})
+        self._joint_enabled = bool(self._joint_config.get("enabled", False))
+        self._poll_interval_s = self._joint_config.get("poll_interval_s", 0.1)
+        if self._joint_enabled and (
+            type(self._poll_interval_s) not in (int, float)
+            or not math.isfinite(self._poll_interval_s)
+            or self._poll_interval_s <= 0
+        ):
+            raise ValueError("joint_scheduling.poll_interval_s must be finite and positive")
+        self._publication_lock = asyncio.Lock()
+        self._last_scheduling_decision = None
         self._latest = None
         self._active = None
         self._active_rank = None
@@ -56,14 +68,51 @@ class WeightPublicationScheduler:
 
     async def publish(self, snapshot):
         """Admit a strictly newer snapshot without waiting for any installation."""
-        self._check_health()
-        self._validate_version(snapshot.version)
-        if self._latest is not None and snapshot.version <= self._latest.version:
-            raise ValueError("published weight versions must be strictly increasing; deduplicate before publication")
+        if self._joint_enabled:
+            return await self._publish_joint(snapshot)
+        self._validate_publication(snapshot)
         self._latest = snapshot
         self._start()
         await self._notify()
         return {"accepted_version": snapshot.version, "latest_version": snapshot.version}
+
+    def _validate_publication(self, snapshot):
+        self._check_health()
+        self._validate_version(snapshot.version)
+        if self._latest is not None and snapshot.version <= self._latest.version:
+            raise ValueError("published weight versions must be strictly increasing; deduplicate before publication")
+
+    async def _publish_joint(self, snapshot):
+        async with self._publication_lock:
+            self._validate_publication(snapshot)
+            cancelled = False
+            try:
+                prepare = asyncio.ensure_future(
+                    self.manager.load_balancer.prepare_weight_update.remote(snapshot.version)
+                )
+                # A cancelled caller cannot undo a remote admission transition.
+                # Retain the snapshot and start catch-up once that RPC settles.
+                while not prepare.done():
+                    try:
+                        await asyncio.shield(prepare)
+                    except asyncio.CancelledError:
+                        if prepare.cancelled():
+                            raise RuntimeError("replica update preparation was cancelled") from None
+                        cancelled = True
+                if prepare.cancelled():
+                    raise RuntimeError("replica update preparation was cancelled")
+                prepare.result()
+            except Exception as error:
+                self._fatal_error = str(error)
+                self._wake.set()
+                await self._notify()
+                raise
+            self._latest = snapshot
+            self._start()
+            await self._notify()
+            if cancelled:
+                raise asyncio.CancelledError
+            return {"accepted_version": snapshot.version, "latest_version": snapshot.version}
 
     async def get_status(self):
         """Return current replica progress and any observed fatal error."""
@@ -78,6 +127,7 @@ class WeightPublicationScheduler:
             "closing": self._closing,
             "closed": self._closed,
             "fatal_error": self._fatal_error,
+            "scheduling_decision": self._last_scheduling_decision,
         }
 
     async def wait_for_version(self, version, timeout_s=300.0):
@@ -207,6 +257,7 @@ class WeightPublicationScheduler:
     async def _run(self):
         try:
             while True:
+                self._check_health(require_open=False)
                 self._wake.clear()
                 while self._commands:
                     command = self._commands.popleft()
@@ -226,7 +277,29 @@ class WeightPublicationScheduler:
                     ]
                 )
                 if candidates:
-                    rank = min(candidates, key=lambda rank: (self._version(states[rank]), rank))
+                    if self._joint_enabled:
+                        decision = await self.manager.load_balancer.select_replica_for_update.remote(snapshot.version)
+                        self._last_scheduling_decision = decision
+                        if snapshot is not self._latest:
+                            snapshot = None
+                            continue
+                        server_id = decision.get("server_id")
+                        ranks = {replica.server_address: replica.replica_rank for replica in self.manager.replicas}
+                        if server_id is not None and server_id not in ranks:
+                            raise RuntimeError(f"joint scheduler selected unknown rollout replica {server_id!r}")
+                        rank = ranks.get(server_id)
+                        if rank is None or rank not in candidates:
+                            snapshot = None
+                            # Deferred work is not idle: wait_for_version must keep
+                            # waiting, and close(drain=True) must finish catch-up.
+                            self._idle = False
+                            try:
+                                await asyncio.wait_for(self._wake.wait(), timeout=self._poll_interval_s)
+                            except asyncio.TimeoutError:
+                                pass
+                            continue
+                    else:
+                        rank = min(candidates, key=lambda rank: (self._version(states[rank]), rank))
                     await self._transfer(snapshot, rank)
                     snapshot = None
                     continue
@@ -258,7 +331,9 @@ class WeightPublicationScheduler:
 
     async def close(self, drain=True):
         """Stop admission, drain or cancel transfers, and release all manifests."""
-        self._closing = True
+        # Serialize against the short preparation RPC, never a weight transfer.
+        async with self._publication_lock:
+            self._closing = True
         self._wake.set()
         try:
             if self._worker is not None:
@@ -269,9 +344,19 @@ class WeightPublicationScheduler:
                 except asyncio.CancelledError as error:
                     if drain:
                         raise
-                    # A cancelled Task caches its cancellation exception. Clear
-                    # transfer frames that otherwise keep object refs alive.
-                    error.__traceback__ = None
+                    # Python 3.10 can cache the original traceback separately
+                    # and chain its cancellation exception as the context.
+                    # Clear finished frames, including chained cleanup errors.
+                    pending = [error]
+                    seen = set()
+                    while pending:
+                        error = pending.pop()
+                        if id(error) in seen:
+                            continue
+                        seen.add(id(error))
+                        traceback.clear_frames(error.__traceback__)
+                        error.__traceback__ = None
+                        pending.extend(e for e in (error.__cause__, error.__context__) if e is not None)
         finally:
             self._settle_commands()
             self._worker = None

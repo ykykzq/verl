@@ -25,6 +25,7 @@ from cachetools import LRUCache
 from omegaconf import OmegaConf
 
 from verl.utils.import_utils import load_class_from_fqn, resolve_config_path
+from verl.workers.rollout.joint_scheduler import JointReplicaScheduler
 from verl.workers.rollout.trajectory_scheduler import ReplicaSnapshot, TrajectoryScheduler
 
 logger = logging.getLogger(__file__)
@@ -164,6 +165,7 @@ class GlobalRequestLoadBalancer:
         full_determinism: bool = False,
         trajectory_migration_config: dict[str, Any] | None = None,
         server_metadata: dict[str, dict[str, Any]] | None = None,
+        joint_scheduling_config: dict[str, Any] | None = None,
     ):
         # Allow empty initial servers: in dynamic-resource-scheduling mode all
         # replicas are hybrid and will be registered later via add_servers().
@@ -173,6 +175,7 @@ class GlobalRequestLoadBalancer:
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
         self._full_determinism = full_determinism
         self._server_metadata = {sid: deepcopy((server_metadata or {}).get(sid, {})) for sid in servers}
+        self._retired_server_metadata: dict[str, dict] = {}
         self._replica_states = {
             sid: {
                 "lifecycle_state": "SERVING",
@@ -191,6 +194,17 @@ class GlobalRequestLoadBalancer:
         )
         self._pending_migrations: dict[str, dict[str, Any]] = {}
         self._migration_reservations: dict[str, int] = {sid: 0 for sid in servers}
+        self._joint = (
+            JointReplicaScheduler(joint_scheduling_config)
+            if joint_scheduling_config and joint_scheduling_config.get("enabled", False)
+            else None
+        )
+        if self._joint is not None and (
+            self._trajectory_scheduler is None or not self._trajectory_scheduler.allow_cross_version_recompute
+        ):
+            raise ValueError("joint scheduling requires trajectory migration and cross-version recompute")
+        if self._joint is not None:
+            self._joint.validate_capacity_metadata(self._server_metadata)
 
     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
@@ -201,6 +215,13 @@ class GlobalRequestLoadBalancer:
         Returns:
             A tuple of ``(server_id, actor_handle)`` in a single atomic call.
         """
+        if self._joint is not None:
+            server_id = self._joint.acquire(
+                request_id, self._replica_states, self._request_id_to_server.get(request_id)
+            )
+            self._request_id_to_server[request_id] = server_id
+            self._inflight_requests[server_id] += 1
+            return server_id, self._servers[server_id]
         # Try sticky session first
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
@@ -249,6 +270,48 @@ class GlobalRequestLoadBalancer:
         """Counts by ``server_id``; no identity needed at release."""
         return []
 
+    def register_trajectory(self, request_id: str, prompt_tokens: int, max_new_tokens: int) -> dict:
+        if self._joint is None:
+            raise RuntimeError("joint scheduling is disabled")
+        self._joint.register(request_id, prompt_tokens, max_new_tokens)
+        return {"registered": True}
+
+    async def report_trajectory_progress(
+        self, request_id: str, server_id: str, generated_tokens: int, weight_version, prefix_ids: list[int]
+    ) -> dict:
+        if self._joint is None:
+            return {"reported": False}
+        record = self._joint.report(request_id, server_id, generated_tokens, weight_version)
+        if record is None:
+            return {"reported": False}
+        if len(prefix_ids) != record.prompt_tokens + generated_tokens:
+            raise ValueError("trajectory prefix does not match reported progress")
+        self._joint.maybe_probe(request_id, prefix_ids, self._replica_states, self._server_metadata, self._servers)
+        return {"reported": True, "staleness": dict(record.staleness)}
+
+    def finish_trajectory(self, request_id: str) -> dict:
+        self._drop_pending_migration(request_id)
+        if self._joint is not None:
+            self._joint.finish(request_id)
+        self._request_id_to_server.pop(request_id, None)
+        if self._joint is not None:
+            live_sources = {r.server_id for r in self._joint.trajectories.values()}
+            self._retired_server_metadata = {
+                s: m for s, m in self._retired_server_metadata.items() if s in live_sources
+            }
+        return {"finished": True}
+
+    def prepare_weight_update(self, version: int) -> dict:
+        if self._joint is None:
+            raise RuntimeError("joint scheduling is disabled")
+        self._joint.prepare(version, self._replica_states)
+        return self._joint.status()
+
+    def select_replica_for_update(self, version: int) -> dict:
+        if self._joint is None:
+            raise RuntimeError("joint scheduling is disabled")
+        return self._joint.select_update(version, self._replica_states, self._server_metadata, self._pending_migrations)
+
     def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
         """Atomically add multiple servers to the load balancer pool.
 
@@ -286,6 +349,8 @@ class GlobalRequestLoadBalancer:
             server_ids: List of server identifiers to remove.
         """
         for sid in server_ids:
+            if self._joint is not None and any(r.server_id == sid for r in self._joint.trajectories.values()):
+                self._retired_server_metadata[sid] = deepcopy(self._server_metadata.get(sid, {}))
             self._invalidate_replica_routes(sid)
             self._inflight_requests.pop(sid, None)
             self._servers.pop(sid, None)
@@ -294,11 +359,15 @@ class GlobalRequestLoadBalancer:
             self._replica_states.pop(sid, None)
             self._managed_versions.discard(sid)
             self._metadata_epochs.pop(sid, None)
+            if self._joint is not None:
+                self._joint.engine_limits.pop(sid, None)
         logger.info(f"[GlobalLoadBalancer] removed {len(server_ids)} servers")
 
     def update_server_metadata(self, server_id: str, metadata: dict[str, Any]) -> None:
         if server_id not in self._servers:
             return
+        if self._joint is not None:
+            self._joint.validate_capacity_metadata({server_id: metadata})
         state = self._replica_states[server_id]
         metadata = deepcopy(metadata)
         version = metadata.get("weight_version", state["weight_version"])
@@ -364,6 +433,8 @@ class GlobalRequestLoadBalancer:
         state = self._require_lifecycle(server_id, "UPDATING")
         if weight_version != state["desired_weight_version"]:
             raise ValueError(f"Replica {server_id} update does not target weight version {weight_version!r}")
+        if self._joint is not None:
+            self._joint.validate_capacity_metadata({server_id: metadata or {}})
         self._server_metadata[server_id].update(deepcopy(metadata or {}))
         self._server_metadata[server_id]["weight_version"] = weight_version
         state.update(
@@ -372,6 +443,11 @@ class GlobalRequestLoadBalancer:
             desired_weight_version=None,
             last_update_error=None,
         )
+        if self._joint is not None:
+            pending_since = self._joint.pending_since.get(server_id, self._joint.clock())
+            self._joint.committed_update(server_id)
+            if self._joint.latest_version is not None and weight_version < self._joint.latest_version:
+                self._joint.pending_since[server_id] = pending_since
         self._metadata_epochs[server_id] = object()
         return deepcopy(state)
 
@@ -410,6 +486,10 @@ class GlobalRequestLoadBalancer:
         capability_server_ids = []
         capability_epochs = []
         for server_id, server in self._servers.items():
+            # Joint scheduling receives version-fenced capabilities at startup
+            # and update commit; avoid a global RPC barrier at each checkpoint.
+            if self._joint is not None:
+                continue
             try:
                 capability_calls.append(server.get_trajectory_migration_capabilities.remote())
                 capability_server_ids.append(server_id)
@@ -431,6 +511,8 @@ class GlobalRequestLoadBalancer:
         # to this migration decision, never to the router's published state.
         snapshot_metadata = {sid: deepcopy(metadata) for sid, metadata in self._server_metadata.items()}
         source_snapshot_metadata = deepcopy(snapshot_metadata.get(source_server_id, {}))
+        if not source_snapshot_metadata and self._joint is not None:
+            source_snapshot_metadata = deepcopy(self._retired_server_metadata.get(source_server_id, {}))
         source_snapshot_metadata.update(deepcopy(source_metadata or {}))
         replicas = [
             ReplicaSnapshot(
@@ -442,11 +524,38 @@ class GlobalRequestLoadBalancer:
             for server_id in self._servers
             if self._is_serving(server_id) or server_id == source_server_id
         ]
+        if self._joint is not None:
+            if source_server_id not in snapshot_metadata and source_snapshot_metadata:
+                replicas.append(ReplicaSnapshot(source_server_id, 0, source_snapshot_metadata, "QUARANTINED"))
+            target_id, policy_reason = self._joint.target(
+                request_id,
+                source_server_id,
+                source_snapshot_metadata,
+                replicas,
+                bool(trajectory.get("migration_required", False)),
+            )
+            if target_id is None:
+                return {"migrate": False, "reason": policy_reason}
+            trajectory = {
+                **trajectory,
+                "migration_required": True,
+                "resume_source_allowed": policy_reason == "resume source",
+                "force_recompute": not self._is_serving(source_server_id),
+                "required_target_server_id": target_id,
+            }
+            replicas = [r for r in replicas if r.server_id in (source_server_id, target_id)]
         target, diagnostics = self._trajectory_scheduler.choose(
-            trajectory, source_server_id, replicas, source_metadata=source_metadata
+            trajectory, source_server_id, replicas, source_metadata=source_snapshot_metadata
         )
         if target is None:
             return {"migrate": False, **diagnostics}
+        if self._joint is not None:
+            if target.server_id != target_id:
+                return {"migrate": False, "reason": "placement changed during compatibility evaluation"}
+            self._joint.reserve(request_id, target.server_id)
+            diagnostics["policy_reason"] = policy_reason
+            if trajectory.get("force_recompute") and diagnostics.get("mode") == "recompute":
+                diagnostics["recovery_recompute"] = True
 
         decision_id = uuid4().hex
         pending = {
@@ -455,11 +564,17 @@ class GlobalRequestLoadBalancer:
             "target_server_id": target.server_id,
         }
         self._pending_migrations[request_id] = pending
+        if self._joint is not None:
+            pending.update(
+                source_version=source_snapshot_metadata.get("weight_version"),
+                target_version=snapshot_metadata[target.server_id].get("weight_version"),
+                resume_source=diagnostics.get("resume_source", False),
+            )
         self._migration_reservations[target.server_id] += 1
         return {
             "migrate": True,
             **pending,
-            "source_server": self._servers[source_server_id],
+            "source_server": self._servers.get(source_server_id),
             "target_server": self._servers[target.server_id],
             "source_metadata": source_snapshot_metadata,
             "target_metadata": deepcopy(snapshot_metadata[target.server_id]),
@@ -474,6 +589,11 @@ class GlobalRequestLoadBalancer:
         if not self._is_serving(target_server_id):
             self._drop_pending_migration(request_id)
             raise RuntimeError(f"migration target {target_server_id} is no longer serving")
+        if self._joint is not None:
+            if self._replica_states[target_server_id]["weight_version"] != pending["target_version"]:
+                self._drop_pending_migration(request_id)
+                raise RuntimeError("migration target weight version changed")
+            self._joint.commit_migration(request_id, target_server_id, pending["resume_source"])
         self._request_id_to_server[request_id] = target_server_id
         self._drop_pending_migration(request_id)
         return {"migrated": True, "server_id": target_server_id}
@@ -488,6 +608,8 @@ class GlobalRequestLoadBalancer:
     async def abort_trajectory(self, request_id: str) -> dict[str, Any]:
         """Stop only the active backend request for one logical trajectory."""
         server_id = self._request_id_to_server.get(request_id)
+        if self._joint is not None and request_id in self._joint.trajectories:
+            server_id = self._joint.trajectories[request_id].server_id
         if server_id is None or server_id not in self._servers:
             return {"aborted": False, "request_id": request_id, "reason": "trajectory route not found"}
         server = self._servers[server_id]
@@ -498,6 +620,8 @@ class GlobalRequestLoadBalancer:
         return {**result, "server_id": server_id}
 
     def _drop_pending_migration(self, request_id: str) -> None:
+        if self._joint is not None:
+            self._joint.reservations.pop(request_id, None)
         pending = self._pending_migrations.pop(request_id, None)
         if pending is None:
             return
@@ -555,6 +679,7 @@ class GlobalRequestLoadBalancer:
             ),
             "pinned_replicas": sum(state["pin"] is not None for state in self._replica_states.values()),
             "pending_migrations": {request_id: dict(value) for request_id, value in self._pending_migrations.items()},
+            **({"joint_scheduling": self._joint.status()} if self._joint is not None else {}),
         }
 
     def get_total_inflight(self) -> int:
@@ -568,6 +693,7 @@ def _create_global_sticky_inflight(
     load_balancer_cls: type | None = None,
     trajectory_migration_config: dict[str, Any] | None = None,
     server_metadata: dict[str, dict[str, Any]] | None = None,
+    joint_scheduling_config: dict[str, Any] | None = None,
 ):
     """Factory for the default sticky-session + least-inflight strategy.
 
@@ -587,6 +713,8 @@ def _create_global_sticky_inflight(
         kwargs["full_determinism"] = full_determinism
         kwargs["trajectory_migration_config"] = trajectory_migration_config
         kwargs["server_metadata"] = server_metadata
+        if joint_scheduling_config and joint_scheduling_config.get("enabled", False):
+            kwargs["joint_scheduling_config"] = joint_scheduling_config
     return ray.remote(load_balancer_cls).remote(**kwargs)
 
 
@@ -669,6 +797,7 @@ def get_router_handle(
     load_balancer_cls: type | None = None,
     trajectory_migration_config: dict[str, Any] | None = None,
     server_metadata: dict[str, dict[str, Any]] | None = None,
+    joint_scheduling_config: dict[str, Any] | None = None,
 ) -> Any:
     """Create a load balancer instance from router configuration.
 
@@ -684,6 +813,8 @@ def get_router_handle(
             applicable to the YAML plugin.
     """
     migration_enabled = bool((trajectory_migration_config or {}).get("enabled", False))
+    if joint_scheduling_config and joint_scheduling_config.get("enabled", False) and not migration_enabled:
+        raise ValueError("joint scheduling requires trajectory migration")
     if migration_enabled and (router_config_path or load_balancer_cls is not None):
         raise ValueError("trajectory migration currently requires the built-in GlobalRequestLoadBalancer")
 
@@ -706,4 +837,5 @@ def get_router_handle(
         load_balancer_cls=load_balancer_cls or GlobalRequestLoadBalancer,
         trajectory_migration_config=trajectory_migration_config,
         server_metadata=server_metadata,
+        joint_scheduling_config=joint_scheduling_config,
     )
