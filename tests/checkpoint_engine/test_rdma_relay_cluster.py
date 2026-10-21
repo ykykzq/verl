@@ -38,7 +38,7 @@ class SnapshotSource:
             if bucket_count
             else expected_weights(version)
         )
-        return export_weight_snapshot(weights, version, bucket_size=bucket_bytes, is_master=True)
+        return export_weight_snapshot(weights, version, bucket_size=bucket_bytes, is_master=True, split_tensors=True)
 
 
 @ray.remote(num_cpus=0, max_restarts=0)

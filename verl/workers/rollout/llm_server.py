@@ -372,6 +372,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         if not decision.get("migrate", False):
             return None
 
+        final_output.extra_fields["trajectory_migration_attempts"] = (
+            final_output.extra_fields.get("trajectory_migration_attempts", 0) + 1
+        )
+
         decision_id = decision["decision_id"]
         timeout_s = float(getattr(migration_config, "transfer_timeout_s", 30.0))
         trajectory_state = {
@@ -452,7 +456,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 )
             )
             raise
-        except Exception:
+        except Exception as error:
             await self._rollback_trajectory_migration(
                 request_id=request_id,
                 decision_id=decision_id,
@@ -464,6 +468,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 request_id,
                 source_server_id,
             )
+            final_output.extra_fields.setdefault("trajectory_migration_failures", []).append(str(error))
+            if getattr(migration_config, "strict_remote_hit", False):
+                raise RuntimeError(f"strict trajectory migration failed: {error}") from error
             return None
 
     @rollout_trace_op
@@ -694,11 +701,16 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 sampling_params[limit_key] = original_max_tokens - len(final_output.token_ids)
                 continue
             if pending_migration is not None:
+                if pending_migration.get("mode", "remote_prefix") == "remote_prefix":
+                    pending_migration["remote_reuse_len"] = output.remote_reuse_len
+                    pending_migration["remote_hit"] = bool(output.extra_fields.get("remote_migration_hit", False))
+                    pending_migration["fallback_reason"] = output.extra_fields.get("migration_fallback_reason")
                 migration_history.append(pending_migration)
                 pending_migration = None
 
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
+            final_output.remote_reuse_len += output.remote_reuse_len
             if output.log_probs is not None:
                 final_output.log_probs.extend(output.log_probs)
             # On partial rollout resume the model version may differ, so keep
@@ -799,9 +811,12 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
         final_output.extra_fields["num_cached_tokens"] = num_cached_tokens
+        final_output.extra_fields["remote_reuse_len"] = final_output.remote_reuse_len
         if forced_prefill_tokens is not None:
             final_output.extra_fields["forced_prefill_tokens"] = forced_prefill_tokens
         if migration_config is not None:
+            final_output.extra_fields.setdefault("trajectory_migration_attempts", 0)
+            final_output.extra_fields.setdefault("trajectory_migration_failures", [])
             final_output.extra_fields["trajectory_segments"] = trajectory_segments
             final_output.extra_fields["forced_prefill_tokens"] = forced_prefill_tokens or 0
             final_output.extra_fields["trajectory_migrations"] = migration_history
@@ -810,6 +825,17 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 for mode in ("remote_prefix", "recompute")
             }
             final_output.extra_fields["trajectory_migration_replans"] = migration_replans
+            final_output.extra_fields["trajectory_remote_hits"] = sum(
+                m.get("remote_hit", False) for m in migration_history
+            )
+            final_output.extra_fields["trajectory_migration_fallbacks"] = sum(
+                bool(m.get("fallback_reason")) for m in migration_history
+            ) + len(final_output.extra_fields.get("trajectory_migration_failures", []))
+            if (
+                getattr(migration_config, "strict_remote_hit", False)
+                and not final_output.extra_fields["trajectory_remote_hits"]
+            ):
+                raise RuntimeError("strict trajectory migration requires a completed cross-replica remote KV hit")
         return final_output
 
 

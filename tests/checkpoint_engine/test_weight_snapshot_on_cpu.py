@@ -79,6 +79,34 @@ def test_export_detaches_cpu_storage_from_live_parameters(object_store):
         snapshot.version = 4
 
 
+def test_rdma_snapshot_splits_oversized_tensor_and_restores_shape(object_store):
+    weights = [
+        ("embedding", torch.arange(105, dtype=torch.float32).reshape(15, 7)),
+        ("bias", torch.arange(3, dtype=torch.float16)),
+        ("scalar", torch.tensor(2.0)),
+    ]
+    snapshot = export_weight_snapshot(weights, 3, 64, True, split_tensors=True)
+    assert snapshot.max_bucket_bytes <= 64
+    assert len(snapshot.buckets) > 6
+    for ref in snapshot.buckets:
+        from verl.checkpoint_engine.rdma_relay import _layout
+
+        assert _layout(object_store.values[ref.binary()])[1] <= 64
+    recovered = _consume(snapshot)
+    for (name, value), (actual_name, actual) in zip(weights, recovered, strict=True):
+        assert name == actual_name
+        assert torch.equal(value, actual)
+
+
+def test_chunked_snapshot_rejects_truncated_tensor(object_store):
+    from dataclasses import replace
+
+    snapshot = export_weight_snapshot([("large", torch.arange(40))], 3, 64, True, split_tensors=True)
+    broken = replace(snapshot, buckets=snapshot.buckets[:-1])
+    with pytest.raises(ValueError, match="incomplete"):
+        _consume(broken)
+
+
 def test_consumer_mutation_does_not_change_snapshot_retry(object_store):
     snapshot = export_weight_snapshot([("w", torch.tensor([5, 6]))], 1, 64, True)
     _consume(snapshot)[0][1].fill_(0)

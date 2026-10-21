@@ -818,6 +818,13 @@ class FSDPEngine(BaseEngine):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
+        probe = None
+        self.last_update_evidence = {}
+        if getattr(self.optimizer_config, "verify_parameter_updates", False):
+            from verl.trainer.ppo.learning_acceptance import ParameterUpdateProbe
+
+            probe = ParameterUpdateProbe(self.module.parameters())
+
         if scaler is not None:
             # scaler handles inf/nan skipping internally via _check_inf_per_device.
             scaler.step(self.optimizer)
@@ -829,6 +836,9 @@ class FSDPEngine(BaseEngine):
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
+
+        if probe is not None:
+            self.last_update_evidence = probe.finish(grad_norm.item())
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales

@@ -277,7 +277,18 @@ class ToolAgentLoop(AgentLoopBase):
                 for mode, count in output.extra_fields["trajectory_migration_counts"].items():
                     counts[mode] = counts.get(mode, 0) + count
                 agent_data.extra_fields["trajectory_migration_counts"] = counts
-            for key in ("trajectory_migration_replans", "forced_prefill_tokens"):
+            if "trajectory_migration_failures" in output.extra_fields:
+                agent_data.extra_fields.setdefault("trajectory_migration_failures", []).extend(
+                    output.extra_fields["trajectory_migration_failures"]
+                )
+            for key in (
+                "trajectory_migration_replans",
+                "forced_prefill_tokens",
+                "remote_reuse_len",
+                "trajectory_migration_attempts",
+                "trajectory_remote_hits",
+                "trajectory_migration_fallbacks",
+            ):
                 if key in output.extra_fields:
                     agent_data.extra_fields[key] = agent_data.extra_fields.get(key, 0) + output.extra_fields[key]
 

@@ -318,6 +318,19 @@ class TestComputeDataMetrics(unittest.TestCase):
             "values": torch.tensor([[0.9, 1.0], [1.1, 1.2]]),
         }
 
+    def test_remote_migration_metrics_count_actual_hits_separately(self):
+        self.batch.non_tensor_batch = {
+            "remote_reuse_len": [0, 512],
+            "trajectory_migration_attempts": [1, 2],
+            "trajectory_remote_hits": [0, 1],
+            "trajectory_migration_fallbacks": [1, 1],
+        }
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+        self.assertEqual(metrics["rollout/remote_reuse_len/sum"], 512)
+        self.assertEqual(metrics["rollout/trajectory_migration_attempts/sum"], 3)
+        self.assertEqual(metrics["rollout/trajectory_remote_hits/sum"], 1)
+        self.assertEqual(metrics["rollout/trajectory_migration_fallbacks/sum"], 2)
+
     def test_compute_data_metrics_with_critic(self):
         """Test compute_data_metrics with critic enabled."""
         metrics = compute_data_metrics(self.batch, use_critic=True)

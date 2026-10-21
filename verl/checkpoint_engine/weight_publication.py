@@ -110,6 +110,8 @@ class WeightPublisher:
         self.last_commit_metrics = {"version": version, "metrics": metrics}
 
     async def publish(self, snapshot) -> dict:
+        if getattr(self, "relay", None) is not None and callable(getattr(self.relay, "validate", None)):
+            self.relay.validate(snapshot)
         result = await self.scheduler.publish(snapshot)
         if getattr(self, "relay", None) is not None:
             self.relay.publish(snapshot)

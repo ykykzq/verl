@@ -6,6 +6,7 @@
 import asyncio
 import logging
 import os
+import time
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -21,7 +22,11 @@ def create_relay(node_id, config):
 
     return RdmaWeightRelayActor.options(
         scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-    ).remote(max_staging_bytes=config["max_staging_bytes"], device_name=config["device_name"])
+    ).remote(
+        max_staging_bytes=config["max_staging_bytes"],
+        device_name=config["device_name"],
+        staging_slot_bytes=config["max_staging_bytes"] // config["pipeline_depth"] // 16 * 16,
+    )
 
 
 def destroy_relay(handle):
@@ -68,10 +73,13 @@ class _Distribution:
                     tuple(self.buckets[node]),
                     self.snapshot.tensor_count,
                     self.snapshot.total_bytes,
+                    self.snapshot.max_bucket_bytes,
+                    self.snapshot.chunks,
                 )
             )
 
     async def bucket(self, index):
+        started = time.perf_counter()
         registered = []
         try:
             descriptor = await self.relays[self.source].load_bucket.remote(self.snapshot.buckets[index])
@@ -128,6 +136,13 @@ class _Distribution:
                     self.source_error |= node == self.source
                 elif isinstance(result, BaseException):
                     self.cleanup_errors.append(str(result))
+            logger.info(
+                "weight_transfer version=%s bucket=%s transfer_s=%.6f errors=%s",
+                self.snapshot.version,
+                index,
+                time.perf_counter() - started,
+                self.errors,
+            )
 
     async def run(self):
         indices = iter(range(len(self.snapshot.buckets)))
@@ -188,8 +203,18 @@ class RelayDistribution:
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="weight-relay-distribution")
 
-    def publish(self, snapshot):
+    def validate(self, snapshot):
         snapshot.__post_init__()
+        largest = snapshot.max_bucket_bytes or max(1, snapshot.total_bytes)
+        slot = self.config["max_staging_bytes"] // self.config["pipeline_depth"] // 16 * 16
+        if slot <= 0 or largest > slot:
+            raise ValueError(
+                f"RDMA snapshot bucket {largest} bytes exceeds per-lane staging {slot}; "
+                "export with RDMA tensor splitting before publication"
+            )
+
+    def publish(self, snapshot):
+        self.validate(snapshot)
         if self.latest is None or snapshot.version > self.latest.version:
             self.latest = snapshot
         self._start()

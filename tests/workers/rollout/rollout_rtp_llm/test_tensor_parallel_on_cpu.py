@@ -252,7 +252,37 @@ class TestTPControl(unittest.IsolatedAsyncioTestCase):
         server = make_server()
         server.engine = SimpleNamespace(wait_remote_cache_idle=Mock(return_value=True))
         server.configure_tp_peers([SimpleNamespace(wait_local_remote_cache_idle=remote(AsyncMock(return_value=False)))])
+        with self.assertRaisesRegex(RuntimeError, "unknown failure"):
+            await server.wait_remote_cache_idle(1)
+
+    async def test_migration_preserves_native_write_error(self):
+        server = make_server()
+        server.engine = SimpleNamespace(
+            wait_remote_cache_status=Mock(
+                return_value={"status": "write_failed", "error_code": 105, "message": "SaveKvCaches failed"}
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "105.*SaveKvCaches"):
+            await server.wait_remote_cache_idle(1)
+
+    async def test_migration_native_timeout_is_a_timeout(self):
+        server = make_server()
+        server.engine = SimpleNamespace(
+            wait_remote_cache_status=Mock(
+                return_value={"status": "timeout", "error_code": 0, "message": "writes pending"}
+            )
+        )
         with self.assertRaises(asyncio.TimeoutError):
+            await server.wait_remote_cache_idle(1)
+
+    async def test_migration_checks_peer_structured_status(self):
+        server = make_server()
+        server.engine = SimpleNamespace(wait_remote_cache_idle=Mock(return_value=True))
+        result = {"status": "write_failed", "error_code": 105, "message": "peer write failed"}
+        server.configure_tp_peers(
+            [SimpleNamespace(wait_local_remote_cache_idle=remote(AsyncMock(return_value=result)))]
+        )
+        with self.assertRaisesRegex(RuntimeError, "rank=1.*105"):
             await server.wait_remote_cache_idle(1)
 
     async def test_nonzero_rank_cannot_serve_generation(self):

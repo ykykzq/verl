@@ -83,6 +83,15 @@ def distribution(monkeypatch, *, blocked=None, fail=False):
     return obj, relays, events
 
 
+def test_rejects_bucket_that_exceeds_concurrent_staging_budget(monkeypatch):
+    dist, _, events = distribution(monkeypatch)
+    # 1024 bytes / pipeline_depth 2: a 513-byte bucket cannot reserve a slot.
+    oversized = WeightSnapshot(1, (ray.ObjectRef.from_random(),), 1, 513, 513)
+    with pytest.raises(ValueError, match="staging"):
+        dist.publish(oversized)
+    assert not events
+
+
 @pytest.mark.asyncio
 async def test_fast_node_is_ready_before_downstream_and_source_stays_registered(monkeypatch):
     unblock = asyncio.Event()

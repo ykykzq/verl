@@ -104,3 +104,103 @@ advantage 可以全为 0，`pg_loss=0`、`grad_norm=0` 与无有效 policy 更�
 4. 确认更新后的快照安装到 rollout ranks，记录其版本和对应参数变化；评估学习效果仍需更多训练步。
 
 `hendrycks_math` 改为已支持的 `math` 属于数据标签修正，不需要修改 TP 实现或人为制造奖励。
+
+## 5. OSS 产物 + Mooncake KV 数据通路
+
+模型路径、checkpoint、日志继续使用原来的 OSS 挂载目录。KV 的存储选择属于 KVCM
+instance group 的服务端配置，与 `MODEL_PATH`、`CKPTS_DIR` 无关。
+先在 KVCM 服务端为独立 instance group 配置 Mooncake storage，并部署与原生 SDK
+内嵌客户端协议匹配的 master。`KVCM_SERVER_ADDRESS` 填 KVCM 的 metadata RPC 地址，
+不能填 Mooncake master 地址。只修改客户端的 `type=mooncake` 不会替换服务端的 file/NFS storage。
+
+当前 SDK RPM 固定为 `2026_09_15_17_40-cuda130.x86_64`。查证
+[KVCM 上游依赖](https://github.com/alibaba/tair-kvcache/blob/b079c1adceb67f858d7d447360e685187e4b9771/open_source/deps/git.bzl#L173)
+后，master 已固定为 `openanolis/Mooncake@211b75742b6d1fee739ad9a486f2ae9ce2695847`。
+其 `PutStart` 四参数签名与该 RPM 的二进制符号一致；现场 master `v0.3.13.post1` 的
+接口增加了 `tenant_id`，这是明确的协议差异。SDK 精确源码提交仍不可核实，不能把公开
+依赖参考提交当作 RPM 构建提交，也不能把静态协议对齐当成端到端验证通过。
+RTP 的 `deps/kvcm_versions.bzl` 记录 artifact/hash/master pin/参考提交，并写入 native
+build info。`tools/build_kvcm_mooncake.py` 校验源码 SHA256 后构建配套 master 和 CPU
+storage client；详细命令和证据见 RTP 的 `docs/backend/remote_cache_build.md`。
+后续必须通过下面的原生测试确认，Python 客户端成功不能替代它。
+
+在 RTP 仓库执行真实跨节点 GPU 测试，两端安装相同的新 wheel：
+
+```bash
+RTP_RUN_NATIVE_KV_TEST=1 RAY_ADDRESS=auto \
+KVCM_SERVER_ADDRESS=kvcm-host:rpc-port KVCM_INSTANCE_GROUP=mooncake-probes \
+python -m pytest rtp_llm/test/smoke/test_native_kv_probe_cluster.py -q -s
+```
+
+测试在不同 IP 的两个 GPU 节点上，通过实际链接的 `NativeKVProbe` 执行分配、put/get，
+逐字节比较 64 KiB 和 64 MiB GPU buffer，各重复两轮。输出双方 build info、节点、字节数
+和 SHA256。源客户端保持存活直至读端完成；超时后停止测试 actor 进程，不提前复用 GPU buffer。
+另可用 `python -m rtp_llm.utils.kvcm_probe --address ... --instance-group ...` 做单机启动预检。
+该预检会真正调用 SDK 的分配、写入、读取路径，FUSE 的 SDK 105 错误不会被忽略。
+启动预检在独立子进程执行，失败或超时后以进程退出结束 native buffer 生命周期；
+Mooncake SDK 的 soft timeout 不能视作 DMA 已结束后直接复用 buffer。
+
+配置完成后使用新增入口（模型及产物路径仍由环境变量控制）：
+
+```bash
+KVCM_SERVER_ADDRESS=kvcm-host:rpc-port KVCM_INSTANCE_GROUP=mooncake-rollout \
+MODEL_PATH=/mnt/fuse/Qwen/Qwen3.8-27B CKPTS_DIR=/mnt/fuse/rl/checkpoints \
+bash examples/grpo_trainer/run_qwen3_5_27b_mooncake_kv.sh \
+  trainer.nnodes=1 trainer.n_gpus_per_node=4 \
+  rollout.nnodes=3 rollout.n_gpus_per_node=4 \
+  actor_rollout_ref.rollout.tensor_model_parallel_size=4
+```
+
+启动预检默认开启：`trajectory_migration.storage_preflight=True`。当前入口支持直接
+KVCM RPC 配置；使用自定义 `kvcm_client_config` 或 VIP discovery 时，需显式关闭该预检，
+并独立运行与实际配置等价的原生测试。关闭预检不代表存储通过验收。
+
+## 6. 严格验收与诊断
+
+原生 `wait_remote_cache_status()` 返回 `status/error_code/message`，区分 `success`、
+`timeout`、`write_failed`、`unavailable`。SDK 错误经 TP RPC 保留，日志包含失败 rank。
+旧 bool API 的 false 只能解释为未知失败，不能归类为超时。
+例外是实际 SDK 数据传输返回 `ER_SDK_TIMEOUT=100`：因原生 DMA 完成状态不确定，
+该 rank 在释放 KV block 前以退出码 70 结束，现有 TP 故障隔离将该副本置为不可用，需重启。
+这与“等待 flush 达到时限、写入仍在执行”的普通等待超时不同。
+
+两个 TP4 副本的长前缀迁移专用验收启用：
+
+```text
+++actor_rollout_ref.rollout.trajectory_migration.strict_remote_hit=True
+```
+
+该模式要求每条 trajectory 至少完成一次跨副本 remote-prefix 迁移并实际远端命中；
+普通完成、未迁移、token-only re-prefill、零远端命中均不能通过。选择足够长、不会在首个
+checkpoint 前结束的输入，并使用现有迁移 scorer 确保产生迁移决策。训练输出保留
+`trajectory_migrations`（含命中与回退原因）、`trajectory_migration_failures`；聚合指标为
+`rollout/{remote_reuse_len,trajectory_migration_attempts,trajectory_remote_hits,trajectory_migration_fallbacks}/{sum,mean}`。
+`remote_reuse_len` 是各段实际复用量之和，可能重复包含同一个前缀，不是唯一 token 数。
+严格迁移模式仅用于专用验收，不适合要求所有短轨迹都迁移的日常训练。
+
+有效学习的短程验收增加以下覆盖项（`G > 1`，使用真实 `math` reward）：
+
+```text
+++trainer.learning_acceptance=True
+++actor_rollout_ref.actor.optim.verify_parameter_updates=True
+++actor_rollout_ref.rollout.verify_weight_updates=True
+actor_rollout_ref.actor.optim.weight_decay=0
+actor_rollout_ref.actor.optim.lr_warmup_steps=0
+```
+
+训练检查组内奖励方差和有效 advantage；FSDP optimizer 在每步前后每个本地参数分片
+最多抽取 4096 个元素，跨 rank 归并检查有限、非零梯度及真实参数差值，输出
+`actor/parameter_delta_max` 和 `actor/parameter_probe_elements_per_rank_max`。
+这是参数变化的抽样证据，不是完整模型逐字节审计。RTP 在每个转换后的权重安装时对比
+真实目标 tensor 与传入数据，失败即中止，成功日志含 `verified_weights`。
+这些检查会增加 CPU 拷贝和同步开销，仅用于验收。
+
+RDMA 导出现在按 `min(bucket_bytes, floor(staging_bytes / pipeline_depth / 16) * 16)`
+切分超大 tensor，并保存名称、原始形状和 offset 供安装前重组；单个 tensor 不再绕过 staging
+容量约束。CPU arena 使用固定槽位，避免不同 bucket 大小与并发释放造成碎片。
+日志含 `weight_snapshot export_s/cpu_copy_s/serialization_s`、每 bucket 的
+`weight_transfer transfer_s` 和每 rank 的 `weight_install install_s/h2d_s`。
+分片限制 relay arena 占用，不限制 Ray object store 或重组完整张量所需 CPU 内存。
+
+验收顺序保持：原生跨节点字节一致 → 两个 TP4 长前缀真实命中 → 4+3×TP4 非零参数更新
+→ RDMA 与迁移联合运行。本地 CPU/语法测试不能代替以上四项硬件验收。

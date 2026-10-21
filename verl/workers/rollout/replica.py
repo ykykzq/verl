@@ -42,6 +42,8 @@ class TokenOutput(BaseModel):
     """stop reason: 'completed', 'aborted', or None for unknown"""
     num_preempted: Optional[int] = None
     """number of preempted times for metric calculation"""
+    remote_reuse_len: int = 0
+    """Remote KV tokens reused, counted once per prefill."""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
 

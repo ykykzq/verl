@@ -644,6 +644,27 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         timing_raw = self.timing_raw
         # implement critic warmup
         if self.config.trainer.critic_warmup <= self.global_steps:
+            if self.config.trainer.get("learning_acceptance", False):
+                from verl.trainer.ppo.learning_acceptance import learning_batch_metrics
+
+                if not self.config.actor_rollout_ref.actor.optim.get("verify_parameter_updates", False):
+                    raise ValueError("learning_acceptance requires actor.optim.verify_parameter_updates=True")
+                if self.config.actor_rollout_ref.actor.optim.get("weight_decay", 0) != 0:
+                    raise ValueError("learning_acceptance requires weight_decay=0 to isolate gradient-driven updates")
+                if not self.config.actor_rollout_ref.rollout.get("verify_weight_updates", False):
+                    raise ValueError("learning_acceptance requires rollout.verify_weight_updates=True")
+                mask = batch.batch["response_mask"]
+                if "rollout_is_weights" in batch.batch:
+                    mask = mask * batch.batch["rollout_is_weights"]
+                metrics.update(
+                    learning_batch_metrics(
+                        batch.batch["token_level_scores"],
+                        batch.batch["advantages"],
+                        mask,
+                        batch.non_tensor_batch["uid"],
+                        strict=True,
+                    )
+                )
             # update actor
             with marked_timer("update_actor", timing_raw, color="red"):
                 actor_output = self._update_actor(batch)

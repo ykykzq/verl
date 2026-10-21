@@ -535,12 +535,28 @@ class RTPLLMHttpServer:
         setup_cuda_device_and_accl_env(local_rank)
         set_global_controller(ConcurrencyController(cfg.concurrency_config.concurrency_limit))
 
+        if self._remote_prefix_migration_enabled() and getattr(
+            self._trajectory_migration_config(), "storage_preflight", True
+        ):
+            from rtp_llm.utils.kvcm_probe import run_probe
+
+            kv = cfg.kv_cache_config
+            if kv.kvcm_client_config or kv.kvcm_enable_vipserver:
+                raise ValueError("native storage preflight currently requires explicit kvcm_server_address settings")
+            result = run_probe(
+                kv.kvcm_server_address, kv.kvcm_instance_group, kv.kvcm_model_sdk_config, device=local_rank
+            )
+            logger.info(
+                "KVCM native storage preflight replica=%s tp_rank=%s result=%s", self.replica_rank, self.tp_rank, result
+            )
+
         self.backend_manager = BackendManager(cfg)
         self.backend_manager.start()
         self.engine = self.backend_manager.engine
         self._cfg = cfg
         self._set_cache_key_salt(self.global_steps)
         self.weight_manager = self.engine.model.weight_manager
+        self.weight_manager.verify_hf_updates = getattr(self.config, "verify_weight_updates", False)
 
         self.eos_token_id = self.engine.model.model_config.special_tokens.eos_token_id
         if self.tp_rank != 0:
@@ -611,7 +627,10 @@ class RTPLLMHttpServer:
                 "error": self._tp_failure or self._weight_sync_error,
             }
 
-    async def wait_local_remote_cache_idle(self, timeout_s: float) -> bool:
+    async def wait_local_remote_cache_idle(self, timeout_s: float):
+        wait_fn = getattr(self.engine, "wait_remote_cache_status", None)
+        if callable(wait_fn):
+            return await asyncio.to_thread(wait_fn, int(timeout_s * 1000))
         wait_fn = getattr(self.engine, "wait_remote_cache_idle", None)
         if wait_fn is None:
             raise RuntimeError("the rtp-llm engine binding does not expose wait_remote_cache_idle")
@@ -626,11 +645,25 @@ class RTPLLMHttpServer:
             ),
             timeout=timeout_s,
         )
-        for result in results:
+        for rank, result in enumerate(results):
             if isinstance(result, BaseException):
                 raise result
-            if not result:
-                raise asyncio.TimeoutError(f"remote KV cache writes did not finish successfully within {timeout_s}s")
+            if result is True:
+                continue
+            if isinstance(result, dict):
+                status = result.get("status")
+                detail = (
+                    f"rank={rank} status={status} error_code={result.get('error_code')} {result.get('message', '')}"
+                )
+                if status == "success":
+                    continue
+                if status == "timeout":
+                    raise asyncio.TimeoutError(f"remote KV cache {detail}")
+                raise RuntimeError(f"remote KV cache {detail}")
+            raise RuntimeError(
+                f"remote KV cache rank={rank}: unknown failure from legacy bool API; "
+                "rebuild RTP with wait_remote_cache_status for SDK diagnostics"
+            )
 
     async def _wait_for_generation(self):
         failure_event = getattr(self, "_tp_failure_event", None)
@@ -829,8 +862,10 @@ class RTPLLMHttpServer:
 
         token_ids: list[int] = []
         probs: list[float] = []
+        remote_reuse_len = 0
 
         async def consume():
+            nonlocal remote_reuse_len
             stream = await self.visitor.enqueue(generate_input)
             try:
                 async for outputs in stream:
@@ -840,6 +875,8 @@ class RTPLLMHttpServer:
                         token_ids.extend(output.output_ids.reshape(-1).tolist())
                     if output.aux_info is not None and output.aux_info.softmax_probs:
                         probs.extend(output.aux_info.softmax_probs)
+                    if output.aux_info is not None:
+                        remote_reuse_len = max(remote_reuse_len, int(getattr(output.aux_info, "remote_reuse_len", 0)))
             finally:
                 await stream.aclose()
 
@@ -927,7 +964,36 @@ class RTPLLMHttpServer:
             stop_reason = "length" if migration_checkpoint else "completed"
         else:
             stop_reason = None
-        extra_fields = {"global_steps": admitted_global_steps, "migration_checkpoint": migration_checkpoint}
+        extra_fields = {
+            "global_steps": admitted_global_steps,
+            "migration_checkpoint": migration_checkpoint,
+            "remote_reuse_len": remote_reuse_len,
+        }
+        if accepted_migration is not None and accepted_migration.get("mode", "remote_prefix") == "remote_prefix":
+            source_rank = accepted_migration.get("source_replica_rank")
+            hit = (
+                source_rank is not None
+                and source_rank != self.replica_rank
+                and remote_reuse_len > 0
+                and bool(token_ids)
+                and not aborted
+            )
+            extra_fields["remote_migration_hit"] = hit
+            if not hit:
+                reason = (
+                    "generation_aborted"
+                    if aborted
+                    else (
+                        "source_replica_not_distinct"
+                        if source_rank is None or source_rank == self.replica_rank
+                        else "remote_cache_miss"
+                    )
+                )
+                extra_fields["migration_fallback_reason"] = reason
+                if getattr(self._trajectory_migration_config(), "strict_remote_hit", False):
+                    raise RuntimeError(
+                        f"remote KV migration acceptance failed: {reason}; remote_reuse_len={remote_reuse_len}"
+                    )
         if token_ids and accepted_migration is not None and accepted_migration.get("mode") == "recompute":
             # Empty aborts do not establish that the forced prefill ran.
             extra_fields["forced_prefill_tokens"] = len(prompt_ids)
@@ -935,6 +1001,7 @@ class RTPLLMHttpServer:
             token_ids=token_ids,
             log_probs=log_probs,
             stop_reason=stop_reason,
+            remote_reuse_len=remote_reuse_len,
             extra_fields=extra_fields,
         )
 

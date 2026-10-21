@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -30,6 +32,9 @@ from verl.utils.ray_utils import auto_await
 from verl.workers.config import CheckpointEngineConfig, FineGrainedWeightUpdateConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 @dataclass
@@ -392,12 +397,25 @@ class CheckpointEngineWorker(Worker):
     async def _install_weight_snapshot(self, snapshot):
         from verl.checkpoint_engine.weight_snapshot import iter_snapshot_weights
 
+        started = time.perf_counter()
+        h2d_s = 0.0
+
         async def weights():
+            nonlocal h2d_s
             async for name, tensor in iter_snapshot_weights(snapshot):
                 # Large tensors bypass the IPC bucket and need device storage too.
-                yield name, tensor.to(device=get_device_id())
+                tick = time.perf_counter()
+                device_tensor = tensor.to(device=get_device_id())
+                h2d_s += time.perf_counter() - tick
+                yield name, device_tensor
 
         await self.server_adapter.update_weights(weights(), global_steps=snapshot.version, wire_format="named_tensors")
+        logger.info(
+            "weight_install version=%s install_s=%.6f h2d_s=%.6f",
+            snapshot.version,
+            time.perf_counter() - started,
+            h2d_s,
+        )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

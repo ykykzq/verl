@@ -103,6 +103,24 @@ def relay(budget=4096):
 
 
 @pytest.mark.asyncio
+async def test_fixed_slots_allow_large_bucket_after_short_bucket_release(runtime):
+    from verl.checkpoint_engine.rdma_relay import RdmaWeightRelay
+
+    source = RdmaWeightRelay(128, staging_slot_bytes=64)
+    short = await source.load_bucket((("short", torch.zeros(1, dtype=torch.uint8)),))
+    long = await source.load_bucket((("long", torch.zeros(64, dtype=torch.uint8)),))
+    assert long["pointer"] - short["pointer"] == 64
+    await source.release_bucket(short["bucket_id"])
+    replacement = await source.load_bucket((("replacement", torch.zeros(64, dtype=torch.uint8)),))
+    assert replacement["pointer"] == short["pointer"]
+    with pytest.raises(ValueError, match="staging slot"):
+        await source.load_bucket((("oversize", torch.zeros(65, dtype=torch.uint8)),))
+    await source.release_bucket(long["bucket_id"])
+    await source.release_bucket(replacement["bucket_id"])
+    await source.close()
+
+
+@pytest.mark.asyncio
 async def test_repeated_buckets_reuse_one_registration_without_changing_remote_keys(runtime):
     source, target = relay(128), relay(128)
     pointers = []

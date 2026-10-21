@@ -605,6 +605,17 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    for key in (
+        "remote_reuse_len",
+        "trajectory_migration_attempts",
+        "trajectory_remote_hits",
+        "trajectory_migration_fallbacks",
+    ):
+        if key in batch.non_tensor_batch:
+            values = [float(value) for value in batch.non_tensor_batch[key] if value is not None]
+            metrics[f"rollout/{key}/sum"] = sum(values)
+            metrics[f"rollout/{key}/mean"] = sum(values) / max(1, len(values))
+
     return metrics
 
 

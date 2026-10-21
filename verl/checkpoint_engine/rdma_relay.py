@@ -126,11 +126,19 @@ class RdmaWeightRelay:
     The controller must settle downstream reads before releasing their sources.
     """
 
-    def __init__(self, max_staging_bytes: int, device_name: str = ""):
+    def __init__(self, max_staging_bytes: int, device_name: str = "", staging_slot_bytes: int = 0):
         if type(max_staging_bytes) is not int or max_staging_bytes <= 0:
             raise ValueError("relay max_staging_bytes must be a positive integer")
         if not isinstance(device_name, str):
             raise TypeError("relay device_name must be a string")
+        if (
+            type(staging_slot_bytes) is not int
+            or staging_slot_bytes < 0
+            or staging_slot_bytes > max_staging_bytes
+            or staging_slot_bytes % 16
+        ):
+            raise ValueError("invalid RDMA staging slot size")
+        self.staging_slot_bytes = staging_slot_bytes
         try:
             from mooncake.engine import TransferEngine
         except ImportError as error:
@@ -160,6 +168,8 @@ class RdmaWeightRelay:
             raise RuntimeError("weight relay is closed")
 
     def _allocate(self, size):
+        if self.staging_slot_bytes and size > self.staging_slot_bytes:
+            raise ValueError(f"RDMA bucket {size} exceeds staging slot {self.staging_slot_bytes}")
         if size > self.max_staging_bytes - self._active_bytes:
             raise RuntimeError(
                 f"relay staging capacity exceeded: {size} requested, "
@@ -186,7 +196,7 @@ class RdmaWeightRelay:
             start = descriptor["pointer"] - base
             if offset + size <= start:
                 break
-            offset = _aligned(start + buffer.numel())
+            offset = _aligned(start + (self.staging_slot_bytes or buffer.numel()))
         if offset + size > self._arena.numel():
             raise RuntimeError("relay staging capacity fragmented; increase max_staging_bytes or reduce pipeline_depth")
         return self._arena[offset : offset + size].zero_()

@@ -577,6 +577,37 @@ class TestRTPLLMTrajectoryAdmission(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.inputs[0].generate_config.reuse_cache)
         self.assertTrue(self.inputs[0].generate_config.enable_remote_cache)
 
+    async def test_strict_remote_prefix_rejects_cache_miss(self):
+        self.server.config.trajectory_migration.strict_remote_hit = True
+        ticket = self.remote_ticket()
+        await self.server.accept_trajectory_migration(ticket, self.state)
+        with self.assertRaisesRegex(RuntimeError, "remote KV migration acceptance failed"):
+            await self.server.generate([1, 2, 3, 4], {"max_tokens": 1}, "trajectory-1", migration_ticket=ticket)
+
+    async def test_remote_reuse_is_reported_once_per_prefill(self):
+        async def enqueue(_):
+            async def stream():
+                for token in (6, 5):
+                    yield SimpleNamespace(
+                        generate_outputs=[
+                            SimpleNamespace(
+                                output_ids=torch.tensor([token]),
+                                aux_info=SimpleNamespace(softmax_probs=[], remote_reuse_len=3),
+                            )
+                        ]
+                    )
+
+            return stream()
+
+        self.server.visitor.enqueue = enqueue
+        ticket = self.remote_ticket()
+        ticket["source_replica_rank"] = self.server.replica_rank + 1
+        self.server.config.trajectory_migration.strict_remote_hit = True
+        await self.server.accept_trajectory_migration(ticket, self.state)
+        result = await self.server.generate([1, 2, 3, 4], {"max_tokens": 2}, "trajectory-1", migration_ticket=ticket)
+        self.assertEqual(result.remote_reuse_len, 3)
+        self.assertTrue(result.extra_fields["remote_migration_hit"])
+
     async def test_aborted_recompute_counts_prefill_only_after_tokens_were_produced(self):
         for produced_tokens in [[], [5]]:
             with self.subTest(produced_tokens=produced_tokens):

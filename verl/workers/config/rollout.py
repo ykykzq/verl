@@ -302,6 +302,8 @@ class TrajectoryMigrationConfig(BaseConfig):
     min_score_improvement: float = 0.0
     kv_transfer_backend: str = "remote_prefix"
     transfer_timeout_s: float = 30.0
+    storage_preflight: bool = True
+    strict_remote_hit: bool = False
     backend_options: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -317,6 +319,7 @@ class TrajectoryMigrationConfig(BaseConfig):
 
 @dataclass
 class RolloutConfig(BaseConfig):
+    verify_weight_updates: bool = False
     _mutable_fields = {
         "max_model_len",
         "load_format",

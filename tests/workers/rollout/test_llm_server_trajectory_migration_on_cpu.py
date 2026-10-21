@@ -92,7 +92,9 @@ class _RollbackLoadBalancer(_LoadBalancer):
 
 
 @pytest.mark.asyncio
-async def test_chunk_checkpoint_transfers_trajectory_and_continues(monkeypatch):
+@pytest.mark.parametrize("remote_hit", [False, True])
+@pytest.mark.parametrize("strict", [False, True])
+async def test_chunk_checkpoint_transfers_trajectory_and_continues(monkeypatch, remote_hit, strict):
     segments = iter(
         [
             TokenOutput(
@@ -107,10 +109,13 @@ async def test_chunk_checkpoint_transfers_trajectory_and_continues(monkeypatch):
             TokenOutput(
                 token_ids=[12],
                 stop_reason="completed",
+                remote_reuse_len=4 if remote_hit else 0,
                 extra_fields={
                     "global_steps": 7,
                     "migration_checkpoint": False,
                     llm_server._ROUTE_SERVER_ID_FIELD: "s1",
+                    "remote_migration_hit": remote_hit,
+                    "migration_fallback_reason": None if remote_hit else "remote_cache_miss",
                 },
             ),
         ]
@@ -137,12 +142,17 @@ async def test_chunk_checkpoint_transfers_trajectory_and_continues(monkeypatch):
                     checkpoint_tokens=2,
                     transfer_timeout_s=1.0,
                     kv_transfer_backend="remote_prefix",
+                    strict_remote_hit=strict,
                 ),
             )
         )
     )
     client = FullyAsyncLLMServerClient(config=config, load_balancer_handle=load_balancer)
 
+    if strict and not remote_hit:
+        with pytest.raises(RuntimeError, match="completed cross-replica remote KV hit"):
+            await client.generate(request_id="trajectory-1", prompt_ids=[1, 2], sampling_params={"max_tokens": 8})
+        return
     output = await client.generate(request_id="trajectory-1", prompt_ids=[1, 2], sampling_params={"max_tokens": 8})
 
     assert prompts == [[1, 2], [1, 2, 10, 11]]
@@ -161,6 +171,10 @@ async def test_chunk_checkpoint_transfers_trajectory_and_continues(monkeypatch):
     assert output.extra_fields["trajectory_migrations"][0]["target_server_id"] == "s1"
     assert output.extra_fields["trajectory_migration_counts"] == {"remote_prefix": 1, "recompute": 0}
     assert output.extra_fields["trajectory_migration_replans"] == 0
+    assert output.extra_fields["trajectory_migration_attempts"] == 1
+    assert output.extra_fields["trajectory_remote_hits"] == int(remote_hit)
+    assert output.extra_fields["trajectory_migration_fallbacks"] == int(not remote_hit)
+    assert output.remote_reuse_len == (4 if remote_hit else 0)
 
 
 @pytest.mark.asyncio

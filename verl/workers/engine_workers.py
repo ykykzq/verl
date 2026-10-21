@@ -757,8 +757,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 pass
             raise ValueError("Independent weight snapshots require full weights; nonmerged LoRA is unsupported")
         bucket_size = self.config.rollout.checkpoint_engine.update_weights_bucket_megabytes << 20
+        publication = getattr(self.config.rollout, "weight_publication", None)
+        split_tensors = publication is not None and publication.enabled and publication.transport == "mooncake_rdma"
+        if split_tensors:
+            relay = publication.relay
+            bucket_size = min(bucket_size, relay.max_staging_bytes // relay.pipeline_depth // 16 * 16)
         return export_weight_snapshot(
-            weights, version=global_steps, bucket_size=bucket_size, is_master=torch.distributed.get_rank() == 0
+            weights,
+            version=global_steps,
+            bucket_size=bucket_size,
+            is_master=torch.distributed.get_rank() == 0,
+            split_tensors=split_tensors,
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)

@@ -96,9 +96,11 @@ class SocketTransferEngine:
 
 @ray.remote(num_cpus=0, max_restarts=0)
 class SocketRelay(RdmaWeightRelay):
-    def __init__(self, node, max_staging_bytes, device_name, fail_reads=False):
+    def __init__(self, node, max_staging_bytes, device_name, fail_reads=False, staging_slot_bytes=0):
         sys.modules["mooncake.engine"] = SimpleNamespace(TransferEngine=SocketTransferEngine)
-        super().__init__(max_staging_bytes=max_staging_bytes, device_name=device_name)
+        super().__init__(
+            max_staging_bytes=max_staging_bytes, device_name=device_name, staging_slot_bytes=staging_slot_bytes
+        )
         self.node_id = node
         self.engine.fail_reads = fail_reads
         self.engine_closed = False
@@ -128,7 +130,11 @@ def test_relay_chain_preserves_local_snapshot_refs_and_survives_a_failed_middle_
 
         def create_relay(node, config):
             actor = SocketRelay.remote(
-                node, config["max_staging_bytes"], config["device_name"], fail_reads=node in failed_nodes
+                node,
+                config["max_staging_bytes"],
+                config["device_name"],
+                fail_reads=node in failed_nodes,
+                staging_slot_bytes=config["max_staging_bytes"] // config["pipeline_depth"] // 16 * 16,
             )
             relays.append(actor)
             return actor
@@ -144,6 +150,7 @@ def test_relay_chain_preserves_local_snapshot_refs_and_survives_a_failed_middle_
             )
             first = await source.export.remote(1)
             assert len(first.buckets) > 1
+            assert first.chunks
             distribution.pin(first)
             # A newer manifest does not replace the version held by an installer.
             second = await source.export.remote(2)
@@ -154,6 +161,7 @@ def test_relay_chain_preserves_local_snapshot_refs_and_survives_a_failed_middle_
                         await asyncio.wait_for(distribution.snapshots_for(rank, 1), 30)
                     continue
                 manifests = await asyncio.wait_for(distribution.snapshots_for(rank, 1), 30)
+                assert manifests[node].chunks == first.chunks
                 result = await worker.verify.remote(manifests[node], 1)
                 assert result["tensor_count"] == 6
             await assert_no_active_leases(list(distribution.relays.values()))
