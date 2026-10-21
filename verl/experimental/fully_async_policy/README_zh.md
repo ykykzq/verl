@@ -277,7 +277,8 @@ actor_rollout_ref:
 数据路径为 `trainer CPU snapshot -> master relay -> node relay -> 本机 rollout worker -> GPU`。
 master 固定在实际导出权重的训练 rank 0 所在节点，每个 rollout worker 节点只创建一个 CPU relay。
 trainer 仍只等待快照导出与发布准入；打包、注册 CPU 内存、跨节点传输由后台执行。
-节点 relay 通过 Mooncake `transfer_sync_read` 从前驱读取 bucket；控制 RPC 只传描述符和引用，
+节点 relay 通过 Mooncake `batch_transfer_async_read` 提交单请求批次，使用
+`transfer_check_status` 确认原生终态；控制 RPC 只传描述符和引用，
 跨 relay 的权重字节走 RDMA。本机落地为不可变 Ray object-store bucket，再复用现有安装器。
 TP/PP 分片仍由 RTP-LLM 的现有 named-tensor 安装路径处理。
 
@@ -285,16 +286,21 @@ TP/PP 分片仍由 RTP-LLM 的现有 named-tensor 安装路径处理。
 安装前先确认该 replica 的所有 worker 节点就绪，再中断生成、释放 KV 并切版权重。
 中间节点失败时，下游尝试更早的前驱直到 master；同版本重试和显式恢复会重建失败的分发。
 已确认死亡的 relay 按节点隔离；存活节点的注销失败会保留注册内存并报告错误。
-CPU buffer 在所有依赖读取完成前不会注销，取消或关闭也要等待底层读取实际结束。
-底层原生读取超时由 Mooncake 配置控制，Python 不用强行释放 buffer 来模拟超时。
+每个 relay 在首次使用时注册固定的 CPU arena，bucket 只租用其中的对齐区间。全部读取结束后
+归还区间，arena 在 relay 关闭时才注销，避免相同地址反复注册后命中旧的 MR/rkey 缓存。
+取消或关闭必须等待原生终态。原生 pending/timeout 继续保留租约；提交没有返回句柄、查询抛错
+或未知状态会进入 quarantine，保持 RPC 和两端租约，明确记录需要停止相关 relay 进程。
+这种无法证明完成的情况不会通过 Python 超时释放 buffer，也不会自动重试或宣称恢复成功。
+落入 Ray object store 的 tensor 使用独立 CPU storage，避免序列化整个 arena。
 
 内存需要按模型规模规划：训练侧保留 active/latest 的 CPU 快照；节点侧保留一个正在使用的完整
 CPU 版本，并占用流水线暂存内存和序列化临时内存。`max_staging_bytes` 只限制每个 relay 的注册
-暂存区，不限制 Ray object store。应至少覆盖流水深度乘以最大打包 bucket（含对齐填充）；
+暂存区，且首次使用后持续注册这部分内存，不限制 Ray object store。应至少覆盖流水深度乘以
+最大打包 bucket（含对齐填充），变长 bucket 还可能需要余量避免空闲区间碎片；
 单个大 tensor 可能超过 checkpoint bucket 配置值。增大此值不会新增完整 GPU 权重缓冲。
 连续发布合并为最新待处理版本，正在安装的版本持有租约，旧版本清理完成后才启动替代分发。
 
-所有参与节点需安装提供 `mooncake.engine.TransferEngine` 的 Mooncake，并具备可用的 RDMA NIC、
+所有参与节点需安装提供上述提交和完成查询 API 的 Mooncake（按 `0.3.13.post1` 语义核查），并具备可用的 RDMA NIC、
 网络连通和足够的内存注册权限。RDMA 初始化失败直接报错，不会静默退回 TCP/Ray 跨节点传权重。
 接口依据 [Mooncake Transfer Engine Python API](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/api-reference/python/transfer-engine.md)。
 默认 `transport: ray` 不要求安装 Mooncake。发布器 `get_status()` 的 `relay` 字段提供分发版本、
@@ -308,7 +314,9 @@ VERL_RUN_RDMA_RELAY_TEST=1 RAY_ADDRESS=auto \
 ```
 
 可用 `VERL_RDMA_DEVICE_NAME` 指定 NIC，用 `VERL_RDMA_TEST_TIMEOUT_S` 调整测试等待时间。
-该 smoke 检查混合 dtype、多 bucket 的逐值一致性及注册内存回收，不代表大模型吞吐验收。
+默认 smoke 检查混合 dtype、多 bucket、连续两版本的逐值一致性、租约归还和关闭清理，
+不代表大模型吞吐验收。大 bucket、单/多 NIC 对照、KVCM wheel 和非零梯度验收见
+[TP=4 集群复测清单](../../../docs/rtp_llm_retest.md)。
 本地 CPU/Ray 测试使用测试专用的字节拷贝后端，不代表已经验证 RDMA 硬件性能。
 
 ## 使用方式

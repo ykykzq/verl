@@ -51,6 +51,7 @@ from verl.utils.device import (
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+from verl.workers.rollout.rtp_llm_rollout.build_capabilities import require_remote_cache_build
 from verl.workers.rollout.rtp_llm_rollout.ray_weight_transfer import rebuild_ipc_tensor, rebuild_shared_memory
 from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 
@@ -512,6 +513,9 @@ class RTPLLMHttpServer:
             sys.argv = saved_argv
 
     def _boot_engine_impl(self):
+        if self._remote_prefix_migration_enabled():
+            require_remote_cache_build()
+
         from rtp_llm.config.server_config_setup import (
             set_parallelism_config,
             setup_and_configure_server,
@@ -626,7 +630,7 @@ class RTPLLMHttpServer:
             if isinstance(result, BaseException):
                 raise result
             if not result:
-                raise TimeoutError(f"remote KV cache writes did not finish successfully within {timeout_s}s")
+                raise asyncio.TimeoutError(f"remote KV cache writes did not finish successfully within {timeout_s}s")
 
     async def _wait_for_generation(self):
         failure_event = getattr(self, "_tp_failure_event", None)
@@ -952,7 +956,7 @@ class RTPLLMHttpServer:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
         except asyncio.CancelledError:
             pass
-        except TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             return {"aborted": False, "request_id": request_id, "reason": "abort timed out"}
         return {"aborted": True, "request_id": request_id}
 

@@ -29,8 +29,16 @@ def expected_weights(version):
 
 @ray.remote(num_cpus=0, max_restarts=0)
 class SnapshotSource:
-    def export(self, version):
-        return export_weight_snapshot(expected_weights(version), version, bucket_size=32, is_master=True)
+    def export(self, version, bucket_bytes=32, bucket_count=0):
+        weights = (
+            (
+                (f"payload-{i}", torch.full((bucket_bytes,), (version + i) % 251, dtype=torch.uint8))
+                for i in range(bucket_count)
+            )
+            if bucket_count
+            else expected_weights(version)
+        )
+        return export_weight_snapshot(weights, version, bucket_size=bucket_bytes, is_master=True)
 
 
 @ray.remote(num_cpus=0, max_restarts=0)
@@ -41,7 +49,17 @@ class RelayConsumer:
     def get_weight_relay_node_id(self):
         return self.node_id
 
-    async def verify(self, snapshot, version):
+    async def verify(self, snapshot, version, bucket_bytes=32, bucket_count=0):
+        if bucket_count:
+            count = 0
+            async for name, tensor in iter_snapshot_weights(snapshot):
+                assert name == f"payload-{count}"
+                assert tensor.dtype == torch.uint8 and tensor.shape == (bucket_bytes,)
+                for part in tensor.split(1 << 20):
+                    assert torch.all(part == (version + count) % 251).item()
+                count += 1
+            assert count == bucket_count and snapshot.version == version
+            return {"node_id": self.node_id, "version": version, "tensor_count": count}
         expected = dict(expected_weights(version))
         actual = {name: tensor async for name, tensor in iter_snapshot_weights(snapshot)}
         assert snapshot.version == version
@@ -55,11 +73,11 @@ class RelayConsumer:
         return {"node_id": self.node_id, "version": version, "tensor_count": len(actual)}
 
 
-async def assert_no_registered_storage(relays, timeout=30):
+async def assert_no_active_leases(relays, timeout=30):
     async def check():
         while True:
             statuses = await asyncio.gather(*(relay.get_status.remote() for relay in relays))
-            if all(status["registered_bytes"] == status["registered_buckets"] == 0 for status in statuses):
+            if all(status["active_bytes"] == status["registered_buckets"] == 0 for status in statuses):
                 return statuses
             await asyncio.sleep(0.05)
 
@@ -93,33 +111,50 @@ async def test_real_rdma_relay_multinode_round_trip_and_registered_memory_cleanu
             consumers.append(consumer)
             actors.append(consumer)
         replicas = [SimpleNamespace(replica_rank=rank, workers=[worker]) for rank, worker in enumerate(consumers)]
+        bucket_bytes = int(os.environ.get("VERL_RDMA_TEST_BUCKET_BYTES", "32"))
+        bucket_count = int(os.environ.get("VERL_RDMA_TEST_BUCKET_COUNT", "0"))
+        versions = int(os.environ.get("VERL_RDMA_TEST_VERSIONS", "2"))
+        assert bucket_bytes > 0 and bucket_count >= 0 and versions > 0
         distribution = RelayDistribution(
             replicas,
             nodes[0],
             {
                 "device_name": os.environ.get("VERL_RDMA_DEVICE_NAME", ""),
-                "max_staging_bytes": 1 << 20,
+                "max_staging_bytes": int(os.environ.get("VERL_RDMA_TEST_STAGING_BYTES", str(1 << 20))),
                 "pipeline_depth": 2,
             },
         )
-        snapshot = await source.export.remote(7)
-        assert len(snapshot.buckets) > 1
-        distribution.pin(snapshot)
         timeout = float(os.environ.get("VERL_RDMA_TEST_TIMEOUT_S", "180"))
-        for rank, (node, worker) in enumerate(zip(nodes, consumers, strict=True)):
-            manifests = await asyncio.wait_for(distribution.snapshots_for(rank, 7), timeout)
-            assert set(manifests) == {node}
-            result = await worker.verify.remote(manifests[node], 7)
-            assert result == {"node_id": node, "version": 7, "tensor_count": 6}
-        relays = list(distribution.relays.values())
-        statuses = await assert_no_registered_storage(relays, timeout)
-        assert {status["node_id"] for status in statuses} == set(nodes)
-        assert not distribution.get_status()["node_errors"]
-        assert distribution.get_status()["fatal_error"] is None
-        distribution.unpin(snapshot)
+        for version in range(7, 7 + versions):
+            snapshot = await source.export.remote(version, bucket_bytes, bucket_count)
+            assert len(snapshot.buckets) > 1
+            distribution.pin(snapshot)
+            for rank, (node, worker) in enumerate(zip(nodes, consumers, strict=True)):
+                manifests = await asyncio.wait_for(distribution.snapshots_for(rank, version), timeout)
+                assert set(manifests) == {node}
+                result = await worker.verify.remote(manifests[node], version, bucket_bytes, bucket_count)
+                assert result == {"node_id": node, "version": version, "tensor_count": bucket_count or 6}
+            relays = list(distribution.relays.values())
+            statuses = await assert_no_active_leases(relays, timeout)
+            assert {status["node_id"] for status in statuses} == set(nodes)
+            assert all(status["registered_bytes"] == status["max_staging_bytes"] for status in statuses)
+            assert not distribution.get_status()["node_errors"]
+            assert distribution.get_status()["fatal_error"] is None
+            distribution.unpin(snapshot)
         await distribution.close()
         assert distribution.closed and not distribution.relays
         distribution = None
+    except BaseException:
+        if distribution is not None:
+            # An uncertain native completion intentionally holds its RPC open.
+            # Stop this test's receiving NIC owners before releasing sources.
+            for node, relay in distribution.relays.items():
+                if node != distribution.source:
+                    ray.kill(relay, no_restart=True)
+            source_relay = distribution.relays.get(distribution.source)
+            if source_relay is not None:
+                ray.kill(source_relay, no_restart=True)
+        raise
     finally:
         if distribution is not None:
             relays = list(distribution.relays.values())

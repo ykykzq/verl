@@ -18,7 +18,7 @@ import ray
 from tests.checkpoint_engine.test_rdma_relay_cluster import (
     RelayConsumer,
     SnapshotSource,
-    assert_no_registered_storage,
+    assert_no_active_leases,
 )
 from verl.checkpoint_engine import relay_distribution
 from verl.checkpoint_engine.rdma_relay import RdmaWeightRelay
@@ -49,7 +49,9 @@ class SocketTransferEngine:
         class Handler(socketserver.BaseRequestHandler):
             def handle(self):
                 pointer, size = struct.unpack("!QQ", receive_exact(self.request, 16))
-                assert engine.regions.get(pointer, 0) >= size
+                assert any(
+                    base <= pointer and pointer + size <= base + length for base, length in engine.regions.items()
+                )
                 self.request.sendall(ctypes.string_at(pointer, size))
 
         self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
@@ -71,12 +73,20 @@ class SocketTransferEngine:
     def transfer_sync_read(self, session, pointer, source, size):
         if self.fail_reads:
             return -7
-        assert self.regions[pointer] >= size
+        assert any(base <= pointer and pointer + size <= base + length for base, length in self.regions.items())
         with socket.create_connection(("127.0.0.1", int(session.rsplit(":", 1)[1])), timeout=10) as connection:
             connection.sendall(struct.pack("!QQ", source, size))
             payload = receive_exact(connection, size)
         ctypes.memmove(pointer, payload, size)
         return 0
+
+    def batch_transfer_async_read(self, session, pointers, sources, sizes):
+        self.pending_read = (session, pointers[0], sources[0], sizes[0])
+        return 1
+
+    def transfer_check_status(self, handle):
+        assert handle == 1
+        return 1 if self.transfer_sync_read(*self.pending_read) == 0 else -1
 
     def close(self):
         self.server.shutdown()
@@ -146,7 +156,7 @@ def test_relay_chain_preserves_local_snapshot_refs_and_survives_a_failed_middle_
                 manifests = await asyncio.wait_for(distribution.snapshots_for(rank, 1), 30)
                 result = await worker.verify.remote(manifests[node], 1)
                 assert result["tensor_count"] == 6
-            await assert_no_registered_storage(list(distribution.relays.values()))
+            await assert_no_active_leases(list(distribution.relays.values()))
             assert set(distribution.get_status()["node_errors"]) == ({failed_node} if failed_node else set())
             if failed_node:
                 failed_nodes.clear()
@@ -160,7 +170,7 @@ def test_relay_chain_preserves_local_snapshot_refs_and_survives_a_failed_middle_
             assert (await consumers[1].verify.remote(newest["tail"], 2))["version"] == 2
             distribution.unpin(second)
             current_relays = list(distribution.relays.values())
-            await assert_no_registered_storage(current_relays)
+            await assert_no_active_leases(current_relays)
             retired_relays = [relay for relay in relays if all(relay is not current for current in current_relays)]
             for relay in retired_relays:
                 with pytest.raises(ray.exceptions.ActorDiedError):

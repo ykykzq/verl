@@ -4,6 +4,7 @@
 import asyncio
 import copy
 import ctypes
+import multiprocessing
 import sys
 import threading
 from types import SimpleNamespace
@@ -23,6 +24,11 @@ class FakeTransferEngine:
         self.unregister_error = 0
         self.read_started = threading.Event()
         self.read_continue = None
+        self.registrations = 0
+        self.unregistrations = 0
+        self.pending_status = 1
+        self.check_started = threading.Event()
+        self.submitted = None
         self.instances.append(self)
 
     def initialize(self, hostname, metadata, protocol, device_name):
@@ -35,11 +41,13 @@ class FakeTransferEngine:
     def register_memory(self, pointer, size):
         if not self.register_error:
             self.regions[pointer] = size
+            self.registrations += 1
         return self.register_error
 
     def unregister_memory(self, pointer):
         if not self.unregister_error:
             self.regions.pop(pointer)
+            self.unregistrations += 1
         return self.unregister_error
 
     def transfer_sync_read(self, session, pointer, source, size):
@@ -48,10 +56,27 @@ class FakeTransferEngine:
             assert self.read_continue.wait(5)
         if self.read_error:
             return self.read_error
-        assert self.regions[pointer] >= size
-        assert any(engine.regions.get(source, 0) >= size for engine in self.instances)
+        assert any(base <= pointer and pointer + size <= base + length for base, length in self.regions.items())
+        assert any(
+            base <= source and source + size <= base + length
+            for engine in self.instances
+            for base, length in engine.regions.items()
+        )
         ctypes.memmove(pointer, source, size)
         return 0
+
+    def batch_transfer_async_read(self, session, pointers, sources, sizes):
+        assert len(pointers) == len(sources) == len(sizes) == 1
+        self.submitted = (session, pointers[0], sources[0], sizes[0])
+        return 123
+
+    def transfer_check_status(self, handle):
+        assert handle == 123
+        self.check_started.set()
+        if self.pending_status != 1:
+            return self.pending_status
+        result = self.transfer_sync_read(*self.submitted)
+        return 1 if result == 0 else -1
 
 
 @pytest.fixture
@@ -78,6 +103,138 @@ def relay(budget=4096):
 
 
 @pytest.mark.asyncio
+async def test_repeated_buckets_reuse_one_registration_without_changing_remote_keys(runtime):
+    source, target = relay(128), relay(128)
+    pointers = []
+    for version in range(6):
+        descriptors = [await source.load_bucket(((f"weight-{i}", torch.full((8,), version + i)),)) for i in range(2)]
+        pointers.append([item["pointer"] for item in descriptors])
+        for descriptor in descriptors:
+            result = await target.pull_bucket(descriptor)
+            await target.release_bucket(result["descriptor"]["bucket_id"])
+            await source.release_bucket(descriptor["bucket_id"])
+    assert all(pair == pointers[0] for pair in pointers)
+    for engine in FakeTransferEngine.instances:
+        assert engine.registrations == 1
+        assert engine.unregistrations == 0
+    assert (await source.get_status())["active_bytes"] == 0
+    await source.close()
+    await target.close()
+    assert all(engine.unregistrations == 1 for engine in FakeTransferEngine.instances)
+
+
+@pytest.mark.asyncio
+async def test_published_tensors_own_only_their_payload_storage(runtime, monkeypatch):
+    source, target = relay(1 << 20), relay(1 << 20)
+    put = ray.put
+
+    def bounded_put(weights):
+        from ray._private.serialization import SerializationContext
+
+        for _, tensor in weights:
+            assert tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+        assert SerializationContext(ray._private.worker.global_worker).serialize(weights).total_bytes < 4096
+        return put(weights)
+
+    monkeypatch.setattr(ray, "put", bounded_put)
+    descriptor = await source.load_bucket((("a", torch.ones(4)), ("b", torch.ones(2, dtype=torch.int64))))
+    try:
+        result = await target.pull_bucket(descriptor)
+        await target.release_bucket(result["descriptor"]["bucket_id"])
+        replacement = await target.load_bucket((("c", torch.zeros(8)),))
+        assert torch.equal(runtime[result["ref"]][0][1], torch.ones(4))
+        await target.release_bucket(replacement["bucket_id"])
+    finally:
+        await source.close()
+        await target.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_status", [0, -2])
+async def test_native_pending_or_timeout_never_releases_or_reuses_buffer(runtime, pending_status):
+    source, target = relay(16), relay(16)
+    descriptor = await source.load_bucket((("a", torch.ones(4)),))
+    engine = FakeTransferEngine.instances[1]
+    engine.pending_status = pending_status
+    task = asyncio.create_task(target.pull_bucket(descriptor))
+    try:
+        assert await asyncio.to_thread(engine.check_started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        status = await asyncio.wait_for(target.get_status(), 1)
+        assert status["active_bytes"] == 16
+        assert status["pending_read"]["source_bucket_id"] == descriptor["bucket_id"]
+        assert engine.unregistrations == 0
+    finally:
+        engine.pending_status = 1
+        await asyncio.gather(task, return_exceptions=True)
+        await source.close()
+        await target.close()
+
+
+def _quarantined_read_process(connection, failure):
+    # An uncertain native transfer deliberately cannot be unwound in-process.
+    # Run this regression in an owned child so teardown can stop its NIC owner.
+    FakeTransferEngine.instances = []
+    sys.modules["mooncake.engine"] = SimpleNamespace(TransferEngine=FakeTransferEngine)
+    ray.get_runtime_context = lambda: SimpleNamespace(get_node_id=lambda: "node")
+    ray.util.get_node_ip_address = lambda: "127.0.0.1"
+
+    async def run():
+        source, target = relay(16), relay(16)
+        descriptor = await source.load_bucket((("a", torch.ones(4)),))
+        engine = target.engine
+        if failure == "submission":
+            engine.batch_transfer_async_read = lambda *args: 0
+        elif failure == "unknown_status":
+            engine.transfer_check_status = lambda handle: -99
+        else:
+
+            def failed_query(handle):
+                raise RuntimeError("completion ownership unknown")
+
+            if failure == "submission_exception":
+                engine.batch_transfer_async_read = lambda *args: failed_query(None)
+            else:
+                engine.transfer_check_status = failed_query
+        task = asyncio.create_task(target.pull_bucket(descriptor))
+        while True:
+            status = await target.get_status()
+            if status["pending_read"] and status["pending_read"].get("requires_process_restart"):
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0)
+        connection.send((status, task.done(), engine.unregistrations))
+        await task
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["submission", "completion_query", "submission_exception", "unknown_status"])
+def test_unknown_native_completion_quarantines_rpc_and_memory(failure):
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_quarantined_read_process, args=(sender, failure), daemon=True)
+    process.start()
+    sender.close()
+    try:
+        assert receiver.poll(20), "child failed to report quarantine status"
+        status, done, unregistrations = receiver.recv()
+        assert status["active_bytes"] == status["registered_bytes"] == 16
+        assert status["pending_read"]["requires_process_restart"]
+        assert not done and unregistrations == 0
+    finally:
+        receiver.close()
+        process.terminate()
+        process.join(5)
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+
+
+@pytest.mark.asyncio
 async def test_relay_round_trip_mixed_dtypes_shapes_and_source_immutability(runtime):
     source, target = relay(), relay()
     weights = (
@@ -99,6 +256,10 @@ async def test_relay_round_trip_mixed_dtypes_shapes_and_source_immutability(runt
     assert result["descriptor"]["checksum"] == descriptor["checksum"]
     await source.release_bucket(descriptor["bucket_id"])
     await target.release_bucket(result["descriptor"]["bucket_id"])
+    assert (await source.get_status())["active_bytes"] == 0
+    assert (await target.get_status())["active_bytes"] == 0
+    await source.close()
+    await target.close()
     assert (await source.get_status())["registered_bytes"] == 0
     assert (await target.get_status())["registered_bytes"] == 0
 
@@ -115,18 +276,18 @@ async def test_all_empty_tensors_still_have_valid_registered_storage(runtime):
 
 
 @pytest.mark.asyncio
-async def test_capacity_is_bounded_and_released_only_after_deregistration(runtime):
+async def test_capacity_is_bounded_and_arena_retained_after_failed_deregistration(runtime):
     source = relay(16)
-    descriptor = await source.load_bucket((("a", torch.ones(4)),))
+    await source.load_bucket((("a", torch.ones(4)),))
     with pytest.raises(RuntimeError, match="capacity|budget"):
         await source.load_bucket((("b", torch.ones(1)),))
     engine = FakeTransferEngine.instances[0]
     engine.unregister_error = -1
     with pytest.raises(RuntimeError, match="unregister"):
-        await source.release_bucket(descriptor["bucket_id"])
+        await source.close()
     assert (await source.get_status())["registered_bytes"] == 16
     engine.unregister_error = 0
-    await source.release_bucket(descriptor["bucket_id"])
+    await source.close()
     assert (await source.get_status())["registered_bytes"] == 0
 
 
@@ -138,11 +299,12 @@ async def test_failed_reads_and_checksum_mismatch_do_not_publish_or_leak(runtime
     engine.read_error = -9
     with pytest.raises(RuntimeError, match="read"):
         await target.pull_bucket(descriptor)
-    assert not engine.regions and not runtime
+    assert (await target.get_status())["active_bytes"] == 0 and not runtime
     engine.read_error = 0
     with pytest.raises(ValueError, match="checksum"):
         await target.pull_bucket({**descriptor, "checksum": "0" * 64})
-    assert not engine.regions and not runtime
+    assert (await target.get_status())["active_bytes"] == 0 and not runtime
+    await target.close()
     await source.close()
 
 
@@ -174,6 +336,8 @@ async def test_cancelled_read_keeps_buffer_registered_until_real_transfer_finish
     engine.read_continue.set()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert (await target.get_status())["active_bytes"] == 0
+    await target.close()
     assert not engine.regions
     await source.close()
 
@@ -215,6 +379,7 @@ async def test_source_descriptor_is_not_an_alias_of_registered_metadata(runtime)
     descriptor["pointer"] = 1
     descriptor["tensors"][0]["name"] = "mutated"
     await source.release_bucket(bucket_id)
+    await source.close()
     assert not FakeTransferEngine.instances[0].regions
 
 
@@ -229,6 +394,8 @@ async def test_put_failure_cleans_registered_receive_memory(runtime, monkeypatch
     monkeypatch.setattr(ray, "put", failed_put)
     with pytest.raises(RuntimeError, match="object store unavailable"):
         await target.pull_bucket(descriptor)
+    assert (await target.get_status())["active_bytes"] == 0
+    await target.close()
     assert not FakeTransferEngine.instances[1].regions
     await source.close()
 

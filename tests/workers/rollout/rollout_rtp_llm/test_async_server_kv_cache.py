@@ -172,6 +172,46 @@ class TestRTPLLMKVCacheTransition(unittest.IsolatedAsyncioTestCase):
         with suppress(asyncio.CancelledError):
             await other
 
+    async def test_abort_request_timeout_returns_failure_while_cleanup_is_pending(self):
+        class LegacyAsyncioTimeoutError(Exception):
+            pass
+
+        for timeout_error in (asyncio.TimeoutError, LegacyAsyncioTimeoutError):
+            with self.subTest(timeout_error=timeout_error):
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def request(entered=entered, release=release):
+                    entered.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        await release.wait()
+
+                async def wait_for(awaitable, timeout, timeout_error=timeout_error):
+                    try:
+                        return await asyncio.wait_for(awaitable, timeout)
+                    except asyncio.TimeoutError as error:
+                        raise timeout_error() from error
+
+                # Python 3.10 has an asyncio timeout distinct from the built-in.
+                asyncio_compat = SimpleNamespace(
+                    TimeoutError=timeout_error,
+                    CancelledError=asyncio.CancelledError,
+                    shield=asyncio.shield,
+                    wait_for=wait_for,
+                )
+                task = asyncio.create_task(request())
+                await entered.wait()
+                server, _ = self._server(generation_allowed=True, abort_requested=False, inflight={"request-1": task})
+                try:
+                    with patch("verl.workers.rollout.rtp_llm_rollout.rtp_llm_async_server.asyncio", asyncio_compat):
+                        result = await server.abort_request("request-1", timeout_s=0.01)
+                    self.assertEqual(result, {"aborted": False, "request_id": "request-1", "reason": "abort timed out"})
+                    self.assertFalse(task.done())
+                finally:
+                    release.set()
+                    await task
+
     async def test_transfer_ticket_waits_for_remote_cache_and_covers_prefix(self):
         server, _ = self._server(generation_allowed=True, abort_requested=False)
         server.replica_rank = 0

@@ -4,11 +4,16 @@
 """Bounded CPU relay chains with independent node readiness and version leases."""
 
 import asyncio
+import logging
+import os
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from verl.checkpoint_engine.weight_snapshot import WeightSnapshot
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 def create_relay(node_id, config):
@@ -71,6 +76,13 @@ class _Distribution:
         try:
             descriptor = await self.relays[self.source].load_bucket.remote(self.snapshot.buckets[index])
             registered.append((self.source, descriptor["bucket_id"]))
+            logger.info(
+                "RDMA distribution version=%s index=%s source_node=%s source_bucket=%s",
+                self.snapshot.version,
+                index,
+                self.source,
+                descriptor["bucket_id"],
+            )
             if descriptor["node_id"] != self.source:
                 raise RuntimeError("master relay was placed on the wrong node")
             predecessors = [descriptor]

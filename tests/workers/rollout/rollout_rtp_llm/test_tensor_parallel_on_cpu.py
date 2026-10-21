@@ -165,7 +165,7 @@ class TestTPControl(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             self.fail("migration ignored timeout_s while waiting for a peer")
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(asyncio.TimeoutError):
             await task
 
     async def test_dead_rank_closes_replica_and_rejects_new_generation(self):
@@ -252,7 +252,7 @@ class TestTPControl(unittest.IsolatedAsyncioTestCase):
         server = make_server()
         server.engine = SimpleNamespace(wait_remote_cache_idle=Mock(return_value=True))
         server.configure_tp_peers([SimpleNamespace(wait_local_remote_cache_idle=remote(AsyncMock(return_value=False)))])
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(asyncio.TimeoutError):
             await server.wait_remote_cache_idle(1)
 
     async def test_nonzero_rank_cannot_serve_generation(self):
@@ -289,9 +289,14 @@ class TestTPLaunch(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 self.fail("startup timeout did not cover actor initialization")
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(asyncio.TimeoutError):
                 await task
         self.assertEqual(kill.call_count, len(handles))
+        for handle in handles:
+            kill.assert_any_call(handle, no_restart=True)
+        self.assertEqual(replica.servers, [])
+        self.assertIsNone(replica.server_handle)
+        self.assertIsNone(replica._server_address)
 
     def make_replica(self, *, failure=False, node_ids=None, devices=None):
         config = RolloutConfig(name="rtp_llm", tensor_model_parallel_size=4)
