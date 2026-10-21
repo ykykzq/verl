@@ -62,6 +62,47 @@ https://github.com/ArronHZG/verl-community/blob/main/docs/fully_async_policy_str
 ![fully_async_policy_revenue](
 https://github.com/ArronHZG/verl-community/blob/main/docs/fully_async_policy_revenue.svg?raw=true)
 
+## RTP-LLM TP replica
+
+支持单节点内的 TP=4 replica，每张卡运行一个 RTP engine rank，只有 rank 0 接收生成和
+tail scoring 请求。对 router、权重发布器和 trajectory 调度器而言，四张卡仍是一个 replica。
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    name: rtp_llm
+    tensor_model_parallel_size: 4
+    data_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_parallel_size: 1
+```
+
+每个 replica 必须分配在同一节点的四张不同 GPU 上；例如 8 张 rollout GPU 可以组成两个
+TP=4 replica。模型自身也需要支持该 TP 大小。当前不支持跨节点 TP 或 replica 内 DP/PP/EP。
+`VERL_RTP_LLM_STARTUP_TIMEOUT_S` 控制整组引擎启动超时，默认 600 秒。
+
+权重安装时关闭整个 replica 的准入，清理全部 rank 的 KV cache，每个 checkpoint worker 将
+完整 named tensor bucket 交给同卡 engine，由 RTP loader 按该 rank 的 TP 配置切分。
+全部 rank 成功安装同一版本后才恢复生成；一个 rank 失败会阻止整个 replica 恢复。
+安装期间有各卡的 bucket 和融合临时张量，不额外常驻一份完整 GPU 权重快照。
+rank 0 每 5 秒检查其他 rank，单次 RPC 超时 30 秒；发现 rank 失联后关闭准入并取消请求，
+包括正在等待切版结束的请求。故障 replica 需重建引擎，不能仅靠重发权重恢复已死亡的 rank。
+
+同版本迁移继续使用 KVCM 的多 rank KV 传输，迁移前等待所有 rank 的远端写入完成。
+源、目标必须具有相同 TP 和兼容布局；cache namespace 包含布局标识。跨版本续跑仍按 token ids
+执行 re-prefill，不复用旧版本 KV。部署新代码后应一起重启参与迁移的 replica，避免混用旧 namespace。
+
+四卡实机验收使用一个本地、小型、非量化的 dense Qwen checkpoint：
+
+```bash
+VERL_RUN_RTP_TP_TEST=1 VERL_RTP_TP_TEST_MODEL=/models/Qwen3-0.6B RAY_ADDRESS=auto \
+  python -m pytest tests/workers/rollout/rollout_rtp_llm/test_tensor_parallel_gpu.py -q
+```
+
+该测试启动真实 TP=4 引擎，检查四个 rank 的实际设备，生成 token/logprobs，安装修改后的 CPU
+快照并检查每个 rank 的权重字节发生变化，然后验证续跑和 rank 退出后的失败处理。
+默认 CPU 测试会跳过它；CPU 回归通过不代表已经完成 CUDA/NCCL 或 KVCM 实机验收。
+
 ## RTP-LLM 独立权重发布
 
 通过以下参数启用独立发布器。未开启时继续使用原有权重同步路径。
@@ -73,6 +114,7 @@ actor_rollout_ref:
     strategy: fsdp2
   rollout:
     name: rtp_llm
+    tensor_model_parallel_size: 1
     checkpoint_engine:
       backend: nccl
       update_weights_bucket_megabytes: 512

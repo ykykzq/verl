@@ -53,9 +53,8 @@ _TORCH_DTYPES = {
 class ServerAdapter(BaseRollout):
     """Weight-sync client for the rtp-llm rollout server.
 
-    rtp-llm re-shards every incoming tensor internally, so only one rank per replica
-    transmits. Every rank must still drain ``weights`` because the checkpoint engine
-    backs it with collectives.
+    Every rank sends to its co-located engine. RTP's receptor loader shards the
+    incoming full named tensors using that engine's TP rank.
     """
 
     def __init__(
@@ -78,8 +77,8 @@ class ServerAdapter(BaseRollout):
         self.replica_rank = rank // rollout_world_size if replica_rank == -1 else replica_rank
         self.rollout_rank = rank % rollout_world_size
         self.node_rank = self.rollout_rank // local_world_size
-        self._has_server = self.rollout_rank == 0
-        self.is_leader_rank = self._has_server
+        self._has_server = True
+        self.is_leader_rank = self.rollout_rank == 0
         # rtp-llm keeps weights resident; only the kv cache is reclaimable.
         self.sleep_level = 1
         # The engine's weights live at its activation dtype and are updated by in-place
@@ -106,7 +105,7 @@ class ServerAdapter(BaseRollout):
             return False
         if self.server_handle is None:
             prefix = self.config.get("name", "rtp_llm")
-            self.server_handle = ray.get_actor(f"{prefix}_server_{self.replica_rank}_{self.node_rank}")
+            self.server_handle = ray.get_actor(f"{prefix}_server_{self.replica_rank}_{self.rollout_rank}")
         return True
 
     async def resume(self, tags: list[str]):

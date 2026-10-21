@@ -61,6 +61,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 # and consumes 9 of them; give each replica a padded block so replicas never overlap.
 _PORTS_PER_WORKER = 9
 _PORT_STRIDE = 16
+_TP_HEALTH_TIMEOUT_S = 30
+_TP_HEALTH_INTERVAL_S = 5
 
 # Architectures that rtp-llm registers under a name that differs from the HF string.
 _ARCH_TO_MODEL_TYPE = {
@@ -106,7 +108,7 @@ def _checkpoint_size_mib(local_path: str) -> int:
 
 
 class RTPLLMHttpServer:
-    """Owns a single-GPU rtp-llm engine and serves verl's token-in/token-out contract."""
+    """Owns one engine rank; rank zero serves the replica's generation contract."""
 
     def __init__(
         self,
@@ -119,6 +121,7 @@ class RTPLLMHttpServer:
         gpus_per_node: int,
         nnodes: int,
         cuda_visible_devices: str,
+        tp_rank: int = 0,
     ):
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
@@ -135,11 +138,17 @@ class RTPLLMHttpServer:
                 f"({max_position_embeddings})"
             )
 
-        if self.config.tensor_model_parallel_size != 1:
-            raise NotImplementedError(
-                "rtp-llm rollout currently runs one engine per GPU; set "
-                "actor_rollout_ref.rollout.tensor_model_parallel_size=1."
-            )
+        tp_size = self.config.tensor_model_parallel_size
+        if nnodes != 1 or gpus_per_node != tp_size:
+            raise ValueError("rtp-llm TP replicas must fit on a single node")
+        devices = cuda_visible_devices.split(",")
+        if len(devices) != tp_size or len(set(devices)) != tp_size or not 0 <= tp_rank < tp_size:
+            raise ValueError("rtp-llm requires one distinct GPU per TP rank")
+        self.tp_rank = tp_rank
+        self._tp_peers: list[ActorHandle] = []
+        self._tp_failure: Optional[str] = None
+        self._tp_failure_event = asyncio.Event()
+        self._tp_health_task: Optional[asyncio.Task] = None
 
         self.rollout_mode = rollout_mode
         self.workers = workers
@@ -247,7 +256,7 @@ class RTPLLMHttpServer:
 
     def _cache_key_salt(self, weight_version: int | str | None = None) -> int:
         version = "initial" if weight_version is None else str(weight_version)
-        payload = f"{self._kv_transfer_domain()}\0{self._model_id()}\0{version}".encode()
+        payload = f"{self._kv_transfer_domain()}\0{self._rollout_config_fingerprint()}\0{version}".encode()
         return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
 
     def _set_cache_key_salt(self, weight_version: int | str | None = None) -> None:
@@ -299,8 +308,12 @@ class RTPLLMHttpServer:
 
     def _start_port(self) -> int:
         base = int(os.environ.get("VERL_RTP_LLM_START_PORT", "31000"))
-        index = self.replica_rank * self.nnodes + self.node_rank
-        return base + index * _PORT_STRIDE
+        tp_size = getattr(self.config, "tensor_model_parallel_size", 1)
+        stride = _PORT_STRIDE if tp_size == 1 else tp_size * _PORTS_PER_WORKER + _PORT_STRIDE
+        port = base + self.replica_rank * stride
+        if port < 12 or port + tp_size * _PORTS_PER_WORKER > 65535:
+            raise ValueError("rtp-llm replica port range is outside 12..65535")
+        return port
 
     def _kv_cache_mem_mib(self) -> int:
         """Translate verl's gpu_memory_utilization fraction into rtp-llm's absolute cap.
@@ -308,8 +321,9 @@ class RTPLLMHttpServer:
         rtp-llm has no utilization fraction: in auto mode it claims *all* free HBM
         minus a runtime reserve, which would collide with the trainer sharing the box.
         """
-        total_mib = get_torch_device().get_device_properties(0).total_memory // (1024 * 1024)
-        weights_mib = _checkpoint_size_mib(self.model_config.local_path)
+        total_mib = get_torch_device().get_device_properties(getattr(self, "tp_rank", 0)).total_memory // (1024 * 1024)
+        tp_size = getattr(self.config, "tensor_model_parallel_size", 1)
+        weights_mib = math.ceil(_checkpoint_size_mib(self.model_config.local_path) / tp_size)
         reserve_mib = max(2048, int(0.05 * total_mib))
         budget_mib = int(self.config.gpu_memory_utilization * total_mib)
         kv_mib = budget_mib - weights_mib - reserve_mib
@@ -361,6 +375,7 @@ class RTPLLMHttpServer:
         text_config = getattr(hf_config, "text_config", hf_config)
         try:
             kv_heads = int(text_config.num_key_value_heads)
+            kv_heads = max(1, math.ceil(kv_heads / getattr(self.config, "tensor_model_parallel_size", 1)))
             head_dim = int(text_config.head_dim)
             layer_types = list(getattr(text_config, "layer_types", None) or [])
             full_layers = sum(1 for t in layer_types if "full" in str(t)) or int(text_config.num_hidden_layers)
@@ -408,15 +423,17 @@ class RTPLLMHttpServer:
             "--max_seq_len",
             str(self._engine_max_seq_len()),
             "--tp_size",
+            str(self.config.tensor_model_parallel_size),
+            "--ep_size",
             "1",
             "--dp_size",
             "1",
             "--world_size",
-            "1",
+            str(self.config.tensor_model_parallel_size),
             "--world_rank",
-            "0",
+            str(getattr(self, "tp_rank", 0)),
             "--local_world_size",
-            "1",
+            str(self.config.tensor_model_parallel_size),
             "--start_port",
             str(start_port),
             "--worker_info_port_num",
@@ -453,7 +470,7 @@ class RTPLLMHttpServer:
             argv += ["--act_type", "fp16"]
 
         cfg = setup_args(argv)
-        cfg.server_config.ip = "127.0.0.1"
+        cfg.server_config.ip = self._server_address
         # Qwen3.5 shares its config with the VL variant, so rtp-llm flags it multimodal and
         # would spin up a local ViT process on the rollout GPU. Keep the ViT remote (i.e. absent)
         # for text-only RL rollout.
@@ -463,14 +480,17 @@ class RTPLLMHttpServer:
         return cfg
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+        # CUDA device selection is thread-local: set it on the RPC event loop as
+        # well as inside the engine boot and weight-install threads.
+        get_torch_device().set_device(self.tp_rank)
         os.environ.setdefault(
             "LOG_PATH",
-            os.path.join(tempfile.gettempdir(), "rtp_llm_logs", f"replica_{self.replica_rank}_{self.node_rank}"),
+            os.path.join(tempfile.gettempdir(), "rtp_llm_logs", f"replica_{self.replica_rank}_tp_{self.tp_rank}"),
         )
         os.makedirs(os.environ["LOG_PATH"], exist_ok=True)
 
         # Booting loads the checkpoint and warms up kernels; keep the actor's event loop free.
-        await asyncio.to_thread(self._boot_engine)
+        await asyncio.to_thread(self._run_on_device, self._boot_engine)
 
         app = FastAPI()
 
@@ -504,7 +524,7 @@ class RTPLLMHttpServer:
 
         cfg = self._build_config()
         setup_and_configure_server(cfg)
-        set_parallelism_config(cfg.parallelism_config, 0, cfg.ffn_disaggregate_config, cfg.prefill_cp_config)
+        set_parallelism_config(cfg.parallelism_config, self.tp_rank, cfg.ffn_disaggregate_config, cfg.prefill_cp_config)
         local_rank = cfg.parallelism_config.local_rank
         cfg.server_config.set_local_rank(local_rank)
         cfg.distribute_config.set_local_rank(local_rank)
@@ -514,8 +534,13 @@ class RTPLLMHttpServer:
         self.backend_manager = BackendManager(cfg)
         self.backend_manager.start()
         self.engine = self.backend_manager.engine
+        self._cfg = cfg
         self._set_cache_key_salt(self.global_steps)
         self.weight_manager = self.engine.model.weight_manager
+
+        self.eos_token_id = self.engine.model.model_config.special_tokens.eos_token_id
+        if self.tp_rank != 0:
+            return
 
         rtp_model_config = ModelFactory.create_model_config(
             model_args=cfg.model_args,
@@ -530,8 +555,93 @@ class RTPLLMHttpServer:
             vit_config=cfg.vit_config,
         )
         self.visitor = create_backend_rpc_server_visitor(cfg, rtp_model_config, source_role="frontend")
-        self.eos_token_id = self.engine.model.model_config.special_tokens.eos_token_id
-        self._cfg = cfg
+
+    def _run_on_device(self, fn, *args, **kwargs):
+        if getattr(getattr(self, "config", None), "tensor_model_parallel_size", 1) > 1:
+            with get_torch_device().device(self.tp_rank):
+                return fn(*args, **kwargs)
+        return fn(*args, **kwargs)
+
+    def configure_tp_peers(self, peers: list[ActorHandle]):
+        self._tp_peers = peers
+
+    def get_tp_health(self):
+        # Do not take the weight lock: a long installation is not a dead rank.
+        if self.engine is None or self._tp_failure is not None:
+            raise RuntimeError(self._tp_failure or "TP engine is not initialized")
+        return True
+
+    async def _check_tp_health(self):
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*[peer.get_tp_health.remote() for peer in self._tp_peers]),
+                timeout=_TP_HEALTH_TIMEOUT_S,
+            )
+        except Exception as error:
+            self._tp_failure = f"TP replica {self.replica_rank} lost a rank: {type(error).__name__}: {error}"
+            self._tp_failure_event.set()
+            await self.abort_all_requests(reject_request=True)
+            raise RuntimeError(self._tp_failure) from error
+
+    async def start_tp_health_monitor(self):
+        if self.tp_rank != 0 or not self._tp_peers or self._tp_health_task is not None:
+            return
+        await self._check_tp_health()
+
+        async def monitor():
+            while True:
+                await asyncio.sleep(_TP_HEALTH_INTERVAL_S)
+                try:
+                    await self._check_tp_health()
+                except Exception:
+                    logger.exception("RTP TP replica failed its rank health check")
+                    return
+
+        self._tp_health_task = asyncio.create_task(monitor())
+
+    async def get_tp_weight_status(self):
+        async with self._weight_update_lock:
+            return {
+                "weight_version": self.global_steps,
+                "updating": self._weight_update is not None,
+                "error": self._tp_failure or self._weight_sync_error,
+            }
+
+    async def wait_local_remote_cache_idle(self, timeout_s: float) -> bool:
+        wait_fn = getattr(self.engine, "wait_remote_cache_idle", None)
+        if wait_fn is None:
+            raise RuntimeError("the rtp-llm engine binding does not expose wait_remote_cache_idle")
+        return await asyncio.to_thread(wait_fn, int(timeout_s * 1000))
+
+    async def wait_remote_cache_idle(self, timeout_s: float):
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                self.wait_local_remote_cache_idle(timeout_s),
+                *[peer.wait_local_remote_cache_idle.remote(timeout_s) for peer in getattr(self, "_tp_peers", [])],
+                return_exceptions=True,
+            ),
+            timeout=timeout_s,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            if not result:
+                raise TimeoutError(f"remote KV cache writes did not finish successfully within {timeout_s}s")
+
+    async def _wait_for_generation(self):
+        failure_event = getattr(self, "_tp_failure_event", None)
+        if failure_event is None:
+            await self._generation_allowed.wait()
+            return
+        waiters = [asyncio.create_task(event.wait()) for event in (self._generation_allowed, failure_event)]
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            if self._tp_failure:
+                raise RuntimeError(self._tp_failure)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
 
     # -------------------------------------------------------------- generation
 
@@ -547,6 +657,10 @@ class RTPLLMHttpServer:
         prefill even though only the tail scores are returned. Sampling warpers
         are deliberately absent: these scores describe the raw model policy.
         """
+        if getattr(self, "tp_rank", 0) != 0:
+            raise RuntimeError("only TP rank 0 accepts scoring requests")
+        if getattr(self, "_tp_failure", None):
+            raise RuntimeError(self._tp_failure)
         if (
             not isinstance(prefix_ids, list)
             or len(prefix_ids) < 2
@@ -608,6 +722,8 @@ class RTPLLMHttpServer:
 
         registration = f"__tail_score__:{uuid4().hex}"
         async with self._request_admission_lock:
+            if getattr(self, "_tp_failure", None):
+                raise RuntimeError(self._tp_failure)
             admitted_version = "initial" if self.global_steps is None else self.global_steps
             if admitted_version != expected_weight_version:
                 raise RuntimeError("tail scoring weight version changed before admission")
@@ -680,6 +796,10 @@ class RTPLLMHttpServer:
         resolved before this single-engine server is called; request tracking
         and migration continue to use ``request_id``.
         """
+        if getattr(self, "tp_rank", 0) != 0:
+            raise RuntimeError("only TP rank 0 accepts generation requests")
+        if getattr(self, "_tp_failure", None):
+            raise RuntimeError(self._tp_failure)
         if image_data or video_data or audio_data:
             raise NotImplementedError("rtp-llm rollout does not support multimodal inputs yet.")
 
@@ -724,6 +844,8 @@ class RTPLLMHttpServer:
         # after the drain snapshot and race the weight transition.
         while True:
             async with self._request_admission_lock:
+                if getattr(self, "_tp_failure", None):
+                    raise RuntimeError(self._tp_failure)
                 reason = None
                 if accepted_migration is not None:
                     pending = self._accepted_migrations.get(request_id)
@@ -765,7 +887,7 @@ class RTPLLMHttpServer:
                         self._accepted_migrations.pop(request_id, None)
                     self._inflight[request_id] = task
                     break
-            await self._generation_allowed.wait()
+            await self._wait_for_generation()
         aborted = False
         try:
             await task
@@ -853,12 +975,7 @@ class RTPLLMHttpServer:
             raise RuntimeError("source and target KV transfer domains differ")
         if source["kv_transfer_namespace"] != target_metadata.get("kv_transfer_namespace"):
             raise RuntimeError("source and target KV transfer namespaces differ")
-        wait_fn = getattr(self.engine, "wait_remote_cache_idle", None)
-        if wait_fn is None:
-            raise RuntimeError("the rtp-llm engine binding does not expose wait_remote_cache_idle")
-        flushed = await asyncio.to_thread(wait_fn, int(timeout_s * 1000))
-        if not flushed:
-            raise TimeoutError(f"remote KV cache writes did not finish successfully within {timeout_s}s")
+        await self.wait_remote_cache_idle(timeout_s)
 
         prefix = list(trajectory_state["prompt_ids"]) + list(trajectory_state["generated_token_ids"])
         return {
@@ -974,8 +1091,21 @@ class RTPLLMHttpServer:
                 raise RuntimeError(f"cannot clear KV cache while {len(self._inflight)} request(s) remain registered")
 
     async def resume_generation(self):
+        if getattr(self, "_tp_failure", None):
+            raise RuntimeError(self._tp_failure)
+        # Check peers before holding a local lock: every rank may resume together.
+        statuses = await asyncio.gather(
+            *[peer.get_tp_weight_status.remote() for peer in getattr(self, "_tp_peers", [])]
+        )
+        for status in statuses:
+            if status["updating"] or status["error"] or status["weight_version"] != self.global_steps:
+                raise RuntimeError(
+                    f"cannot resume generation: TP rank weights are not committed consistently: {status}"
+                )
         async with self._weight_update_lock:
             async with self._request_admission_lock:
+                if getattr(self, "_tp_failure", None):
+                    raise RuntimeError(self._tp_failure)
                 if self._weight_update is not None or self._weight_sync_error is not None:
                     detail = self._weight_sync_error or "a weight update is still active"
                     raise RuntimeError(f"cannot resume generation: {detail}")
@@ -1119,7 +1249,7 @@ class RTPLLMHttpServer:
                 get_torch_device().synchronize()
 
             try:
-                await asyncio.to_thread(apply_bucket)
+                await asyncio.to_thread(self._run_on_device, apply_bucket)
             except BaseException as error:
                 self._weight_sync_error = f"weight update {round_id} failed in bucket {sequence}: {error}"
                 raise
@@ -1247,6 +1377,8 @@ class RTPLLMReplica(RolloutReplica):
         super().__init__(
             replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
         )
+        if self.nnodes != 1:
+            raise ValueError("rtp-llm TP replicas must fit on a single node")
         self.server_class = ray.remote(RTPLLMHttpServer)
 
     async def launch_servers(self):
@@ -1269,14 +1401,31 @@ class RTPLLMReplica(RolloutReplica):
         )
         worker_node_ids = [info[0] for info in worker_infos]
         worker_visible_devices = [info[1] for info in worker_infos]
+        if len(set(worker_node_ids)) != 1 or len(set(worker_visible_devices)) != self.world_size:
+            raise ValueError("rtp-llm TP workers require distinct GPUs on a single node")
+        timeout_s = float(os.environ.get("VERL_RTP_LLM_STARTUP_TIMEOUT_S", "600"))
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("VERL_RTP_LLM_STARTUP_TIMEOUT_S must be finite and positive")
+        try:
+            await asyncio.wait_for(
+                self._launch_rank_servers(worker_node_ids[0], worker_visible_devices), timeout=timeout_s
+            )
+        except BaseException:
+            # A failed bootstrap can leave other ranks blocked in TCPStore/NCCL.
+            for server in self.servers:
+                try:
+                    ray.kill(server, no_restart=True)
+                except Exception:
+                    logger.exception("Failed to terminate an RTP TP rank after launch failure")
+            self.servers.clear()
+            self._server_handle = None
+            self._server_address = None
+            raise
 
-        nnodes, gpus_per_replica_node = self.nnodes, self.gpus_per_replica_node
-        for node_rank in range(nnodes):
-            lo = node_rank * gpus_per_replica_node
-            hi = (node_rank + 1) * gpus_per_replica_node
-            node_visible_devices = ",".join(worker_visible_devices[lo:hi])
-            node_id = worker_node_ids[lo]
-            name = f"rtp_llm_server_{self.replica_rank}_{node_rank}{self.name_suffix}"
+    async def _launch_rank_servers(self, node_id: str, worker_visible_devices: list[str]):
+        node_visible_devices = ",".join(worker_visible_devices)
+        for tp_rank in range(self.world_size):
+            name = f"rtp_llm_server_{self.replica_rank}_{tp_rank}{self.name_suffix}"
 
             env_vars = {
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
@@ -1316,16 +1465,24 @@ class RTPLLMReplica(RolloutReplica):
                 config=self.config,
                 model_config=self.model_config,
                 rollout_mode=self.rollout_mode,
-                workers=self.workers[lo:hi],
+                workers=[self.workers[tp_rank]],
                 replica_rank=self.replica_rank,
-                node_rank=node_rank,
-                gpus_per_node=gpus_per_replica_node,
-                nnodes=nnodes,
+                node_rank=0,
+                gpus_per_node=self.world_size,
+                nnodes=1,
                 cuda_visible_devices=node_visible_devices,
+                tp_rank=tp_rank,
             )
             self.servers.append(server)
 
+        await asyncio.gather(
+            *[
+                server.configure_tp_peers.remote(self.servers[:rank] + self.servers[rank + 1 :])
+                for rank, server in enumerate(self.servers)
+            ]
+        )
         await asyncio.gather(*[server.launch_server.remote() for server in self.servers])
+        await self.servers[0].start_tp_health_monitor.remote()
 
         server_address, server_port = await self.servers[0].get_server_address.remote()
         self._server_handle = self.servers[0]

@@ -462,6 +462,12 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        if self.name == "rtp_llm":
+            if type(self.tensor_model_parallel_size) is not int or self.tensor_model_parallel_size < 1:
+                raise ValueError("rtp_llm tensor_model_parallel_size must be a positive integer")
+            for field_name in ("data_parallel_size", "pipeline_model_parallel_size", "expert_parallel_size"):
+                if getattr(self, field_name) != 1:
+                    raise ValueError(f"rtp_llm requires {field_name}=1; use independent rollout replicas for DP")
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(
