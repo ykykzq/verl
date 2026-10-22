@@ -24,6 +24,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.utils.device import get_device_name, get_vendor
+from verl.utils.metric import Metric
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 
 
@@ -129,7 +130,8 @@ class BaseEngine:
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
-            outputs["metrics"].update(getattr(self, "last_update_evidence", {}))
+            # Probe scalars need explicit MAX aggregation through DP and mini-batch metrics.
+            outputs["metrics"].update(Metric.from_dict(getattr(self, "last_update_evidence", {}), aggregation="max"))
         return outputs
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:

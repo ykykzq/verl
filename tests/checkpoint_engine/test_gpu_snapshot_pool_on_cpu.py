@@ -548,7 +548,7 @@ async def test_native_failure_retains_source_owner_until_worker_restart(monkeypa
         await asyncio.to_thread(started.wait, 1)
         if cancel:
             running.cancel()
-        with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
+        with pytest.raises(asyncio.CancelledError if cancel else asyncio.TimeoutError):
             await running
         assert transport.failed
         assert transport.retained[0][0] is owner
