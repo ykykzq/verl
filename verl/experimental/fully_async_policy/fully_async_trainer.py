@@ -56,6 +56,13 @@ def validate_weight_publication_config(config):
         raise ValueError("weight_publication requires rollout.name=rtp_llm")
     if not rollout.get("fine_grained_weight_update", {}).get("enabled", False):
         raise ValueError("weight_publication requires fine_grained_weight_update.enabled=True")
+    if publication.transport == "nccl_gpu":
+        if rollout.get("pipeline_model_parallel_size", 1) != 1 or rollout.get("data_parallel_size", 1) != 1:
+            raise ValueError("nccl_gpu publication supports TP-only rollout replicas (PP=DP=1)")
+        if rollout.get("quantization") is not None:
+            raise ValueError("nccl_gpu publication currently requires unquantized runtime weights")
+        if rollout.get("dtype", "bfloat16") not in ("bfloat16", "float16", "float32"):
+            raise ValueError("nccl_gpu publication requires an explicit supported floating dtype")
     if publication.joint_scheduling.enabled:
         if not config.async_training.get("partial_rollout", False):
             raise ValueError("joint_scheduling requires async_training.partial_rollout=True")
@@ -290,6 +297,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     if len(source_nodes) != 1 or not isinstance(source_nodes[0], str) or not source_nodes[0]:
                         raise RuntimeError("RDMA publication requires exactly one snapshot export source node")
                     publisher_kwargs.update(relay_config=publication_config.relay, source_node_id=source_nodes[0])
+                elif publication_config.transport == "nccl_gpu":
+                    publisher_kwargs["gpu_snapshot_config"] = publication_config.gpu_snapshot
                 self.weight_publisher = WeightPublisherActor.remote(
                     checkpoint_config=checkpoint_engine_config,
                     fine_grained_config=fine_grained_config,
@@ -298,6 +307,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     rollouter=self.rollouter,
                     **publisher_kwargs,
                 )
+                if publication_config.transport == "nccl_gpu":
+                    from verl.checkpoint_engine.gpu_snapshot_pool import settle
+
+                    transport = await self.weight_publisher.configure_gpu.remote(self.weight_publisher)
+                    await settle(
+                        [
+                            *self.actor_rollout_wg.initialize_gpu_snapshot(**transport),
+                            self.weight_publisher.initialize_gpu.remote(),
+                        ]
+                    )
             return
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config,
@@ -327,7 +346,19 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if publisher is None:
             return
         try:
-            await publisher.close.remote(drain=drain)
+            publication = self.config.actor_rollout_ref.rollout.get("weight_publication", {})
+            if publication.get("transport") == "nccl_gpu":
+                from verl.checkpoint_engine.gpu_snapshot_pool import settle
+
+                async def shutdown_gpu():
+                    await publisher.quiesce_gpu.remote(drain=drain)
+                    # NCCL destroy may wait for every rank; start source and storage
+                    # teardown together only after scheduler and payload work settles.
+                    await settle([*self.actor_rollout_wg.close_gpu_snapshot(), publisher.close_gpu.remote()])
+
+                await settle([shutdown_gpu()])
+            else:
+                await publisher.close.remote(drain=drain)
         finally:
             if terminate:
                 self.weight_publisher = None
@@ -932,8 +963,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if steps is not None and self.current_param_version in steps:
             await self.rollouter._stop_profiling.remote()
         timing = {}
+        gpu_publication = self.config.actor_rollout_ref.rollout.weight_publication.get("transport", "ray") == "nccl_gpu"
         with marked_timer("timing_s/weight_snapshot_export", timing):
-            refs = self.actor_rollout_wg.export_weight_snapshot(global_steps=self.current_param_version)
+            if gpu_publication:
+                await publisher.begin_gpu_snapshot.remote(self.current_param_version)
+                refs = self.actor_rollout_wg.export_gpu_snapshot(
+                    global_steps=self.current_param_version, publisher=publisher
+                )
+            else:
+                refs = self.actor_rollout_wg.export_weight_snapshot(global_steps=self.current_param_version)
             # Never return to training until all FSDP collective participants settle,
             # even when one rank fails while another is still draining its generator.
             settled = asyncio.gather(*refs, return_exceptions=True)
@@ -947,14 +985,22 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     # FSDP collectives, which continue running in worker actors.
                     cancelled = True
             if cancelled:
+                if gpu_publication:
+                    await publisher.fail_gpu_snapshot.remote("trainer cancelled during GPU export")
                 raise asyncio.CancelledError
             for result in results:
                 if isinstance(result, BaseException):
+                    if gpu_publication:
+                        await publisher.fail_gpu_snapshot.remote(f"training export rank failed: {result}")
                     raise result
             snapshots = [result for result in results if result is not None]
             if len(snapshots) != 1:
                 raise RuntimeError(f"Snapshot export expected one rank-zero manifest, got {len(snapshots)}")
-            snapshot = snapshots[0]
+            snapshot = (
+                await publisher.seal_gpu_snapshot.remote(self.current_param_version)
+                if gpu_publication
+                else snapshots[0]
+            )
             if snapshot.version != self.current_param_version:
                 raise RuntimeError("Snapshot export returned the wrong parameter version")
         with marked_timer("timing_s/weight_publication_admission", timing):

@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import asyncio
+import gc
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -37,6 +39,14 @@ class _DeviceApi:
 class _RemoteMethod:
     def __init__(self, method):
         self.remote = method
+
+
+class _CudaControlTensor(torch.Tensor):
+    """CPU storage with a CUDA device marker for sender control-plane checks."""
+
+    @property
+    def device(self):
+        return torch.device("cuda:0")
 
 
 class TestRayIpcWeightSender(unittest.IsolatedAsyncioTestCase):
@@ -79,6 +89,79 @@ class TestRayIpcWeightSender(unittest.IsolatedAsyncioTestCase):
             return {"method": "cuda_ipc", "payload": b"handle"}
 
         return sender, init_buffer, calls, failure
+
+    async def test_runtime_failure_aborts_before_releasing_or_fetching_more_inputs(self):
+        sender, init_buffer, calls, failure = self._sender("bucket")
+        sender.wire_format = "runtime_tensors"
+        fetched, released = [], []
+
+        async def weights():
+            for index in range(4):
+                fetched.append(index)
+                try:
+                    yield str(index), torch.ones(2).as_subclass(_CudaControlTensor)
+                finally:
+                    released.append(index)
+
+        async def abort(**kwargs):
+            self.assertEqual(fetched, [0, 1])
+            self.assertEqual(released, [0])
+            calls.append("abort")
+
+        sender.server_handle.abort_weight_update_from_ipc.remote = abort
+        iterator = weights()
+        with (
+            patch.object(sender, "_init_buffer", side_effect=init_buffer),
+            patch(
+                "verl.workers.rollout.rtp_llm_rollout.ray_weight_transfer.get_torch_device", return_value=_DeviceApi()
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            await sender.async_send_weights(iterator)
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(fetched, [0, 1])
+        self.assertEqual(calls, ["begin", "apply", "abort"])
+        await iterator.aclose()
+        self.assertEqual(released, [0, 1])
+
+    async def test_runtime_sender_drops_previous_tensor_before_fetching_next(self):
+        sender, init_buffer, _, _ = self._sender()
+        sender.wire_format = "runtime_tensors"
+        refs = []
+
+        async def weights():
+            for index in range(3):
+                gc.collect()
+                if refs:
+                    self.assertIsNone(refs[-1](), "previous input still owns a full GPU buffer")
+                value = torch.ones(2).as_subclass(_CudaControlTensor)
+                refs.append(weakref.ref(value))
+                yield str(index), value
+                del value
+
+        with (
+            patch.object(sender, "_init_buffer", side_effect=init_buffer),
+            patch(
+                "verl.workers.rollout.rtp_llm_rollout.ray_weight_transfer.get_torch_device", return_value=_DeviceApi()
+            ),
+        ):
+            await sender.async_send_weights(weights())
+        self.assertTrue(all(ref() is None for ref in refs))
+
+    async def test_runtime_unknown_abort_keeps_ipc_bucket_allocated(self):
+        sender, init_buffer, _, _ = self._sender("bucket")
+        sender.wire_format = "runtime_tensors"
+        sender.server_handle.abort_weight_update_from_ipc.remote = AsyncMock(side_effect=RuntimeError("unknown abort"))
+        with (
+            patch.object(sender, "_init_buffer", side_effect=init_buffer),
+            patch(
+                "verl.workers.rollout.rtp_llm_rollout.ray_weight_transfer.get_torch_device", return_value=_DeviceApi()
+            ),
+            self.assertRaisesRegex(RuntimeError, "bucket failed"),
+        ):
+            await sender.async_send_weights([("x", torch.ones(2).as_subclass(_CudaControlTensor))])
+        self.assertIsNotNone(sender.buffer, "unacknowledged IPC buffer must survive until worker restart")
+        self.assertTrue(sender.quarantined)
 
     async def test_failed_ipc_drains_collective_iterator_before_returning(self):
         for failure_at in ["buffer", "begin", "bucket"]:
@@ -324,6 +407,8 @@ class TestRayIpcWeightUpdate(unittest.IsolatedAsyncioTestCase):
         server.weight_manager = SimpleNamespace(
             update_from_hf_tensors=Mock(),
             abort_hf_update=Mock(),
+            update_from_runtime_tensors=Mock(),
+            abort_runtime_update=Mock(),
         )
         return server
 
@@ -349,6 +434,22 @@ class TestRayIpcWeightUpdate(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "paused"):
             await server.begin_weight_update_from_ipc("round-1", {"method": "invalid"})
+
+    async def test_runtime_wire_format_installs_without_hf_transforms(self):
+        server = self._server()
+        server._weight_update["wire_format"] = "runtime_tensors"
+        with (
+            patch(
+                "verl.workers.rollout.rtp_llm_rollout.rtp_llm_async_server.get_torch_device", return_value=_DeviceApi()
+            ),
+            patch("verl.workers.rollout.rtp_llm_rollout.rtp_llm_async_server.get_device_id", return_value=0),
+        ):
+            await server.apply_weight_bucket_from_ipc("round-1", 0, [self._entry('[null,"out"]')], True)
+            await server.abort_weight_update_from_ipc("round-1")
+        server.weight_manager.update_from_runtime_tensors.assert_called_once()
+        server.weight_manager.abort_runtime_update.assert_called_once()
+        server.weight_manager.update_from_hf_tensors.assert_not_called()
+        server.weight_manager.abort_hf_update.assert_not_called()
 
     async def test_bucket_ack_follows_weight_application_and_commit(self):
         server = self._server()

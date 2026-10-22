@@ -192,7 +192,7 @@ fine_grained_weight_update:
   retry_backoff_s: 1.0
   continue_on_failure: True
 
-# Export CPU snapshots, then publish to standalone RTP-LLM replicas in a separate actor.
+# Export immutable snapshots, then install standalone RTP-LLM replicas in a separate actor.
 # Requires fine_grained_weight_update and FSDP/FSDP2 full-weight exports.
 weight_publication:
 
@@ -203,6 +203,16 @@ weight_publication:
   wait_timeout_s: 600.0
   # mooncake_rdma stages CPU buckets through per-node relays before installation.
   transport: ray
+  # nccl_gpu stores final TP weights across rollout GPUs; Ray carries metadata only.
+  gpu_snapshot:
+    _target_: verl.workers.config.GPUSnapshotConfig
+    slots: 2
+    max_bytes_per_gpu: 10737418240
+    max_conversion_bytes: 8589934592
+    max_tensor_bytes: 4294967296
+    chunk_bytes: 268435456
+    operation_timeout_s: 120.0
+    reserve_timeout_s: 600.0
   relay:
     _target_: verl.workers.config.WeightRelayConfig
     device_name: ""

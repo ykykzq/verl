@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import asyncio
+import gc
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -103,6 +105,81 @@ class TestRTPWeightAdapter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source.iterations, 1)
         self.assertEqual(self.bad_tensor.cast_count, 1)
         self.adapter.server_handle.set_global_steps.remote.assert_not_awaited()
+
+    async def test_runtime_format_preserves_keys_dtype_and_vision_like_names(self):
+        captured = []
+
+        async def send(sender, weights):
+            async for entry in weights:
+                captured.append(entry)
+
+        values = [
+            ("vision.weight", torch.ones(2, dtype=torch.float32)),
+            ('[0,"kernel"]', torch.ones(2, dtype=torch.int8)),
+        ]
+        with patch.object(RayIpcWeightSender, "async_send_weights", send):
+            await self.adapter.update_weights(values, wire_format="runtime_tensors")
+        self.assertEqual([name for name, _ in captured], ["vision.weight", '[0,"kernel"]'])
+        self.assertEqual([tensor.dtype for _, tensor in captured], [torch.float32, torch.int8])
+
+    async def test_runtime_adapter_drops_source_and_view_before_next_fetch(self):
+        refs = []
+
+        async def weights():
+            for index in range(3):
+                gc.collect()
+                self.assertTrue(all(ref() is None for ref in refs), "adapter retains the previous GPU storage")
+                value = torch.ones(2)
+                refs.append(weakref.ref(value))
+                yield str(index), value
+                del value
+
+        async def send(sender, prepared):
+            while True:
+                try:
+                    item = await anext(prepared)
+                except StopAsyncIteration:
+                    break
+                refs.append(weakref.ref(item[1]))
+                del item
+
+        with patch.object(RayIpcWeightSender, "async_send_weights", send):
+            await self.adapter.update_weights(weights(), wire_format="runtime_tensors")
+
+    async def test_runtime_preparation_failure_does_not_drain_snapshot_inputs(self):
+        failure = RuntimeError("detach failed")
+
+        class InvalidTensor:
+            def detach(self):
+                raise failure
+
+        source = _WeightSource([InvalidTensor(), InvalidTensor()])
+
+        async def send(sender, prepared):
+            async for _ in prepared:
+                pass
+
+        with (
+            patch.object(RayIpcWeightSender, "async_send_weights", send),
+            self.assertRaisesRegex(RuntimeError, "detach"),
+        ):
+            await self.adapter.update_weights(source, wire_format="runtime_tensors")
+        self.assertEqual(source.received, [0])
+
+    async def test_runtime_adapter_retains_unacknowledged_sender_and_rejects_reuse(self):
+        async def send(sender, weights):
+            sender.quarantined = True
+            sender.buffer = torch.ones(2)
+            raise RuntimeError("abort acknowledgement missing")
+
+        with (
+            patch.object(RayIpcWeightSender, "async_send_weights", send),
+            self.assertRaisesRegex(RuntimeError, "abort"),
+        ):
+            await self.adapter.update_weights([], wire_format="runtime_tensors")
+        self.assertIsNotNone(self.adapter._failed_runtime_senders[0].buffer)
+        with self.assertRaisesRegex(RuntimeError, "restart"):
+            await self.adapter.update_weights([], wire_format="runtime_tensors")
 
     async def test_nonleader_drains_raw_weights_without_casting(self):
         self.adapter._has_server = False

@@ -5,9 +5,18 @@
 """Single-replica, latest-version publication independent of training workers."""
 
 import asyncio
+import json
 import math
 import traceback
 from collections import deque
+
+
+class WeightPublicationTimeoutError(asyncio.TimeoutError):
+    """Publication deadline with serializable progress and no transport payloads."""
+
+    def __init__(self, message, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics if diagnostics is not None else {}
 
 
 class WeightPublicationScheduler:
@@ -35,6 +44,7 @@ class WeightPublicationScheduler:
         self._latest = None
         self._active = None
         self._active_rank = None
+        self._active_phase = None
         self._committed_version = -1
         self._commands = deque()
         self._wake = asyncio.Event()
@@ -121,6 +131,7 @@ class WeightPublicationScheduler:
             "latest_version": self._latest.version if self._latest is not None else None,
             "active_version": self._active.version if self._active is not None else None,
             "active_replica_rank": self._active_rank,
+            "active_phase": self._active_phase,
             "committed_version": self._committed_version if self._committed_version >= 0 else None,
             "replicas": states,
             "idle": self._idle,
@@ -140,12 +151,20 @@ class WeightPublicationScheduler:
         self._validate_version(version)
         if not isinstance(timeout_s, (int, float)) or not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("publication timeout must be finite and positive")
+        clock = asyncio.get_running_loop().time
+        started_at = clock()
+        observed_states, observed_at = {}, None
+        state_query_pending = False
 
         async def wait():
+            nonlocal observed_states, observed_at, state_query_pending
             async with self._changed:
                 while True:
                     self._check_health(require_open=False)
+                    state_query_pending = True
                     states = await self.manager.get_replica_states()
+                    observed_states, observed_at = states, clock()
+                    state_query_pending = False
                     self._check_health(require_open=False)
                     eligible = [
                         state
@@ -159,6 +178,7 @@ class WeightPublicationScheduler:
                         # The first-commit notification must finish before startup
                         # or validation observes publication as committed.
                         if self._active is None or self._committed_version >= version:
+                            state_query_pending = True
                             return await self.get_status()
                     if self._closed:
                         raise RuntimeError(f"publication closed before version {version} became serving")
@@ -169,7 +189,55 @@ class WeightPublicationScheduler:
                         )
                     await self._changed.wait()
 
-        return await asyncio.wait_for(wait(), timeout=timeout_s)
+        try:
+            return await asyncio.wait_for(wait(), timeout=timeout_s)
+        except asyncio.TimeoutError as error:
+            # Reuse the last successful observation: a fresh status RPC can also hang.
+            now = clock()
+            latest = self._latest.version if self._latest is not None else None
+            active = self._active.version if self._active is not None else None
+            states = list(observed_states.values())
+            diagnostics = {
+                "requested_version": version,
+                "timeout_s": timeout_s,
+                "elapsed_s": now - started_at,
+                "latest_version": latest,
+                "pending_version": latest if not self._idle and (active is None or latest > active) else None,
+                "committed_version": self._committed_version if self._committed_version >= 0 else None,
+                "active_version": active,
+                "active_replica_rank": self._active_rank,
+                "phase": self._active_phase
+                or ("replica_state_query" if state_query_pending else "waiting_for_publication_or_replica"),
+                "state_query_pending": state_query_pending,
+                "replica_states_age_s": now - observed_at if observed_at is not None else None,
+                "replica_counts": {
+                    "total": len(states),
+                    "serving": sum(state["lifecycle_state"] == "SERVING" for state in states),
+                    "serving_requested_version": sum(
+                        state["lifecycle_state"] == "SERVING" and self._version(state) >= version for state in states
+                    ),
+                    "pending_eligible": sum(
+                        state["lifecycle_state"] != "QUARANTINED"
+                        and not state.get("pin")
+                        and self._version(state) < version
+                        for state in states
+                    ),
+                    "pinned": sum(bool(state.get("pin")) for state in states),
+                    "quarantined": sum(state["lifecycle_state"] == "QUARANTINED" for state in states),
+                },
+                "replicas": {
+                    rank: {
+                        "lifecycle_state": state["lifecycle_state"],
+                        "weight_version": state.get("weight_version"),
+                        "desired_weight_version": state.get("desired_weight_version"),
+                        "pinned": bool(state.get("pin")),
+                    }
+                    for rank, state in observed_states.items()
+                },
+            }
+            raise WeightPublicationTimeoutError(
+                f"weight publication wait timed out: {json.dumps(diagnostics, sort_keys=True)}", diagnostics
+            ) from error
 
     async def _command(self, action, rank, reason=None):
         self._check_health()
@@ -204,12 +272,15 @@ class WeightPublicationScheduler:
     async def _transfer(self, snapshot, rank, recovery=False):
         self._active = snapshot
         self._active_rank = rank
+        self._active_phase = "replica_update"
         await self._notify()
         try:
             result = await self.manager.update_replica_from_snapshot(snapshot, rank, recovery=recovery)
             entry = result["replicas"][rank]
             if entry["status"] == "updated" and snapshot.version > self._committed_version:
                 if self.on_commit is not None:
+                    self._active_phase = "commit_callback"
+                    await self._notify()
                     await self.on_commit(snapshot.version, result)
                 self._committed_version = snapshot.version
             return result
@@ -219,6 +290,7 @@ class WeightPublicationScheduler:
         finally:
             self._active = None
             self._active_rank = None
+            self._active_phase = None
             await self._notify()
 
     async def _execute_command(self, action, rank, reason, future):

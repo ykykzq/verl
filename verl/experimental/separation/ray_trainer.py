@@ -19,7 +19,9 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import json
 import uuid
+from pathlib import Path
 from pprint import pprint
 from typing import Any, Optional
 
@@ -645,7 +647,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         # implement critic warmup
         if self.config.trainer.critic_warmup <= self.global_steps:
             if self.config.trainer.get("learning_acceptance", False):
-                from verl.trainer.ppo.learning_acceptance import learning_batch_metrics
+                from verl.trainer.ppo.learning_acceptance import LearningAcceptanceError, learning_batch_metrics
 
                 if not self.config.actor_rollout_ref.actor.optim.get("verify_parameter_updates", False):
                     raise ValueError("learning_acceptance requires actor.optim.verify_parameter_updates=True")
@@ -656,15 +658,24 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 mask = batch.batch["response_mask"]
                 if "rollout_is_weights" in batch.batch:
                     mask = mask * batch.batch["rollout_is_weights"]
-                metrics.update(
-                    learning_batch_metrics(
+                try:
+                    acceptance_metrics = learning_batch_metrics(
                         batch.batch["token_level_scores"],
                         batch.batch["advantages"],
                         mask,
                         batch.non_tensor_batch["uid"],
                         strict=True,
                     )
-                )
+                except LearningAcceptanceError as error:
+                    metrics.update(error.metrics)
+                    try:
+                        self._log_learning_acceptance_failure(batch, error)
+                    except Exception as diagnostic_error:
+                        # Preserve the strict failure even if an output backend is unavailable.
+                        print(f"Learning acceptance diagnostic logging failed: {diagnostic_error}")
+                        print(json.dumps(error.diagnostics, default=str))
+                    raise
+                metrics.update(acceptance_metrics)
             # update actor
             with marked_timer("update_actor", timing_raw, color="red"):
                 actor_output = self._update_actor(batch)
@@ -672,6 +683,27 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
             metrics.update(actor_output_metrics)
         return batch
+
+    def _log_learning_acceptance_failure(self, batch, error):
+        from verl.trainer.ppo.learning_acceptance import add_learning_batch_evidence
+
+        evidence = error.diagnostics
+        evidence.update({"step": self.global_steps, "error": str(error)})
+        add_learning_batch_evidence(
+            evidence,
+            batch,
+            self.tokenizer,
+            self.reward_extra_infos_dict,
+            self.config.actor_rollout_ref.rollout.get("response_length"),
+        )
+        dump_root = self.config.trainer.get("rollout_data_dir") or self.config.trainer.default_local_dir
+        dump_path = Path(dump_root) / "learning_acceptance" / f"{self.global_steps}.json"
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        # The failed step never reaches the normal asynchronous generation dump or metric flush.
+        with dump_path.open("w", encoding="utf-8") as output:
+            json.dump(evidence, output, ensure_ascii=False, allow_nan=False, default=str)
+        print(f"Learning acceptance diagnostics written to {dump_path}")
+        self.logger.log(data=error.metrics, step=self.global_steps)
 
     def _fit_update_weights(self):
         timing_raw = self.timing_raw

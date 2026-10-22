@@ -741,6 +741,74 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return ray.get_runtime_context().get_node_id() if torch.distributed.get_rank() == 0 else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def initialize_gpu_snapshot(self, world_size, unique_id, timeout_s):
+        from verl.checkpoint_engine.gpu_snapshot_transport import DirectedNCCL
+
+        if torch.distributed.get_rank() == 0:
+            if getattr(self, "_gpu_snapshot_sender", None) is not None:
+                raise RuntimeError("GPU snapshot sender is already initialized; close it or restart the worker")
+            self._gpu_snapshot_sender = DirectedNCCL(timeout_s)
+            await self._gpu_snapshot_sender.initialize(world_size, unique_id, 0)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def close_gpu_snapshot(self):
+        if torch.distributed.get_rank() == 0:
+            sender = getattr(self, "_gpu_snapshot_sender", None)
+            if sender is not None:
+                await sender.close()
+                del self._gpu_snapshot_sender
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def export_gpu_snapshot(self, global_steps: int, publisher):
+        """Drain the FSDP export on all ranks; rank zero sends GPU payloads only."""
+        import time
+
+        from verl.checkpoint_engine.gpu_snapshot_pool import settle
+
+        assert "actor" in self.role, "GPU snapshot export only supports actor role"
+        weights, peft_config = self.actor.engine.get_per_tensor_param()
+        source = torch.distributed.get_rank() == 0
+        failure = ValueError("GPU snapshots require full, merged weights") if peft_config is not None else None
+        started = time.perf_counter()
+        dtype = getattr(torch, self.config.rollout.dtype)
+        try:
+            for name, tensor in weights:
+                if not source or failure is not None:
+                    continue
+                try:
+                    payload = tensor.detach()
+                    if payload.is_floating_point():
+                        payload = payload.to(dtype=dtype)
+                    payload = payload.contiguous()
+                    if payload.device.type != "cuda":
+                        raise ValueError("nccl_gpu export requires CUDA source tensors")
+                    destinations = (
+                        await settle(
+                            [
+                                publisher.prepare_gpu_input.remote(
+                                    global_steps, name, tuple(payload.shape), str(payload.dtype)
+                                )
+                            ]
+                        )
+                    )[0]
+                    for destination in destinations:
+                        await self._gpu_snapshot_sender.transfer(payload, destination)
+                    if destinations:
+                        await settle([publisher.finish_gpu_input.remote()])
+                    del payload
+                except BaseException as error:
+                    # Every training rank must drain the same FSDP collectives,
+                    # even if the export's GPU communication has failed.
+                    failure = error
+        except BaseException as error:
+            failure = failure or error
+        if failure is not None:
+            if source:
+                await settle([publisher.fail_gpu_snapshot.remote(f"source export failed: {failure}")])
+            raise failure
+        return {"source_export_s": time.perf_counter() - started} if source else None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def export_weight_snapshot(self, global_steps: int) -> WeightSnapshot | None:
         """Export full immutable CPU weights without joining rollout transfers.
 

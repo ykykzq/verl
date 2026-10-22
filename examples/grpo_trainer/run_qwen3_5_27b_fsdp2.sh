@@ -53,6 +53,8 @@ MICRO_BATCH_SIZE_PER_GPU=1
 TOTAL_ROLLOUT_STEPS=${TOTAL_ROLLOUT_STEPS:-2000}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.85}
 CONCURRENT_SAMPLES_PER_REPLICA=${CONCURRENT_SAMPLES_PER_REPLICA:-8}
+# Large snapshots and serial replica installs can exceed the library's default wait.
+WEIGHT_PUBLICATION_WAIT_TIMEOUT_S=${WEIGHT_PUBLICATION_WAIT_TIMEOUT_S:-1800}
 
 python3 -m verl.experimental.fully_async_policy.fully_async_main \
     data.train_files="${TRAIN_FILE}" \
@@ -111,6 +113,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.name=rtp_llm \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.fine_grained_weight_update.enabled=True \
+    actor_rollout_ref.rollout.weight_publication.wait_timeout_s=${WEIGHT_PUBLICATION_WAIT_TIMEOUT_S} \
     actor_rollout_ref.rollout.trajectory_migration.enabled=True \
     actor_rollout_ref.rollout.trajectory_migration.allow_cross_version_recompute=True \
     actor_rollout_ref.rollout.n=${N_RESPONSES} \

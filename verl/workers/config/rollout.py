@@ -36,6 +36,7 @@ __all__ = [
     "FineGrainedWeightUpdateConfig",
     "JointSchedulingConfig",
     "WeightRelayConfig",
+    "GPUSnapshotConfig",
     "WeightPublicationConfig",
     "TrajectoryMigrationConfig",
 ]
@@ -247,22 +248,57 @@ class WeightRelayConfig(BaseConfig):
 
 
 @dataclass
+class GPUSnapshotConfig(BaseConfig):
+    """Per-GPU persistent storage and temporary working memory limits."""
+
+    slots: int = 2
+    max_bytes_per_gpu: int = 10 << 30
+    max_conversion_bytes: int = 8 << 30
+    max_tensor_bytes: int = 4 << 30
+    chunk_bytes: int = 256 << 20
+    operation_timeout_s: float = 120.0
+    reserve_timeout_s: float = 600.0
+
+    def __post_init__(self):
+        for name in ("slots", "max_bytes_per_gpu", "max_conversion_bytes", "max_tensor_bytes", "chunk_bytes"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"weight_publication.gpu_snapshot.{name} must be a positive integer")
+        if self.slots < 2:
+            raise ValueError("GPU publication requires at least two version slots")
+        if self.chunk_bytes > min(self.max_bytes_per_gpu, self.max_tensor_bytes):
+            raise ValueError("GPU chunk_bytes exceeds storage or temporary tensor capacity")
+        for name in ("operation_timeout_s", "reserve_timeout_s"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"weight_publication.gpu_snapshot.{name} must be finite and positive")
+
+
+@dataclass
 class WeightPublicationConfig(BaseConfig):
-    """Publish immutable CPU snapshots independently of training workers."""
+    """Publish immutable snapshots independently of replica installation."""
 
     enabled: bool = False
     wait_timeout_s: float = 600.0
     transport: str = "ray"
     relay: WeightRelayConfig = field(default_factory=WeightRelayConfig)
+    gpu_snapshot: GPUSnapshotConfig = field(default_factory=GPUSnapshotConfig)
     joint_scheduling: JointSchedulingConfig = field(default_factory=JointSchedulingConfig)
 
     def __post_init__(self):
         if not math.isfinite(self.wait_timeout_s) or self.wait_timeout_s <= 0:
             raise ValueError("weight_publication.wait_timeout_s must be finite and positive")
-        if self.transport not in ("ray", "mooncake_rdma"):
-            raise ValueError("weight_publication.transport must be 'ray' or 'mooncake_rdma'")
-        if self.transport == "mooncake_rdma" and not self.enabled:
-            raise ValueError("mooncake_rdma transport requires weight_publication.enabled=True")
+        if self.transport not in ("ray", "mooncake_rdma", "nccl_gpu"):
+            raise ValueError("weight_publication.transport must be 'ray', 'mooncake_rdma' or 'nccl_gpu'")
+        if self.transport != "ray" and not self.enabled:
+            raise ValueError(f"{self.transport} transport requires weight_publication.enabled=True")
+        if isinstance(self.gpu_snapshot, (dict, DictConfig)):
+            values = self.gpu_snapshot
+            if isinstance(values, DictConfig):
+                values = OmegaConf.to_container(values, resolve=True)
+            object.__setattr__(self, "gpu_snapshot", GPUSnapshotConfig(**values))
+        elif not isinstance(self.gpu_snapshot, GPUSnapshotConfig):
+            raise TypeError("weight_publication.gpu_snapshot must be dict, DictConfig, or GPUSnapshotConfig")
         if isinstance(self.relay, (dict, DictConfig)):
             relay = self.relay
             if isinstance(relay, DictConfig):

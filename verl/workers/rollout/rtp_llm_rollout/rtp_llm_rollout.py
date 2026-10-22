@@ -31,7 +31,7 @@ from verl import DataProto
 from verl.utils.device import get_torch_device, is_support_ipc, set_expandable_segments
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
-from verl.workers.rollout.rtp_llm_rollout.ray_weight_transfer import RayIpcWeightSender
+from verl.workers.rollout.rtp_llm_rollout.ray_weight_transfer import RayIpcWeightSender, runtime_tensor_iterator
 from verl.workers.rollout.utils import ensure_async_iterator
 
 logger = logging.getLogger(__file__)
@@ -124,13 +124,18 @@ class ServerAdapter(BaseRollout):
         wire_format: str = "named_tensors",
         **kwargs,
     ):
-        assert wire_format == "named_tensors", (
-            f"rtp-llm rollout only consumes full named tensors; got wire_format={wire_format!r}"
-        )
+        if wire_format not in {"named_tensors", "runtime_tensors"}:
+            raise ValueError(f"unsupported rtp-llm weight wire_format={wire_format!r}")
+        if wire_format == "runtime_tensors" and self.use_shm:
+            raise ValueError("runtime tensor installation requires CUDA IPC")
+        if wire_format == "runtime_tensors" and getattr(self, "_failed_runtime_senders", None):
+            raise RuntimeError("runtime IPC completion is unknown; restart this worker before another install")
         start_time = time.time()
         num_sent = 0
         num_skipped = 0
-        weight_iterator = ensure_async_iterator(weights)
+        weight_iterator = (
+            runtime_tensor_iterator(weights) if wire_format == "runtime_tensors" else ensure_async_iterator(weights)
+        )
 
         async def prepared() -> AsyncGenerator[tuple[str, torch.Tensor], None]:
             nonlocal num_sent, num_skipped
@@ -138,13 +143,19 @@ class ServerAdapter(BaseRollout):
                 try:
                     # The engine runs text-only (vit_separation=REMOTE), so it owns no vision
                     # tower receptors while the trainer's Qwen3.5 checkpoint still carries them.
-                    if _VISION_PREFIX_RE.match(name):
+                    if wire_format == "named_tensors" and _VISION_PREFIX_RE.match(name):
                         num_skipped += 1
                         continue
                     payload = param.detach()
-                    if payload.is_floating_point() and payload.dtype != self._engine_dtype:
+                    if (
+                        wire_format == "named_tensors"
+                        and payload.is_floating_point()
+                        and payload.dtype != self._engine_dtype
+                    ):
                         payload = payload.to(self._engine_dtype)
                 except Exception:
+                    if wire_format == "runtime_tensors":
+                        raise
                     # The sender cannot recover the raw collective iterator after
                     # this adapter generator closes on a local conversion error.
                     try:
@@ -155,6 +166,8 @@ class ServerAdapter(BaseRollout):
                     raise
                 num_sent += 1
                 yield name, payload
+                if wire_format == "runtime_tensors":
+                    del param, payload
 
         if not self._ensure_server_handle():
             # The checkpoint engine backs `weights` with collectives, so every rank must
@@ -167,8 +180,16 @@ class ServerAdapter(BaseRollout):
             server_handle=self.server_handle,
             bucket_size_mb=self.config.checkpoint_engine.update_weights_bucket_megabytes,
             use_shm=self.use_shm,
+            wire_format=wire_format,
         )
-        await sender.async_send_weights(prepared())
+        try:
+            await sender.async_send_weights(prepared())
+        except BaseException:
+            if sender.quarantined:
+                # An unreachable receiver may still read this IPC bucket. The
+                # failed worker owns it until restart, alongside snapshot buffers.
+                self._failed_runtime_senders = [sender]
+            raise
 
         if global_steps is not None:
             await self.server_handle.set_global_steps.remote(global_steps)

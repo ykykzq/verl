@@ -75,26 +75,60 @@ def rebuild_shared_memory(name: str, size: int) -> tuple[torch.Tensor, shared_me
     return torch.frombuffer(shm.buf[:size], dtype=torch.uint8), shm
 
 
+def runtime_tensor_iterator(weights):
+    """Avoid an adapter holding the previous GPU allocation during the next fetch."""
+    if hasattr(weights, "__aiter__"):
+        return aiter(weights)
+
+    async def from_sync():
+        iterator = iter(weights)
+        while True:
+            try:
+                yield next(iterator)
+            except StopIteration:
+                return
+
+    return from_sync()
+
+
 class RayIpcWeightSender:
     """Send tensor buckets while using Ray actor calls as the control channel."""
 
-    def __init__(self, server_handle: Any, bucket_size_mb: int = 512, use_shm: bool = False):
+    def __init__(
+        self,
+        server_handle: Any,
+        bucket_size_mb: int = 512,
+        use_shm: bool = False,
+        wire_format: str = "named_tensors",
+    ):
+        if wire_format not in {"named_tensors", "runtime_tensors"}:
+            raise ValueError(f"unsupported weight wire format: {wire_format!r}")
+        if wire_format == "runtime_tensors" and use_shm:
+            raise ValueError("runtime tensor installation requires CUDA IPC, not shared memory")
+        self.wire_format = wire_format
         self.server_handle = server_handle
         self.bucket_size = int(bucket_size_mb) << 20
         self.bucket_size_mb = bucket_size_mb
         self.use_shm = use_shm
+        self.quarantined = False
         self.buffer: torch.Tensor | None = None
         self.shm: shared_memory.SharedMemory | None = None
 
     async def async_send_weights(self, weights) -> None:
         round_id = uuid.uuid4().hex
-        weight_iterator = ensure_async_iterator(weights)
+        weight_iterator = (
+            runtime_tensor_iterator(weights)
+            if self.wire_format == "runtime_tensors"
+            else ensure_async_iterator(weights)
+        )
         next_weight = None
         iterator_failed = False
         failed = False
         began = False
+        abort_confirmed = False
         try:
             descriptor = self._init_buffer()
+            descriptor["wire_format"] = self.wire_format
             began = True
             await self.server_handle.begin_weight_update_from_ipc.remote(
                 round_id=round_id,
@@ -119,6 +153,8 @@ class RayIpcWeightSender:
                     raise
                 next_weight = None
                 name, weight = item
+                if self.wire_format == "runtime_tensors" and weight.device.type != "cuda":
+                    raise ValueError(f"runtime tensor {name!r} must reside on CUDA")
                 alignment = weight.element_size()
                 offset = (offset + alignment - 1) // alignment * alignment
                 if offset + weight.nbytes > self.bucket_size and entries:
@@ -140,6 +176,8 @@ class RayIpcWeightSender:
                         is_last=False,
                     )
                     sequence += 1
+                    if self.wire_format == "runtime_tensors":
+                        del item, weight
                     continue
 
                 assert self.buffer is not None
@@ -148,6 +186,8 @@ class RayIpcWeightSender:
                 )
                 entries.append(self._entry(name, weight, offset=offset))
                 offset += weight.nbytes
+                if self.wire_format == "runtime_tensors":
+                    del item, weight
 
             await self._send_bucket(round_id, sequence, entries, is_last=True)
             await self.server_handle.finish_weight_update_from_ipc.remote(round_id=round_id)
@@ -155,7 +195,17 @@ class RayIpcWeightSender:
             failed = True
 
             async def drain_and_abort():
-                if not iterator_failed:
+                nonlocal abort_confirmed
+                if self.wire_format == "runtime_tensors":
+                    # Runtime snapshots have no trainer collectives to drain.
+                    # Keep any in-flight fetch result owned until IPC abort acks;
+                    # resuming this iterator would release its current source.
+                    if next_weight is not None:
+                        try:
+                            await next_weight
+                        except BaseException:
+                            logger.warning("Runtime tensor fetch failed while settling %s", round_id, exc_info=True)
+                elif not iterator_failed:
                     try:
                         if next_weight is not None:
                             await next_weight
@@ -170,6 +220,7 @@ class RayIpcWeightSender:
                 if began:
                     try:
                         await self.server_handle.abort_weight_update_from_ipc.remote(round_id=round_id)
+                        abort_confirmed = True
                     except BaseException:
                         logger.warning("Failed to abort rtp-llm weight-update round %s", round_id, exc_info=True)
 
@@ -182,8 +233,10 @@ class RayIpcWeightSender:
             recovery.result()
             raise
         finally:
+            self.quarantined = failed and self.wire_format == "runtime_tensors" and began and not abort_confirmed
             try:
-                self._cleanup()
+                if not self.quarantined:
+                    self._cleanup()
             except BaseException:
                 if not failed:
                     raise

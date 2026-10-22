@@ -12,6 +12,13 @@ Checkpoint Engine is an unified abstract layer to synchronize weights between va
 
 ### Supported Backends
 
+Standalone RTP-LLM also supports independent publication through
+`weight_publication.transport=nccl_gpu`: a bounded GPU snapshot pool holding
+TP-local runtime shards, directed NCCL transfers, and serialized replica
+installation. See [GPU snapshot design](../../docs/checkpoint_engine/gpu_snapshot_pool.md)
+and [hardware validation](../../docs/checkpoint_engine/gpu_snapshot_validation.md).
+This publication setting is separate from `checkpoint_engine.backend`.
+
 ||Comm Library|Topology|Hardware|Performance|Elastic|Use case|
 |----|----|----|----|----|----|----|
 |naive|torch.distributed|all_gather|NVIDIA/AMD/Ascend|Very High|NA|On-policy training<br>- Actor/rollout colocated

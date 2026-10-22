@@ -18,7 +18,9 @@ from verl.checkpoint_engine import base
 class SnapshotCheckpointEngineManager(base.CheckpointEngineManager):
     """Reuse replica isolation and retries with a trainer-independent source."""
 
-    def __init__(self, checkpoint_config, fine_grained_config, replicas, load_balancer_handle, relay=None):
+    def __init__(
+        self, checkpoint_config, fine_grained_config, replicas, load_balancer_handle, relay=None, gpu_pool=None
+    ):
         super().__init__(
             config=checkpoint_config,
             actor_wg=None,
@@ -29,6 +31,7 @@ class SnapshotCheckpointEngineManager(base.CheckpointEngineManager):
         self._require_fine_grained()
         self._snapshot = None
         self.relay = relay
+        self.gpu_pool = gpu_pool
         self._local_snapshots = None
 
     async def update_replica_from_snapshot(self, snapshot, replica_rank: int, recovery: bool = False) -> dict:
@@ -37,7 +40,12 @@ class SnapshotCheckpointEngineManager(base.CheckpointEngineManager):
         async with self._weight_update_lock:
             self._snapshot = snapshot
             pinned = False
+            gpu_pinned = False
             try:
+                if self.gpu_pool is not None:
+                    self.gpu_pool.validate(snapshot)
+                    self.gpu_pool.slots.pin(snapshot.version)
+                    gpu_pinned = True
                 if self.relay is not None:
                     self.relay.pin(snapshot)
                     pinned = True
@@ -45,6 +53,8 @@ class SnapshotCheckpointEngineManager(base.CheckpointEngineManager):
                     [self._replica(replica_rank)], snapshot.version, recovery=recovery
                 )
             finally:
+                if gpu_pinned:
+                    self.gpu_pool.slots.unpin(snapshot.version)
                 if pinned:
                     self.relay.unpin(snapshot)
                 self._snapshot = None
@@ -58,6 +68,9 @@ class SnapshotCheckpointEngineManager(base.CheckpointEngineManager):
     async def _transfer_replica_weights(self, replica, global_steps: int) -> dict:
         if self._snapshot is None or self._snapshot.version != global_steps:
             raise RuntimeError("replica update requires a matching immutable snapshot")
+        if self.gpu_pool is not None:
+            await self.gpu_pool.install(replica, self._snapshot)
+            return {}
         rollout = base.RayWorkerGroup(
             worker_handles=replica.workers,
             ray_cls_with_init=base.RayClassWithInitArgs(cls=base._worker_cls),
@@ -86,18 +99,31 @@ class WeightPublisher:
         joint_scheduling_config=None,
         relay_config=None,
         source_node_id=None,
+        gpu_snapshot_config=None,
     ):
         from verl.checkpoint_engine.weight_scheduler import WeightPublicationScheduler
 
         if not replicas:
             raise ValueError("weight publication requires standalone rollout replicas")
         self.relay = None
+        self.gpu_pool = None
+        if gpu_snapshot_config is not None:
+            from verl.checkpoint_engine.gpu_snapshot_pool import GPUSnapshotPool
+
+            if relay_config is not None:
+                raise ValueError("GPU snapshots and CPU relay are separate transports")
+            self.gpu_pool = GPUSnapshotPool(replicas, gpu_snapshot_config)
         if relay_config is not None:
             from verl.checkpoint_engine.relay_distribution import RelayDistribution
 
             self.relay = RelayDistribution(replicas, source_node_id, relay_config)
         manager = SnapshotCheckpointEngineManager(
-            checkpoint_config, fine_grained_config, replicas, load_balancer_handle, relay=self.relay
+            checkpoint_config,
+            fine_grained_config,
+            replicas,
+            load_balancer_handle,
+            relay=self.relay,
+            gpu_pool=self.gpu_pool,
         )
         self.rollouter = rollouter
         self.last_commit_metrics = {}
@@ -110,6 +136,8 @@ class WeightPublisher:
         self.last_commit_metrics = {"version": version, "metrics": metrics}
 
     async def publish(self, snapshot) -> dict:
+        if getattr(self, "gpu_pool", None) is not None:
+            self.gpu_pool.validate(snapshot)
         if getattr(self, "relay", None) is not None and callable(getattr(self.relay, "validate", None)):
             self.relay.validate(snapshot)
         result = await self.scheduler.publish(snapshot)
@@ -120,10 +148,48 @@ class WeightPublisher:
     async def get_status(self) -> dict:
         status = await self.scheduler.get_status()
         status["last_commit"] = self.last_commit_metrics
+        if getattr(self, "gpu_pool", None) is not None:
+            status["gpu_pool"] = self.gpu_pool.status()
+            status["fatal_error"] = status["fatal_error"] or status["gpu_pool"]["fatal_error"]
         if getattr(self, "relay", None) is not None:
             status["relay"] = self.relay.get_status()
             status["fatal_error"] = status["fatal_error"] or status["relay"]["fatal_error"]
         return status
+
+    async def configure_gpu(self, publisher):
+        self.gpu_pool.publisher = publisher
+        return await self.gpu_pool.describe()
+
+    async def initialize_gpu(self):
+        return await self.gpu_pool.initialize()
+
+    async def begin_gpu_snapshot(self, version):
+        return await self.gpu_pool.begin(version)
+
+    async def prepare_gpu_input(self, version, name, shape, dtype):
+        return await self.gpu_pool.prepare_input(version, name, shape, dtype)
+
+    async def finish_gpu_input(self):
+        return await self.gpu_pool.finish_input()
+
+    async def seal_gpu_snapshot(self, version):
+        return await self.gpu_pool.seal(version)
+
+    async def gpu_fetch_tensor(self, snapshot, worker_index, name, key):
+        return await self.gpu_pool.fetch_tensor(snapshot, worker_index, name, key)
+
+    async def fail_gpu_snapshot(self, error):
+        self.gpu_pool.fatal_error = str(error)
+
+    async def quiesce_gpu(self, drain: bool = True):
+        """Drain publications and transfers before any NCCL rank starts teardown."""
+        result = await self.scheduler.close(drain=drain)
+        await self.gpu_pool.quiesce()
+        return result
+
+    async def close_gpu(self):
+        """Close storage ranks concurrently with the trainer's source rank."""
+        await self.gpu_pool.close()
 
     async def wait_for_version(self, version: int, timeout_s: float = 600.0) -> dict:
         return await self.scheduler.wait_for_version(version, timeout_s)
@@ -171,6 +237,10 @@ class WeightPublisher:
             await asyncio.sleep(0.5)
 
     async def close(self, drain: bool = True):
+        if getattr(self, "gpu_pool", None) is not None:
+            result = await self.quiesce_gpu(drain=drain)
+            await self.close_gpu()
+            return result
         try:
             return await self.scheduler.close(drain=drain)
         finally:

@@ -47,12 +47,17 @@ from verl.utils.device import (
     get_resource_name,
     get_torch_device,
     get_visible_devices_keyword,
+    set_expandable_segments,
 )
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.rtp_llm_rollout.build_capabilities import require_remote_cache_build
-from verl.workers.rollout.rtp_llm_rollout.ray_weight_transfer import rebuild_ipc_tensor, rebuild_shared_memory
+from verl.workers.rollout.rtp_llm_rollout.ray_weight_transfer import (
+    rebuild_ipc_tensor,
+    rebuild_shared_memory,
+    serialize_ipc_tensor,
+)
 from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 
 logger = logging.getLogger(__file__)
@@ -173,6 +178,8 @@ class RTPLLMHttpServer:
         self._weight_update_lock = asyncio.Lock()
         self._weight_update: Optional[dict[str, Any]] = None
         self._weight_sync_error: Optional[str] = None
+        self._gpu_snapshot_lock = asyncio.Lock()
+        self._gpu_snapshot: Optional[dict[str, Any]] = None
 
         self.engine = None
         self.visitor = None
@@ -326,17 +333,29 @@ class RTPLLMHttpServer:
         tp_size = getattr(self.config, "tensor_model_parallel_size", 1)
         weights_mib = math.ceil(_checkpoint_size_mib(self.model_config.local_path) / tp_size)
         reserve_mib = max(2048, int(0.05 * total_mib))
+        snapshot_reserve_mib = 0
+        publication = getattr(self.config, "weight_publication", None)
+        if getattr(publication, "transport", None) == "nccl_gpu":
+            snapshot = publication.gpu_snapshot
+            snapshot_reserve_mib = (
+                math.ceil(
+                    (snapshot.max_bytes_per_gpu + snapshot.max_conversion_bytes + snapshot.max_tensor_bytes)
+                    / (1024 * 1024)
+                )
+                + self.config.checkpoint_engine.update_weights_bucket_megabytes
+            )
         budget_mib = int(self.config.gpu_memory_utilization * total_mib)
-        kv_mib = budget_mib - weights_mib - reserve_mib
+        kv_mib = budget_mib - weights_mib - reserve_mib - snapshot_reserve_mib
         if kv_mib < 1024:
             raise ValueError(
                 f"gpu_memory_utilization={self.config.gpu_memory_utilization} leaves only {kv_mib} MiB for the "
-                f"kv cache (total={total_mib} MiB, weights={weights_mib} MiB, runtime reserve={reserve_mib} MiB). "
+                f"kv cache (total={total_mib} MiB, weights={weights_mib} MiB, runtime reserve={reserve_mib} MiB, "
+                f"GPU snapshot reserve={snapshot_reserve_mib} MiB). "
                 f"Raise gpu_memory_utilization."
             )
         logger.info(
             f"rtp-llm memory plan: total={total_mib} MiB weights={weights_mib} MiB "
-            f"reserve={reserve_mib} MiB kv_cache={kv_mib} MiB"
+            f"reserve={reserve_mib} MiB snapshot_reserve={snapshot_reserve_mib} MiB kv_cache={kv_mib} MiB"
         )
         return kv_mib
 
@@ -581,6 +600,25 @@ class RTPLLMHttpServer:
             with get_torch_device().device(self.tp_rank):
                 return fn(*args, **kwargs)
         return fn(*args, **kwargs)
+
+    async def _settled_device_call(self, function, *args):
+        """Keep native owners and locks alive until a cancelled worker thread settles."""
+        task = asyncio.create_task(asyncio.to_thread(self._run_on_device, function, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    break
+            try:
+                task.result()
+            except Exception:
+                logger.exception("Native RTP operation failed while settling cancellation")
+            raise
 
     def configure_tp_peers(self, peers: list[ActorHandle]):
         self._tp_peers = peers
@@ -1265,6 +1303,94 @@ class RTPLLMHttpServer:
         if self.rollout_mode != RolloutMode.STANDALONE:
             raise ValueError(f"rtp-llm rollout only supports standalone mode, got {self.rollout_mode}")
 
+    async def describe_gpu_snapshot(self):
+        """Return local runtime metadata while serving remains available."""
+        async with self._gpu_snapshot_lock:
+
+            def describe():
+                converter = self.weight_manager.create_runtime_snapshot_converter(1)
+                try:
+                    return {
+                        "layout": self.weight_manager.get_runtime_weight_layout(),
+                        "required_names": sorted(converter.required_names),
+                        "ignored_source_names": sorted(converter.ignored_source_names),
+                    }
+                finally:
+                    converter.close()
+
+            return await self._settled_device_call(describe)
+
+    async def begin_gpu_snapshot(self, version: int, max_pending_bytes: int):
+        async with self._gpu_snapshot_lock:
+            if self._gpu_snapshot is not None:
+                raise RuntimeError("a GPU snapshot conversion is already active")
+            if type(version) is not int or version < 0:
+                raise ValueError("GPU snapshot version must be a non-negative integer")
+
+            def begin():
+                set_expandable_segments(False)
+                converter = self.weight_manager.create_runtime_snapshot_converter(max_pending_bytes)
+                self._gpu_snapshot = {"version": version, "converter": converter, "outputs": [], "failed": False}
+                return {"version": version, "required_names": sorted(converter.required_names)}
+
+            return await self._settled_device_call(begin)
+
+    async def convert_gpu_snapshot(self, name: Optional[str], payload: Optional[bytes], is_last: bool = False):
+        async with self._gpu_snapshot_lock:
+            state = self._gpu_snapshot
+            if state is None or state["failed"]:
+                raise RuntimeError("GPU snapshot conversion is inactive or failed")
+            if state["outputs"]:
+                raise RuntimeError("release GPU snapshot outputs after DMA before converting another input")
+            if (name is None) != (payload is None) or (name is None and not is_last):
+                raise ValueError("snapshot input requires a name and CUDA IPC payload, or an empty final call")
+
+            def convert():
+                inputs = []
+                if payload is not None:
+                    tensor = rebuild_ipc_tensor(payload, get_device_id())
+                    if tensor.device.type != "cuda":
+                        raise ValueError("GPU snapshot input must be a CUDA IPC tensor")
+                    inputs.append((name, tensor))
+                # Save owners before serializing or returning; cancellation cannot
+                # discard storage which a coordinator may already have mapped.
+                state["outputs"] = state["converter"].add(inputs, is_last=is_last)
+                result = []
+                for key, tensor in state["outputs"]:
+                    if tensor.device.type != "cuda":
+                        raise ValueError("GPU snapshot output must be a CUDA tensor")
+                    result.append(
+                        {
+                            "name": key,
+                            "shape": list(tensor.shape),
+                            "dtype": str(tensor.dtype),
+                            "payload": serialize_ipc_tensor(tensor),
+                        }
+                    )
+                return result
+
+            try:
+                return await self._settled_device_call(convert)
+            except BaseException:
+                state["failed"] = True
+                raise
+
+    async def release_gpu_snapshot_outputs(self):
+        """Coordinator acknowledgement that all output DMA has completed."""
+        async with self._gpu_snapshot_lock:
+            if self._gpu_snapshot is not None:
+                self._gpu_snapshot["outputs"].clear()
+
+    async def close_gpu_snapshot(self):
+        async with self._gpu_snapshot_lock:
+            state = self._gpu_snapshot
+            if state is None:
+                return
+            if state["outputs"]:
+                raise RuntimeError("release GPU snapshot outputs after DMA before closing")
+            await self._settled_device_call(state["converter"].close)
+            self._gpu_snapshot = None
+
     async def begin_weight_update_from_ipc(self, round_id: str, descriptor: dict[str, Any]):
         """Register a reusable IPC buffer for one Ray-controlled update round."""
         async with self._weight_update_lock:
@@ -1277,6 +1403,11 @@ class RTPLLMHttpServer:
                     raise RuntimeError(f"weight update refused while {len(self._inflight)} request(s) remain in flight")
 
             method = descriptor.get("method")
+            wire_format = descriptor.get("wire_format", "named_tensors")
+            if wire_format not in {"named_tensors", "runtime_tensors"}:
+                raise ValueError(f"unsupported weight wire format: {wire_format!r}")
+            if wire_format == "runtime_tensors" and method != "cuda_ipc":
+                raise ValueError("runtime tensor installation requires CUDA IPC")
             device = torch.device(get_device_name(), get_device_id())
             if method == "cuda_ipc":
                 buffer = rebuild_ipc_tensor(descriptor["payload"], device.index)
@@ -1289,6 +1420,7 @@ class RTPLLMHttpServer:
             self._weight_update = {
                 "round_id": round_id,
                 "method": method,
+                "wire_format": wire_format,
                 "buffer": buffer,
                 "shm": shm,
                 "next_sequence": 0,
@@ -1316,11 +1448,16 @@ class RTPLLMHttpServer:
             weights = self._rebuild_weight_bucket(state, entries)
 
             def apply_bucket():
-                self.weight_manager.update_from_hf_tensors(weights, is_last=is_last)
+                update = (
+                    self.weight_manager.update_from_runtime_tensors
+                    if state.get("wire_format") == "runtime_tensors"
+                    else self.weight_manager.update_from_hf_tensors
+                )
+                update(weights, is_last=is_last)
                 get_torch_device().synchronize()
 
             try:
-                await asyncio.to_thread(self._run_on_device, apply_bucket)
+                await self._settled_device_call(apply_bucket)
             except BaseException as error:
                 self._weight_sync_error = f"weight update {round_id} failed in bucket {sequence}: {error}"
                 raise
@@ -1355,10 +1492,11 @@ class RTPLLMHttpServer:
             if round_id is None:
                 round_id = self._weight_update["round_id"]
             state = self._require_weight_update(round_id)
-            abort_fn = getattr(self.weight_manager, "abort_hf_update", None)
+            abort_name = "abort_runtime_update" if state.get("wire_format") == "runtime_tensors" else "abort_hf_update"
+            abort_fn = getattr(self.weight_manager, abort_name, None)
             try:
                 if abort_fn is not None:
-                    await asyncio.to_thread(abort_fn)
+                    await self._settled_device_call(abort_fn)
             finally:
                 try:
                     self._close_weight_update(state)
@@ -1510,6 +1648,7 @@ class RTPLLMReplica(RolloutReplica):
                 "LOG_LEVEL",
                 "PYTHONPATH",
                 "ENABLE_FLASHINFER_TRTLLM_GEN",
+                "MASTER_METRICS",
             ):
                 if value := os.environ.get(var):
                     env_vars[var] = value

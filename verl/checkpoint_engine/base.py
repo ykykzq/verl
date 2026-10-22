@@ -375,6 +375,37 @@ class CheckpointEngineWorker(Worker):
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def gpu_snapshot_rpc(self, method: str, *args):
+        from verl.checkpoint_engine.gpu_snapshot_transport import GPUSnapshotWorker
+
+        if self.rollout_config.weight_publication.transport != "nccl_gpu":
+            raise ValueError("GPU snapshot RPC requires nccl_gpu publication")
+        if not hasattr(self, "_gpu_snapshot_worker"):
+            self._gpu_snapshot_worker = GPUSnapshotWorker(
+                self.server_adapter, self.rollout_config.weight_publication.gpu_snapshot
+            )
+        if method.startswith("_") or method not in {
+            "describe",
+            "unique_id",
+            "initialize",
+            "close",
+            "reserve",
+            "begin_conversion",
+            "allocate",
+            "receive_input",
+            "convert",
+            "release_outputs",
+            "finish_conversion",
+            "store_chunk",
+            "send_output",
+            "send_chunk",
+            "receive_chunk",
+            "install",
+        }:
+            raise ValueError(f"unsupported GPU snapshot RPC {method!r}")
+        return await getattr(self._gpu_snapshot_worker, method)(*args)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights_from_snapshot(self, snapshot):
         """Install an immutable export without involving any training worker."""
         await self._install_weight_snapshot(snapshot)

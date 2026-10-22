@@ -177,6 +177,94 @@ async def test_barrier_waits_for_serving_commit_and_times_out_without_cancelling
 
 
 @pytest.mark.asyncio
+async def test_timeout_reports_versions_and_replica_progress_without_payloads():
+    manager = Manager((0, 0, 0, 0))
+    scheduler = WeightPublicationScheduler(manager)
+    try:
+        await scheduler.publish(Snapshot(1))
+        await scheduler.wait_for_version(1, timeout_s=1)
+        while not manager.started.empty():
+            manager.started.get_nowait()
+        await scheduler.pin_replica(1, "private pin reason")
+        manager.states[2].update(lifecycle_state="QUARANTINED", last_update_error="private backend endpoint")
+        manager.release.clear()
+        await scheduler.publish(Snapshot(2, buckets=("private transport payload",)))
+        assert await next_transfer(manager) == (0, 2, False)
+        await scheduler.publish(Snapshot(3))
+
+        with pytest.raises(asyncio.TimeoutError, match="weight publication") as failure:
+            await scheduler.wait_for_version(3, timeout_s=0.01)
+        diagnostic = failure.value.diagnostics
+        assert diagnostic["requested_version"] == 3
+        assert diagnostic["committed_version"] == 1
+        assert diagnostic["latest_version"] == 3
+        assert diagnostic["pending_version"] == 3
+        assert diagnostic["active_version"] == 2
+        assert diagnostic["active_replica_rank"] == 0
+        assert diagnostic["phase"] == "replica_update"
+        assert diagnostic["replica_counts"] == {
+            "total": 4,
+            "serving": 2,
+            "serving_requested_version": 0,
+            "pending_eligible": 2,
+            "pinned": 1,
+            "quarantined": 1,
+        }
+        assert diagnostic["replicas"][0]["lifecycle_state"] == "UPDATING"
+        assert diagnostic["replicas"][1]["pinned"] is True
+        assert diagnostic["replica_states_age_s"] >= 0
+        assert "private" not in str(failure.value)
+        assert manager.active == 1
+        manager.release.set()
+        await scheduler.wait_for_version(3, timeout_s=1)
+    finally:
+        manager.release.set()
+        await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_timeout_does_not_issue_another_rpc_when_replica_state_query_hangs():
+    class UnresponsiveManager(Manager):
+        def __init__(self):
+            super().__init__()
+            self.state_queries = 0
+
+        async def get_replica_states(self):
+            self.state_queries += 1
+            await asyncio.Event().wait()
+
+    manager = UnresponsiveManager()
+    scheduler = WeightPublicationScheduler(manager)
+    with pytest.raises(asyncio.TimeoutError, match="weight publication") as failure:
+        await asyncio.wait_for(scheduler.wait_for_version(1, timeout_s=0.01), timeout=0.2)
+    diagnostic = failure.value.diagnostics
+    assert diagnostic["state_query_pending"] is True
+    assert diagnostic["replica_states_age_s"] is None
+    assert diagnostic["replicas"] == {}
+    assert manager.state_queries == 1
+
+
+@pytest.mark.asyncio
+async def test_slow_install_completes_within_configured_wait_budget():
+    manager = Manager((0,))
+    manager.release.clear()
+    scheduler = WeightPublicationScheduler(manager)
+    try:
+        await scheduler.publish(Snapshot(1))
+        await next_transfer(manager)
+        waiting = asyncio.create_task(scheduler.wait_for_version(1, timeout_s=1))
+        await asyncio.sleep(0.03)
+        assert not waiting.done()
+        manager.release.set()
+        result = await waiting
+        assert result["committed_version"] == 1
+        assert manager.states[0]["weight_version"] == 1
+    finally:
+        manager.release.set()
+        await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_all_quarantined_barrier_fails_actionably_instead_of_waiting_for_timeout():
     manager = Manager((0,))
     manager.failed_ranks.add(0)
@@ -376,8 +464,9 @@ async def test_barrier_waits_for_commit_callback_and_recovery_does_not_repeat_it
     try:
         await scheduler.publish(Snapshot(1))
         await asyncio.wait_for(entered.wait(), 1)
-        with pytest.raises(asyncio.TimeoutError):
+        with pytest.raises(asyncio.TimeoutError) as failure:
             await scheduler.wait_for_version(1, timeout_s=0.01)
+        assert failure.value.diagnostics["phase"] == "commit_callback"
         release.set()
         await scheduler.wait_for_version(1, timeout_s=1)
         manager.states[0]["lifecycle_state"] = "QUARANTINED"
