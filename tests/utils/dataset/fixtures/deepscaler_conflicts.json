@@ -1,0 +1,26 @@
+{
+  "source": "agentica-org/DeepScaleR-Preview-Dataset",
+  "revision": "4500022f6cb0a1456ea5eabe2ff366d4610ee339",
+  "rows": [
+    {
+      "original_index": 538,
+      "problem": "Tetrahedron $ABCD$ has $AB=5$, $AC=3$, $BC=4$, $BD=4$, $AD=3$, and $CD=\\frac{12}5\\sqrt2$. What is the volume of the tetrahedron?",
+      "answer": "$\\frac{24}5$"
+    },
+    {
+      "original_index": 636,
+      "problem": "Tetrahedron $ABCD$ has $AB=5$, $AC=3$, $BC=4$, $BD=4$, $AD=3$, and $CD=\\frac{12}5\\sqrt2$.  What is the volume of the tetrahedron?",
+      "answer": "\\frac{24}{5}"
+    },
+    {
+      "original_index": 56,
+      "problem": "Two long cylindrical tubes of the same length but different diameters lie parallel to each other on a flat surface. The larger tube has radius $72$ and rolls along the surface toward the smaller tube, which has radius $24$. It rolls over the smaller tube and continues rolling along the flat surface until it comes to rest on the same point of its circumference as it started, having made one complete revolution. If the smaller tube never moves, and the rolling occurs with no slipping, the larger tube ends up a distance $x$ from where it starts. The distance $x$ can be expressed in the form $a\\pi+b\\sqrt{c},$ where $a,$ $b,$ and $c$ are integers and $c$ is not divisible by the square of any prime. Find $a+b+c.$",
+      "answer": "312"
+    },
+    {
+      "original_index": 6906,
+      "problem": "Two long cylindrical tubes of the same length but different diameters lie parallel to each other on a flat surface. The larger tube has radius $72$ and rolls along the surface toward the smaller tube, which has radius $24$. It rolls over the smaller tube and continues rolling along the flat surface until it comes to rest on the same point of its circumference as it started, having made one complete revolution. If the smaller tube never moves, and the rolling occurs with no slipping, the larger tube ends up a distance $x$ from where it starts. The distance $x$ can be expressed in the form $a\\pi+b\\sqrt{c},$ where $a,$ $b,$ and $c$ are integers and $c$ is not divisible by the square of any prime. Find $a+b+c.$",
+      "answer": "179"
+    }
+  ]
+}

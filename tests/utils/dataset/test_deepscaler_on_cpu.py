@@ -1,5 +1,6 @@
 """DeepScaleR preprocessing, reward routing and RTP launcher integration."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -90,6 +91,7 @@ def test_preprocessing_preserves_answers_without_leakage_and_deduplicates_before
     assert manifest["train_rows"] == 4
     assert manifest["test_rows"] == 2
     assert manifest["revision"] is None  # Local data must not claim the upstream commit.
+    assert manifest["input_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
 
     repeated = tmp_path / "repeated"
     result = preprocess(source, repeated, "--test_size", "2", "--seed", "17")
@@ -117,6 +119,19 @@ def test_split_must_leave_nonempty_training_and_validation_sets(tmp_path, test_s
     assert "test_size" in result.stderr
 
 
+def test_existing_outputs_cannot_be_mixed_with_a_failed_or_new_run(tmp_path):
+    source = tmp_path / "raw.json"
+    source.write_text(json.dumps([{"problem": "A", "answer": "1"}, {"problem": "B", "answer": "2"}]))
+    output = tmp_path / "out"
+    assert preprocess(source, output, "--test_size", "1").returncode == 0
+    original = {path.name: path.read_bytes() for path in output.iterdir()}
+    source.write_text(json.dumps([{"problem": "A", "answer": "1"}, {"problem": "A", "answer": "2"}]))
+    result = preprocess(source, output, "--test_size", "1")
+    assert result.returncode != 0
+    assert "fresh output directory" in result.stderr
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == original
+
+
 @pytest.mark.parametrize("source", [SOURCE, "deepscaler"])
 @pytest.mark.parametrize(
     "response,answer,expected",
@@ -127,10 +142,159 @@ def test_split_must_leave_nonempty_training_and_validation_sets(tmp_path, test_s
         ("unfinished reasoning, 42", "42", 0.0),
         (r"\boxed{1} corrected to \boxed{2}", "2", 1.0),
         ("\\boxed{" + "1," * 200 + "2}", "1," * 200 + "2", 1.0),
+        (r"\boxed{$87.50}", "$87.50", 1.0),
+        (r"\boxed{337}", r"\boxed{337}", 1.0),
     ],
 )
 def test_deepscaler_scores_math_answers_without_tail_truncation(source, response, answer, expected):
     assert default_compute_score(source, response, answer) == expected
+
+
+def real_cases():
+    fixture = Path(__file__).parent / "fixtures/deepscaler_conflicts.json"
+    return json.loads(fixture.read_text())["rows"]
+
+
+@pytest.mark.parametrize("source", [SOURCE, "deepscaler"])
+@pytest.mark.parametrize("answer", [r"$\frac{24}5$", r"\frac{24}{5}"])
+def test_real_fraction_formats_have_identical_rewards(source, answer):
+    assert default_compute_score(source, r"\boxed{\frac{24}{5}}", answer) == 1.0
+    assert default_compute_score(source, r"\boxed{\frac{23}{5}}", answer) == 0.0
+    assert default_compute_score(source, r"\boxed{\frac{24}{5}} then \boxed{7}", answer) == 0.0
+    assert default_compute_score(source, r"\frac{24}{5}", answer) == 0.0
+
+
+def test_equivalent_real_duplicates_share_normalized_truth_and_keep_original_answers(tmp_path):
+    source = tmp_path / "real.json"
+    rows = real_cases()[:2] + [{"problem": "Other question", "answer": "42"}]
+    source.write_text(json.dumps(rows))
+    output = tmp_path / "out"
+    result = preprocess(source, output, "--test_size", "1")
+    assert result.returncode == 0, result.stderr
+    prepared = sum((pq.read_table(output / f"{split}.parquet").to_pylist() for split in ("train", "test")), [])
+    tetrahedron = next(row for row in prepared if row["prompt"][0]["content"].startswith("Tetrahedron"))
+    assert tetrahedron["reward_model"]["ground_truth"] == r"\frac{24}{5}"
+    assert tetrahedron["extra_info"]["source_indices"] == [0, 1]
+    assert tetrahedron["extra_info"]["source_answers"] == [r"$\frac{24}5$", r"\frac{24}{5}"]
+    assert default_compute_score(SOURCE, r"\boxed{\frac{24}5}", tetrahedron["reward_model"]["ground_truth"]) == 1.0
+    assert tetrahedron["prompt"][0]["content"] == (
+        rows[0]["problem"] + "\n\nLet's think step by step and output the final answer within \\boxed{}."
+    )
+
+
+@pytest.mark.parametrize("policy", ["error", "drop"])
+def test_real_conflict_policy_writes_complete_audit_and_never_selects_one_label(tmp_path, policy):
+    source = tmp_path / "real.json"
+    source.write_text(json.dumps(real_cases() + [{"problem": "Other question", "answer": "42"}]))
+    output = tmp_path / "out"
+    result = preprocess(source, output, "--test_size", "1", "--conflict_policy", policy)
+    assert (result.returncode == 0) == (policy == "drop"), result.stderr
+    manifest = json.loads((output / "manifest.json").read_text())
+    audit = json.loads((output / "audit.json").read_text())
+    assert manifest["conflict_policy"] == policy
+    assert manifest["normalization_version"] == audit["normalization_version"]
+    assert manifest["input_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert manifest["conflict_groups"] == 1
+    assert manifest["conflict_rows"] == 2
+    assert manifest["equivalent_duplicate_rows"] == 1
+    assert len(audit["conflicts"]) == 1
+    assert audit["conflicts"][0]["rows"] == [
+        {"index": 2, "raw_answer": "312", "normalized_answer": "312"},
+        {"index": 3, "raw_answer": "179", "normalized_answer": "179"},
+    ]
+    if policy == "error":
+        assert manifest["status"] == "conflicts"
+        assert not (output / "train.parquet").exists()
+        assert not (output / "test.parquet").exists()
+    else:
+        assert manifest["status"] == "ready"
+        assert manifest["quarantined_rows"] == 2
+        assert (manifest["train_rows"], manifest["test_rows"]) == (1, 1)
+        prepared = sum((pq.read_table(output / f"{split}.parquet").to_pylist() for split in ("train", "test")), [])
+        assert all("cylindrical" not in row["prompt"][0]["content"] for row in prepared)
+
+
+def test_mixed_duplicate_groups_are_resolved_before_order_independent_splitting():
+    from datasets import Dataset
+
+    from examples.data_preprocess.deepscaler import prepare_splits
+
+    rows = [
+        {"problem": "A", "answer": r"$\frac12$"},
+        {"problem": "A", "answer": "0.5"},
+        {"problem": "A", "answer": r"\frac{1}{2}"},
+        {"problem": "B", "answer": "312"},
+        {"problem": "B", "answer": "179"},
+        {"problem": "B", "answer": "$312$"},
+        {"problem": "C", "answer": "42"},
+        {"problem": "D", "answer": "43"},
+        {"problem": None, "answer": "1"},
+        {"problem": "Empty", "answer": None},
+        {"problem": "Empty math", "answer": "$ $"},
+    ]
+    previous = None
+    for ordered in (rows, list(reversed(rows)), rows):
+        splits, stats, audit = prepare_splits(Dataset.from_list(ordered), test_size=1, seed=42, conflict_policy="drop")
+        prompts = {
+            split: {row["prompt"][0]["content"].split("\n")[0] for row in data} for split, data in splits.items()
+        }
+        assert prompts["train"].isdisjoint(prompts["test"])
+        assert prompts["train"] | prompts["test"] == {"A", "C", "D"}
+        if previous is not None:
+            assert prompts == previous
+        previous = prompts
+        assert stats["equivalent_duplicate_rows"] == 2
+        assert stats["quarantined_rows"] == 3
+        assert stats["dropped_empty_problem"] == 1
+        assert stats["dropped_empty_answer"] == 2
+        assert stats["train_rows"] + stats["test_rows"] + 2 + 3 + 1 + 2 == len(rows)
+        assert len(audit["conflicts"][0]["rows"]) == 3
+
+
+@pytest.mark.parametrize(
+    "answer,expected",
+    [
+        (r"$\frac{24}5$", r"\frac{24}{5}"),
+        (r"\(\dfrac{24}{5}\)", r"\frac{24}{5}"),
+        (r"$$\tfrac{48}{10}$$", r"\frac{24}{5}"),
+        ("4.8", r"\frac{24}{5}"),
+        (r"\sqrt2", r"\sqrt{2}"),
+        (r"\sqrt[3]{2}", r"\sqrt[3]{2}"),
+        (r"\text{a b}", r"\text{a b}"),
+        (r"\[\frac{24}5\]", r"\frac{24}{5}"),
+        (r"\frac{1}{0}", r"\frac{1}{0}"),
+        (r"\frac{24}{", r"\frac{24}{"),
+        (r"2007 + \frac\pi 2", r"2007 + \frac{\pi}{2}"),
+        (r"\boxed{337}", "337"),
+        (r"$\boxed{337}$", "337"),
+        (r"$ \boxed{2, 3, 7} $", "2, 3, 7"),
+        ("$87.50", "$87.50"),
+        (r"\$24", r"\$24"),
+        ("$1$ and $2$", "$1$ and $2$"),
+    ],
+)
+def test_normalization_preserves_math_structure(answer, expected):
+    from verl.utils.reward_score.deepscaler import normalize_answer
+
+    assert normalize_answer(answer) == expected
+    assert normalize_answer(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "response,answer",
+    [
+        (r"\boxed{4.8000000001}", "4.8"),
+        (r"\boxed{12}", "1,2"),
+        (r"\boxed{\text{ab}}", r"\text{a b}"),
+        (r"\boxed{1} then \boxed{", "1"),
+        (r"\boxed{}", "$ $"),
+        (r"\boxed{1} then \boxed 2", "1"),
+        (r"\boxed{1} then \boxed", "1"),
+        (r"\boxed % last", "1"),
+    ],
+)
+def test_reward_does_not_guess_equivalence_or_use_an_earlier_box(response, answer):
+    assert default_compute_score(SOURCE, response, answer) == 0.0
 
 
 def test_deepscaler_launcher_composes_with_tp4_and_gpu_publication_overrides(tmp_path):
