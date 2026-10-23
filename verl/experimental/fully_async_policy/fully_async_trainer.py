@@ -684,11 +684,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 break
 
         self.progress_bar.close()
-        if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
-            rollout_reset_timing_raw = await self._fit_update_weights()
-            if rollout_reset_timing_raw is not None:
-                self._fit_log_aggregated_training_metrics(rollout_reset_timing_raw)
-            await self._fit_validate()
+        # Completed cycles already synchronized and validated in fit_step(). Flush
+        # any partial cycle without publishing weights or advancing its version.
+        if self.metrics_aggregator.step_count > 0:
+            self._fit_log_aggregated_training_metrics({})
         self._fit_save_checkpoint(force=True)
 
     async def fit_step(self, batch_dict: dict = None):
@@ -757,9 +756,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_save_checkpoint()
         self._fit_stop_profile(should_profiler=should_profile)
         self._fit_collect_metrics(batch)
+        self._fit_postprocess_step()
         if rollout_reset_timing_raw is not None:
             self._fit_log_aggregated_training_metrics(rollout_reset_timing_raw)
-        self._fit_postprocess_step()
 
     # Timing-raw keys that represent actual training-GPU compute, from
     # _fit_compute_reward() through _fit_update_actor(). Some keys may be
@@ -1015,7 +1014,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         return timing
 
     def _fit_log_aggregated_training_metrics(self, rollout_reset_timing_raw: dict):
-        """Log aggregated training metrics for the sync cycle just finished.
+        """Log aggregated training metrics by synchronization-cycle index.
+
+        A final partial cycle uses the next log index without advancing the
+        parameter version, which is recorded separately as training/param_version.
 
         Args:
             rollout_reset_timing_raw: timing_raw dict returned by _fit_update_weights()
@@ -1030,9 +1032,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             rollout_resource_utilization=rollout_reset_timing_raw.get("dynamic_resource/rollout_resource_utilization"),
         )
         if aggregated_metrics:
+            aggregated_metrics["training/param_version"] = self.current_param_version
+            # Reusing the previous cycle's step would overwrite its metrics in W&B.
+            log_step = self.current_param_version + int(self.local_trigger_step > 1)
             self.logger.log(
                 data=aggregated_metrics,
-                step=self.current_param_version,
+                step=log_step,
             )
         self.metrics_aggregator.reset()
 

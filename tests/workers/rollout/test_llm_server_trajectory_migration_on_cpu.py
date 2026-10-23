@@ -236,6 +236,101 @@ def _migration_config():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [False, True])
+async def test_short_prefix_defers_releases_reservation_and_retries_next_checkpoint(strict):
+    source = _TransferServer("source")
+    target = _TransferServer("target")
+    balancer = _RollbackLoadBalancer(source, target)
+    config = _migration_config()
+    config.actor_rollout_ref.rollout.trajectory_migration.strict_remote_hit = strict
+    client = FullyAsyncLLMServerClient(config=config, load_balancer_handle=balancer)
+    source.prepare_trajectory_migration = _RemoteMethod(
+        lambda **kwargs: {"status": "deferred", "reason": "no_complete_block", "minimum_prefix_tokens": 5}
+    )
+    output = TokenOutput(token_ids=[10, 11])
+
+    async def attempt(index):
+        return await client._try_migrate_trajectory(
+            request_id="short-prefix",
+            source_server_id="s0",
+            prompt_ids=[1, 2],
+            final_output=output,
+            checkpoint_index=index,
+            source_weight_version=7,
+            sampling_params={"max_tokens": 6},
+        )
+
+    assert await attempt(1) is None
+    assert balancer.cancels == [{"request_id": "short-prefix", "decision_id": "decision-1"}]
+    assert not balancer.commits
+    assert not target.calls
+    assert not client._migration_retries
+    assert not output.extra_fields.get("trajectory_migration_failures")
+    assert output.extra_fields.get("trajectory_migration_attempts", 0) == 0
+    assert output.extra_fields["trajectory_migration_deferred"] == 1
+
+    output.token_ids.extend([12, 13])
+    source.prepare_trajectory_migration = _RemoteMethod(source._prepare)
+    result = await attempt(2)
+    assert result["target_server_id"] == "s1"
+    assert len(balancer.commits) == 1
+    assert output.extra_fields["trajectory_migration_attempts"] == 1
+    assert output.extra_fields["trajectory_migration_deferred"] == 1
+
+
+@pytest.mark.asyncio
+async def test_short_prefix_continues_locally_then_completes_strict_remote_migration(monkeypatch):
+    segments = iter(
+        [
+            TokenOutput(
+                token_ids=tokens,
+                stop_reason="completed" if final else "length",
+                remote_reuse_len=4 if final else 0,
+                extra_fields={
+                    "global_steps": 7,
+                    "migration_checkpoint": not final,
+                    llm_server._ROUTE_SERVER_ID_FIELD: "s1" if final else "s0",
+                    "remote_migration_hit": final,
+                },
+            )
+            for tokens, final in (([10, 11], False), ([12, 13], False), ([14], True))
+        ]
+    )
+    prompts = []
+
+    async def generate(self, request_id, *, prompt_ids, sampling_params, **kwargs):
+        prompts.append(list(prompt_ids))
+        return next(segments)
+
+    monkeypatch.setattr(llm_server.LLMServerClient, "generate", generate)
+    source = _TransferServer("source")
+    target = _TransferServer("target")
+    balancer = _RollbackLoadBalancer(source, target)
+
+    def prepare(**kwargs):
+        state = kwargs["trajectory_state"]
+        if len(state["prompt_ids"]) + len(state["generated_token_ids"]) <= 4:
+            return {"status": "deferred", "reason": "no_complete_block", "minimum_prefix_tokens": 5}
+        return source._prepare(**kwargs)
+
+    source.prepare_trajectory_migration = _RemoteMethod(prepare)
+    config = _migration_config()
+    config.actor_rollout_ref.rollout.trajectory_migration.strict_remote_hit = True
+    client = FullyAsyncLLMServerClient(config=config, load_balancer_handle=balancer)
+    output = await client.generate("short-prefix", prompt_ids=[1, 2], sampling_params={"max_tokens": 8})
+
+    assert prompts == [[1, 2], [1, 2, 10, 11], [1, 2, 10, 11, 12, 13]]
+    assert output.token_ids == [10, 11, 12, 13, 14]
+    assert output.extra_fields["trajectory_migration_deferred"] == 1
+    assert output.extra_fields["trajectory_migration_attempts"] == 1
+    assert output.extra_fields["trajectory_migration_fallbacks"] == 0
+    assert output.extra_fields["trajectory_migration_failures"] == []
+    assert output.extra_fields["trajectory_remote_hits"] == 1
+    assert len(balancer.cancels) == len(balancer.commits) == 1
+    assert len(target.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_failed_migration_backs_off_without_sleeping_and_recovers(monkeypatch):
     source = _TransferServer("source")
     target = _TransferServer("target", accepted=False)

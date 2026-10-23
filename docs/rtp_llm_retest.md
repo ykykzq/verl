@@ -160,7 +160,7 @@ KVCM RPC 配置；使用自定义 `kvcm_client_config` 或 VIP discovery 时，�
 
 迁移使用原生 `wait_remote_prefix_status(tokens, salt, timeout_ms)`，返回
 `status/error_code/message/write_ids/prefix_tokens`，区分 `success`、`timeout`、
-`write_failed`、`unavailable`。它捕获此次前缀依赖的 full/linear/SWA 缓存块写入记录，
+`write_failed`、`unavailable`、`no_complete_block`。它捕获此次前缀依赖的 full/linear/SWA 缓存块写入记录，
 不等待无关请求，也不受无关历史失败影响。SDK 错误经 TP RPC 保留，日志包含失败 rank。
 TP0 协调的写入只有在所有所需 rank 完成并且 `FinishWrite` 成功后才完成。
 末尾尚未计算 KV 的 sampled token 和不完整缓存块不计入 `prefix_tokens`。
@@ -181,6 +181,14 @@ VERL 启动时要求 `get_build_capabilities()["remote_prefix_write_status"] == 
 超限拒绝不启动 I/O，已接收写入的源 buffer 始终保留到原生操作结束。超时仅结束等待。
 这些界限限制本地排队和元数据，不代表 Mooncake 的可用容量。
 
+同版本 remote-prefix 迁移要求 `prompt_tokens + generated_tokens - 1 >= 实际 KV block 大小`。
+不足时 VERL 在等待写入前返回 `deferred/no_complete_block`，撤销目标 reservation，留在源副本
+解码并在后续 checkpoint 重试；不计迁移尝试、失败或回退，不进入失败退避。
+`rollout/trajectory_migration_deferred/{sum,mean}` 单独统计这种延后。原生查询也返回
+`no_complete_block`、错误码 0、空写入 ID 和零可复用 tokens，不能作为成功凭据。
+例如 block 为 1024 时，1024 tokens 的总前缀仍需延后，1025 tokens 才有一个可复用块。
+已有完整块但写入失败、缺失或超时，仍按原有错误处理；跨版本 token-only recompute 不受此限制。
+
 普通模式失败后撤销迁移 reservation、清理目标状态并在源副本继续；迁移重试按
 `trajectory_migration.retry_backoff_s=1` 到 `max_retry_backoff_s=30` 秒指数退避，
 不通过 sleep 阻塞正常解码。成功、结束或取消后清理退避状态。
@@ -189,12 +197,13 @@ Mooncake 示例脚本默认每 512 token 调度，可通过 `MIGRATION_CHECKPOIN
 长回复仍应配置独立 instance group 和足够的 store/quota；此前 16 GiB/12 GiB 不够的
 容量问题不会被状态修正消除，也不能把所有 51/55 错误直接归为容量不足。
 
-回归测试入口（RTP 仓库内执行，后两项需要该仓库的 CUDA/Bazel 构建环境）：
+回归测试入口（RTP 仓库内执行，需要该仓库的 CUDA/Bazel 构建环境）：
 
 ```bash
 bazel test --config=cuda13_remote_cache //rtp_llm/cpp/cache/block_tree_cache/storage_backend/test:remote_write_ledger_test
 bazel test --config=cuda13_remote_cache //rtp_llm/cpp/cache/block_tree_cache/storage_backend/test:storage_backend_test
 bazel test --config=cuda13_remote_cache //rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/test:all
+bazel test --config=cuda13_remote_cache //rtp_llm/cpp/cache/test:kv_cache_manager_test --test_filter=KVCacheManagerTest.RemotePrefixStatusDistinguishesShortPrefixesFromUnavailableWrites
 ```
 
 硬件恢复验收：注入一个可恢复写入失败，确认受影响前缀持续失败、无关成功前缀可迁移；
@@ -214,6 +223,12 @@ checkpoint 前结束的输入，并使用现有迁移 scorer 确保产生迁移�
 `rollout/{remote_reuse_len,trajectory_migration_attempts,trajectory_remote_hits,trajectory_migration_fallbacks}/{sum,mean}`。
 `remote_reuse_len` 是各段实际复用量之和，可能重复包含同一个前缀，不是唯一 token 数。
 严格迁移模式仅用于专用验收，不适合要求所有短轨迹都迁移的日常训练。
+
+训练指标在本步采集并加入聚合器后输出；队列正常结束时刷新剩余指标，不依赖 `test_freq`，
+也不为日志额外发布快照。日志 step 表示同步周期序号，`training/global_step` 为实际训练步，
+`training/param_version` 为实际发布版本计数。最后未满周期使用下一个日志序号，避免覆盖上一周期；
+例如同步间隔为 2、训练 3 步时，两条记录为 `(日志 1, 训练步 2, 版本 1)` 和
+`(日志 2, 训练步 3, 版本 1)`，不能据日志序号推断发生了第二次权重发布。
 
 有效学习的短程验收增加以下覆盖项（`G > 1`，使用真实 `math` reward）：
 

@@ -1087,6 +1087,14 @@ class RTPLLMHttpServer:
         if source["kv_transfer_namespace"] != target_metadata.get("kv_transfer_namespace"):
             raise RuntimeError("source and target KV transfer namespaces differ")
         prefix = list(trajectory_state["prompt_ids"]) + list(trajectory_state["generated_token_ids"])
+        # The last sampled token has no KV yet. Even an exactly block-sized
+        # prefix must decode one more token before remote-prefix reuse is possible.
+        if len(prefix) <= source["kv_block_size_tokens"]:
+            return {
+                "status": "deferred",
+                "reason": "no_complete_block",
+                "minimum_prefix_tokens": source["kv_block_size_tokens"] + 1,
+            }
         wait_fn = getattr(self.engine, "wait_remote_prefix_status", None)
         if not callable(wait_fn):
             raise RuntimeError("remote-prefix migration requires an RTP wheel with wait_remote_prefix_status")

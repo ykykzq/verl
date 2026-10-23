@@ -230,6 +230,7 @@ class TestRTPLLMKVCacheTransition(unittest.IsolatedAsyncioTestCase):
             return_value={"status": "success", "error_code": 0, "message": "", "write_ids": [12], "prefix_tokens": 3}
         )
         server.engine.wait_remote_prefix_status = wait_prefix
+        server._cfg = SimpleNamespace(kv_cache_config=SimpleNamespace(seq_size_per_block=1))
         server.engine.wait_remote_cache_idle = Mock(side_effect=AssertionError("global fence used"))
         state = {
             "request_id": "trajectory-1",
@@ -297,6 +298,7 @@ class TestRTPLLMTrajectoryAdmission(unittest.IsolatedAsyncioTestCase):
         self.server.model_config = SimpleNamespace(
             local_path="/model", hf_config=SimpleNamespace(architectures=["ModelForCausalLM"])
         )
+        self.server._cfg = SimpleNamespace(kv_cache_config=SimpleNamespace(seq_size_per_block=1))
         self.state = {"request_id": "trajectory-1", "prompt_ids": [1, 2], "generated_token_ids": [3, 4]}
         self.ticket = {
             "backend": "recompute",
@@ -347,6 +349,33 @@ class TestRTPLLMTrajectoryAdmission(unittest.IsolatedAsyncioTestCase):
             }.items()
             if key not in {"mode", "source_version", "target_version"}
         }
+
+    async def test_short_prefix_defers_without_waiting_for_remote_writes(self):
+        self.server._cfg.kv_cache_config.seq_size_per_block = 1024
+        self.server.engine.wait_remote_prefix_status = Mock(side_effect=AssertionError("no complete block to wait for"))
+        target = self.server.get_trajectory_migration_capabilities()
+        for length in (0, 1, 512, 1023, 1024):
+            with self.subTest(prefix_tokens=length):
+                state = {**self.state, "prompt_ids": [1] * length, "generated_token_ids": []}
+                result = await self.server.prepare_trajectory_migration(state, target, "remote_prefix", 1)
+                self.assertEqual(result["status"], "deferred")
+                self.assertEqual(result["reason"], "no_complete_block")
+                self.assertEqual(result["minimum_prefix_tokens"], 1025)
+                self.assertNotIn("prefix_digest", result)
+                self.assertNotIn("remote_write_status", result)
+        self.server.engine.wait_remote_prefix_status.assert_not_called()
+
+    async def test_complete_prefix_boundaries_wait_for_write_evidence(self):
+        self.server._cfg.kv_cache_config.seq_size_per_block = 1024
+        target = self.server.get_trajectory_migration_capabilities()
+        for length, reusable in ((1025, 1024), (2048, 1024), (2049, 2048)):
+            with self.subTest(prefix_tokens=length):
+                state = {**self.state, "prompt_ids": [1] * length, "generated_token_ids": []}
+                status = {"status": "success", "error_code": 0, "write_ids": [12], "prefix_tokens": reusable}
+                self.server.engine.wait_remote_prefix_status = Mock(return_value=status)
+                ticket = await self.server.prepare_trajectory_migration(state, target, "remote_prefix", 1)
+                self.server.engine.wait_remote_prefix_status.assert_called_once()
+                self.assertEqual(ticket["remote_write_status"], status)
 
     async def test_prefix_errors_are_repeatable_and_independent_success_recovers(self):
         target = self.server.get_trajectory_migration_capabilities()

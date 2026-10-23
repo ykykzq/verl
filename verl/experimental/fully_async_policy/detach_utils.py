@@ -393,14 +393,9 @@ class MetricsAggregator:
         #   resource_utilization = ((1 - x) * a * train_resource_utilization
         #                            + (x * a + b) * rollout_resource_utilization) / (a + b)
         #
-        # dynamic_resource/train_resource_utilization is only available once the aggregator
-        # has collected at least one micro-step's dynamic_resource/train_{compute,allocated}_time_s
-        # (see add_step_metrics()/_record_train_resource_utilization()) — this never holds on
-        # the very first sync cycle, since the sync-triggering micro-step's own values are
-        # only recorded *after* this method's caller (_fit_update_weights()) returns. To keep
-        # "dynamic_resource/rollout_resource_utilization" and "dynamic_resource/resource_utilization"
-        # appearing together (rather than the former appearing one cycle earlier), the former is
-        # only added to the output once the latter can also be computed.
+        # Emit rollout and combined utilization together only when this cycle has
+        # both training metrics and rollout utilization from a weight sync. A final
+        # partial cycle can have training metrics without a corresponding rollout sync.
         total_gpus = self.hybrid_gpus + self.standalone_gpus
         if (
             "dynamic_resource/train_resource_utilization" in aggregated

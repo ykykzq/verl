@@ -323,6 +323,7 @@ class TestComputeDataMetrics(unittest.TestCase):
             "remote_reuse_len": [0, 512],
             "trajectory_migration_attempts": [1, 2],
             "trajectory_migration_backoff_skips": [2, 4],
+            "trajectory_migration_deferred": [1, 3],
             "trajectory_remote_hits": [0, 1],
             "trajectory_migration_fallbacks": [1, 1],
         }
@@ -331,6 +332,8 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertEqual(metrics["rollout/trajectory_migration_attempts/sum"], 3)
         self.assertEqual(metrics["rollout/trajectory_migration_backoff_skips/sum"], 6)
         self.assertEqual(metrics["rollout/trajectory_migration_backoff_skips/mean"], 3)
+        self.assertEqual(metrics["rollout/trajectory_migration_deferred/sum"], 4)
+        self.assertEqual(metrics["rollout/trajectory_migration_deferred/mean"], 2)
         self.assertEqual(metrics["rollout/trajectory_remote_hits/sum"], 1)
         self.assertEqual(metrics["rollout/trajectory_migration_fallbacks/sum"], 2)
 

@@ -381,10 +381,6 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         if not decision.get("migrate", False):
             return None
 
-        final_output.extra_fields["trajectory_migration_attempts"] = (
-            final_output.extra_fields.get("trajectory_migration_attempts", 0) + 1
-        )
-
         decision_id = decision["decision_id"]
         timeout_s = float(getattr(migration_config, "transfer_timeout_s", 30.0))
         trajectory_state = {
@@ -395,6 +391,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             "sampling_params": dict(sampling_params),
         }
         ticket = None
+        deferred = False
         try:
             if decision.get("resume_source", False):
                 await self._load_balancer.commit_trajectory_migration.remote(
@@ -432,6 +429,19 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     ),
                     timeout=timeout_s,
                 )
+                if ticket.get("status") == "deferred" and ticket.get("reason") == "no_complete_block":
+                    await asyncio.wait_for(
+                        self._load_balancer.cancel_trajectory_migration.remote(
+                            request_id=request_id, decision_id=decision_id
+                        ),
+                        timeout=timeout_s,
+                    )
+                    self._migration_retries.pop(request_id, None)
+                    final_output.extra_fields["trajectory_migration_deferred"] = (
+                        final_output.extra_fields.get("trajectory_migration_deferred", 0) + 1
+                    )
+                    deferred = True
+                    return None
             accepted = await asyncio.wait_for(
                 decision["target_server"].accept_trajectory_migration.remote(
                     ticket=ticket,
@@ -492,6 +502,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if getattr(migration_config, "strict_remote_hit", False):
                 raise RuntimeError(f"strict trajectory migration failed: {error}") from error
             return None
+        finally:
+            if not deferred:
+                final_output.extra_fields["trajectory_migration_attempts"] = (
+                    final_output.extra_fields.get("trajectory_migration_attempts", 0) + 1
+                )
 
     @rollout_trace_op
     async def generate(
@@ -841,6 +856,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         if migration_config is not None:
             final_output.extra_fields.setdefault("trajectory_migration_attempts", 0)
             final_output.extra_fields.setdefault("trajectory_migration_backoff_skips", 0)
+            final_output.extra_fields.setdefault("trajectory_migration_deferred", 0)
             final_output.extra_fields.setdefault("trajectory_migration_failures", [])
             final_output.extra_fields["trajectory_segments"] = trajectory_segments
             final_output.extra_fields["forced_prefill_tokens"] = forced_prefill_tokens or 0
