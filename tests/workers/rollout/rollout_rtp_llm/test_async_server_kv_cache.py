@@ -15,6 +15,7 @@
 import asyncio
 import itertools
 import sys
+import threading
 import unittest
 from contextlib import suppress
 from types import SimpleNamespace
@@ -225,8 +226,11 @@ class TestRTPLLMKVCacheTransition(unittest.IsolatedAsyncioTestCase):
             local_path="/model",
             hf_config=SimpleNamespace(architectures=["ModelForCausalLM"]),
         )
-        wait_remote_cache_idle = Mock(return_value=True)
-        server.engine.wait_remote_cache_idle = wait_remote_cache_idle
+        wait_prefix = Mock(
+            return_value={"status": "success", "error_code": 0, "message": "", "write_ids": [12], "prefix_tokens": 3}
+        )
+        server.engine.wait_remote_prefix_status = wait_prefix
+        server.engine.wait_remote_cache_idle = Mock(side_effect=AssertionError("global fence used"))
         state = {
             "request_id": "trajectory-1",
             "prompt_ids": [1, 2],
@@ -237,7 +241,9 @@ class TestRTPLLMKVCacheTransition(unittest.IsolatedAsyncioTestCase):
         ticket = await server.prepare_trajectory_migration(state, target, "remote_prefix", timeout_s=2.0)
         accepted = await server.accept_trajectory_migration(ticket, state)
 
-        wait_remote_cache_idle.assert_called_once_with(2000)
+        self.assertEqual(wait_prefix.call_args.args[0], [1, 2, 3, 4])
+        self.assertEqual(wait_prefix.call_args.args[-1], 2000)
+        self.assertEqual(ticket["remote_write_status"]["write_ids"], [12])
         self.assertEqual(ticket["prefix_tokens"], 4)
         self.assertTrue(accepted["accepted"])
         self.assertIn("trajectory-1", server._accepted_migrations)
@@ -331,9 +337,84 @@ class TestRTPLLMTrajectoryAdmission(unittest.IsolatedAsyncioTestCase):
                 **self.ticket,
                 **capabilities,
                 "backend": "remote_prefix",
+                "remote_write_status": {
+                    "status": "success",
+                    "error_code": 0,
+                    "message": "",
+                    "write_ids": [12],
+                    "prefix_tokens": 3,
+                },
             }.items()
             if key not in {"mode", "source_version", "target_version"}
         }
+
+    async def test_prefix_errors_are_repeatable_and_independent_success_recovers(self):
+        target = self.server.get_trajectory_migration_capabilities()
+        statuses = (
+            ({"status": "write_failed", "error_code": 55, "message": "quota"}, RuntimeError),
+            ({"status": "timeout", "error_code": 0, "message": "pending"}, asyncio.TimeoutError),
+            ({"status": "unavailable", "error_code": -1, "message": "missing group"}, RuntimeError),
+        )
+        for status, error in statuses:
+            self.server.engine.wait_remote_prefix_status = Mock(return_value=status)
+            for _ in range(2):
+                with self.subTest(status=status), self.assertRaisesRegex(error, status["message"]):
+                    await self.server.prepare_trajectory_migration(self.state, target, "remote_prefix", 1)
+        self.server.engine.wait_remote_prefix_status.return_value = self.remote_ticket()["remote_write_status"]
+        ticket = await self.server.prepare_trajectory_migration(self.state, target, "remote_prefix", 1)
+        self.assertTrue((await self.server.accept_trajectory_migration(ticket, self.state))["accepted"])
+
+    async def test_prefix_wait_timeout_does_not_cancel_native_write_and_can_recover(self):
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        status = self.remote_ticket()["remote_write_status"]
+
+        def wait_prefix(*args):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test write did not settle")
+            finished.set()
+            return status
+
+        self.server.engine.wait_remote_prefix_status = wait_prefix
+        target = self.server.get_trajectory_migration_capabilities()
+        try:
+            with self.assertRaises(asyncio.TimeoutError):
+                await self.server.prepare_trajectory_migration(self.state, target, "remote_prefix", 0.05)
+            self.assertTrue(entered.is_set())
+            self.assertFalse(finished.is_set())
+        finally:
+            release.set()
+            self.assertTrue(await asyncio.to_thread(finished.wait, 5))
+        ticket = await self.server.prepare_trajectory_migration(self.state, target, "remote_prefix", 1)
+        self.assertEqual(ticket["remote_write_status"]["write_ids"], [12])
+
+    async def test_remote_ticket_requires_valid_prefix_completion_evidence(self):
+        for evidence in (None, {}, {"status": "success"}, {"status": "success", "write_ids": [1], "prefix_tokens": 4}):
+            ticket = {**self.remote_ticket(), "remote_write_status": evidence}
+            with self.subTest(evidence=evidence):
+                result = await self.server.accept_trajectory_migration(ticket, self.state)
+                self.assertFalse(result["accepted"])
+                self.assertIn("write evidence", result["reason"])
+
+    async def test_weight_change_during_prefix_wait_cannot_issue_a_ticket(self):
+        target = self.server.get_trajectory_migration_capabilities()
+        status = self.remote_ticket()["remote_write_status"]
+
+        def wait_prefix(*args):
+            self.server.global_steps += 1
+            return status
+
+        self.server.engine.wait_remote_prefix_status = wait_prefix
+        with self.assertRaisesRegex(RuntimeError, "capabilities changed"):
+            await self.server.prepare_trajectory_migration(self.state, target, "remote_prefix", 1)
+
+    async def test_invalid_prefix_wait_timeout_never_starts_native_work(self):
+        self.server.engine.wait_remote_prefix_status = Mock(return_value=self.remote_ticket()["remote_write_status"])
+        target = self.server.get_trajectory_migration_capabilities()
+        for timeout in (0, -1, float("inf"), float("nan"), True):
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                await self.server.prepare_trajectory_migration(self.state, target, "remote_prefix", timeout)
+        self.server.engine.wait_remote_prefix_status.assert_not_called()
 
     def common_client(self, *, fully_async=False, migration_enabled=True):
         # Only the transport is replaced: RPC keyword binding and both generation

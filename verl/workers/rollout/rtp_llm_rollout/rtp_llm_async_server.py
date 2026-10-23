@@ -1072,7 +1072,9 @@ class RTPLLMHttpServer:
         backend: str,
         timeout_s: float,
     ) -> dict[str, Any]:
-        """Flush the completed prefix to KVCM and issue a verifiable transfer ticket."""
+        """Wait for this prefix's submitted writes and issue a verifiable transfer ticket."""
+        if type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("remote prefix wait timeout must be finite and positive")
         if backend != "remote_prefix" or not self._remote_prefix_migration_enabled():
             raise RuntimeError(f"KV transfer backend {backend!r} is not enabled on the source replica")
         source = self.get_trajectory_migration_capabilities()
@@ -1084,9 +1086,26 @@ class RTPLLMHttpServer:
             raise RuntimeError("source and target KV transfer domains differ")
         if source["kv_transfer_namespace"] != target_metadata.get("kv_transfer_namespace"):
             raise RuntimeError("source and target KV transfer namespaces differ")
-        await self.wait_remote_cache_idle(timeout_s)
-
         prefix = list(trajectory_state["prompt_ids"]) + list(trajectory_state["generated_token_ids"])
+        wait_fn = getattr(self.engine, "wait_remote_prefix_status", None)
+        if not callable(wait_fn):
+            raise RuntimeError("remote-prefix migration requires an RTP wheel with wait_remote_prefix_status")
+        # TP0's native coordinator includes every required rank and FinishWrite.
+        # Waiting on idle non-owner ranks would not prove this prefix was stored.
+        status = await asyncio.wait_for(
+            asyncio.to_thread(wait_fn, prefix, self._cache_key_salt(self.global_steps), int(timeout_s * 1000)),
+            timeout=timeout_s,
+        )
+        if not isinstance(status, dict):
+            raise RuntimeError("invalid remote prefix write status")
+        if status.get("status") == "timeout":
+            raise asyncio.TimeoutError(f"remote KV prefix write timed out: {status}")
+        if status.get("status") != "success":
+            raise RuntimeError(f"remote KV prefix unavailable: {status}")
+        if not self._valid_prefix_write_status(status, len(prefix)):
+            raise RuntimeError("remote prefix success lacks write evidence or valid reusable tokens")
+        if source != self.get_trajectory_migration_capabilities():
+            raise RuntimeError("source replica capabilities changed during prefix wait")
         return {
             "backend": backend,
             "request_id": trajectory_state["request_id"],
@@ -1097,7 +1116,22 @@ class RTPLLMHttpServer:
             "kv_transfer_domain": source["kv_transfer_domain"],
             "kv_transfer_namespace": source["kv_transfer_namespace"],
             "source_replica_rank": self.replica_rank,
+            "remote_write_status": status,
         }
+
+    @staticmethod
+    def _valid_prefix_write_status(status: Any, prefix_tokens: int) -> bool:
+        if not isinstance(status, dict) or status.get("status") != "success" or status.get("error_code") != 0:
+            return False
+        write_ids = status.get("write_ids")
+        reusable = status.get("prefix_tokens")
+        return (
+            isinstance(write_ids, list)
+            and bool(write_ids)
+            and all(type(write_id) is int and write_id > 0 for write_id in write_ids)
+            and type(reusable) is int
+            and 0 < reusable < prefix_tokens
+        )
 
     async def accept_trajectory_migration(
         self,
@@ -1152,6 +1186,8 @@ class RTPLLMHttpServer:
                 return "target KV transfer domain differs"
             if ticket.get("kv_transfer_namespace") != capabilities["kv_transfer_namespace"]:
                 return "target KV transfer namespace differs"
+            if not self._valid_prefix_write_status(ticket.get("remote_write_status"), len(prefix)):
+                return "remote prefix ticket lacks valid write evidence"
         if ticket.get("model_id") != capabilities["model_id"]:
             return "target model identity differs"
         if target_version != capabilities["weight_version"]:

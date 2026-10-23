@@ -81,6 +81,7 @@ RTP 仓库的 `docs/backend/remote_cache_build.md` 提供 x86 CUDA13 的
 ```python
 from rtp_llm.ops import get_build_capabilities
 assert get_build_capabilities()["remote_kv_cache"] is True
+assert get_build_capabilities()["remote_prefix_write_status"] == 1
 import libth_transformer
 print(libth_transformer.__file__)
 ```
@@ -157,12 +158,48 @@ KVCM RPC 配置；使用自定义 `kvcm_client_config` 或 VIP discovery 时，�
 
 ## 6. 严格验收与诊断
 
-原生 `wait_remote_cache_status()` 返回 `status/error_code/message`，区分 `success`、
-`timeout`、`write_failed`、`unavailable`。SDK 错误经 TP RPC 保留，日志包含失败 rank。
+迁移使用原生 `wait_remote_prefix_status(tokens, salt, timeout_ms)`，返回
+`status/error_code/message/write_ids/prefix_tokens`，区分 `success`、`timeout`、
+`write_failed`、`unavailable`。它捕获此次前缀依赖的 full/linear/SWA 缓存块写入记录，
+不等待无关请求，也不受无关历史失败影响。SDK 错误经 TP RPC 保留，日志包含失败 rank。
+TP0 协调的写入只有在所有所需 rank 完成并且 `FinishWrite` 成功后才完成。
+末尾尚未计算 KV 的 sampled token 和不完整缓存块不计入 `prefix_tokens`。
+历史全局 `wait_remote_cache_status()` 保留用于诊断，不再作为迁移门禁。
 旧 bool API 的 false 只能解释为未知失败，不能归类为超时。
 例外是实际 SDK 数据传输返回 `ER_SDK_TIMEOUT=100`：因原生 DMA 完成状态不确定，
 该 rank 在释放 KV block 前以退出码 70 结束，现有 TP 故障隔离将该副本置为不可用，需重启。
 这与“等待 flush 达到时限、写入仍在执行”的普通等待超时不同。
+
+VERL 启动时要求 `get_build_capabilities()["remote_prefix_write_status"] == 1`，
+必须重新构建并安装此修正后的 RTP wheel；仅更新 Python 代码不足以启用修正。
+迁移凭据包含完成的写入 ID 和可复用长度，并继续绑定完整 token digest、模型、权重版本
+和 namespace。状态缺失或过期不能签发凭据；凭据成功也不保证远端缓存未被淘汰，最终仍需
+检查目标端的实际 `remote_reuse_len`。
+
+同一写入的失败不会被成功回调清除或被查询消费；后续重写有新的 ID，之前已开始的等待仍
+观察原写入结果。状态索引最多保留 65,536 个 key/group 项，最多接收 64 个未完成写入；
+超限拒绝不启动 I/O，已接收写入的源 buffer 始终保留到原生操作结束。超时仅结束等待。
+这些界限限制本地排队和元数据，不代表 Mooncake 的可用容量。
+
+普通模式失败后撤销迁移 reservation、清理目标状态并在源副本继续；迁移重试按
+`trajectory_migration.retry_backoff_s=1` 到 `max_retry_backoff_s=30` 秒指数退避，
+不通过 sleep 阻塞正常解码。成功、结束或取消后清理退避状态。
+`trajectory_migration_backoff_skips` 记录因退避跳过的调度次数，训练指标提供其 sum/mean。
+Mooncake 示例脚本默认每 512 token 调度，可通过 `MIGRATION_CHECKPOINT_TOKENS` 覆盖。
+长回复仍应配置独立 instance group 和足够的 store/quota；此前 16 GiB/12 GiB 不够的
+容量问题不会被状态修正消除，也不能把所有 51/55 错误直接归为容量不足。
+
+回归测试入口（RTP 仓库内执行，后两项需要该仓库的 CUDA/Bazel 构建环境）：
+
+```bash
+bazel test --config=cuda13_remote_cache //rtp_llm/cpp/cache/block_tree_cache/storage_backend/test:remote_write_ledger_test
+bazel test --config=cuda13_remote_cache //rtp_llm/cpp/cache/block_tree_cache/storage_backend/test:storage_backend_test
+bazel test --config=cuda13_remote_cache //rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/test:all
+```
+
+硬件恢复验收：注入一个可恢复写入失败，确认受影响前缀持续失败、无关成功前缀可迁移；
+恢复容量后生成并写入新的前缀，确认后续 TP4 跨副本迁移实际命中。分别注入 TP 分片失败、
+FinishWrite 失败和等待超时，检查源轨迹保留、无误签凭据且 native buffer 未被提前复用。
 
 两个 TP4 副本的长前缀迁移专用验收启用：
 

@@ -46,3 +46,9 @@ def require_remote_cache_build() -> None:
             "RTP-LLM get_build_capabilities() did not return a boolean remote_kv_cache capability; "
             f"KVCM support cannot be verified. {rebuild}"
         )
+    prefix_status = capabilities.get("remote_prefix_write_status")
+    if type(prefix_status) is not int or prefix_status != 1:
+        raise RuntimeError(
+            "remote_prefix migration requires native prefix write status API version 1; "
+            f"the loaded wheel reports {prefix_status!r}. {rebuild}"
+        )

@@ -39,7 +39,12 @@ class _TransferServer:
 
     def _prepare(self, **kwargs):
         self.calls.append(kwargs)
-        return {"backend": "remote_prefix", "prefix_digest": "digest", "ticket": "ready"}
+        return {
+            "backend": "remote_prefix",
+            "prefix_digest": "digest",
+            "ticket": "ready",
+            "remote_write_status": {"status": "success", "error_code": 0, "write_ids": [12], "prefix_tokens": 3},
+        }
 
     def _accept(self, **kwargs):
         self.calls.append(kwargs)
@@ -169,6 +174,7 @@ async def test_chunk_checkpoint_transfers_trajectory_and_continues(monkeypatch, 
     }
     assert target.calls[0]["trajectory_state"] == transferred
     assert output.extra_fields["trajectory_migrations"][0]["target_server_id"] == "s1"
+    assert output.extra_fields["trajectory_migrations"][0]["remote_write_status"]["write_ids"] == [12]
     assert output.extra_fields["trajectory_migration_counts"] == {"remote_prefix": 1, "recompute": 0}
     assert output.extra_fields["trajectory_migration_replans"] == 0
     assert output.extra_fields["trajectory_migration_attempts"] == 1
@@ -227,6 +233,49 @@ def _migration_config():
             )
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_migration_backs_off_without_sleeping_and_recovers(monkeypatch):
+    source = _TransferServer("source")
+    target = _TransferServer("target", accepted=False)
+    balancer = _RollbackLoadBalancer(source, target)
+    config = _migration_config()
+    config.actor_rollout_ref.rollout.trajectory_migration.retry_backoff_s = 2.0
+    config.actor_rollout_ref.rollout.trajectory_migration.max_retry_backoff_s = 3.0
+    client = FullyAsyncLLMServerClient(config=config, load_balancer_handle=balancer)
+    now = 100.0
+    monkeypatch.setattr(llm_server, "time", SimpleNamespace(monotonic=lambda: now), raising=False)
+    output = TokenOutput(token_ids=[10, 11])
+
+    async def attempt():
+        return await client._try_migrate_trajectory(
+            request_id="retry",
+            source_server_id="s0",
+            prompt_ids=[1, 2],
+            final_output=output,
+            checkpoint_index=1,
+            source_weight_version=7,
+            sampling_params={"max_tokens": 6},
+        )
+
+    assert await attempt() is None
+    assert len(source.calls) == 1
+    now = 101.0
+    assert await attempt() is None
+    assert len(source.calls) == 1
+    now = 102.0
+    assert await attempt() is None
+    assert len(source.calls) == 2
+    now = 104.9
+    assert await attempt() is None
+    assert len(source.calls) == 2
+    target.accepted = True
+    now = 105.0
+    assert (await attempt())["target_server_id"] == "s1"
+    assert "retry" not in client._migration_retries
+    assert output.extra_fields["trajectory_migration_backoff_skips"] == 2
+    assert len(balancer.cancels) == 2
 
 
 class _RecomputeLoadBalancer(_RollbackLoadBalancer):

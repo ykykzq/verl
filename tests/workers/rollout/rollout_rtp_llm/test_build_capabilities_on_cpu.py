@@ -75,9 +75,22 @@ class TestRemoteCacheBuildPreflight(unittest.TestCase):
         self.server._build_config.assert_not_called()
 
     def test_supported_build_proceeds_to_model_configuration(self):
-        ops = SimpleNamespace(get_build_capabilities=lambda: {"remote_kv_cache": True})
+        ops = SimpleNamespace(get_build_capabilities=lambda: {"remote_kv_cache": True, "remote_prefix_write_status": 1})
         with self.assertRaises(_ReachedConfigBuild):
             self.boot_with_ops(ops)
+
+    def test_kvcm_build_without_prefix_status_is_rejected_before_loading_weights(self):
+        for version in (None, False, True, 0, "1"):
+            with self.subTest(version=version), self.assertRaisesRegex(RuntimeError, "prefix.*[Rr]ebuild"):
+                self.boot_with_ops(
+                    SimpleNamespace(
+                        get_build_capabilities=lambda version=version: {
+                            "remote_kv_cache": True,
+                            "remote_prefix_write_status": version,
+                        }
+                    )
+                )
+        self.server._build_config.assert_not_called()
 
     def test_disabled_migration_does_not_require_the_new_api(self):
         self.server.config.trajectory_migration.enabled = False

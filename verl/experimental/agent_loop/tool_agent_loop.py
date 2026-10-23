@@ -286,6 +286,7 @@ class ToolAgentLoop(AgentLoopBase):
                 "forced_prefill_tokens",
                 "remote_reuse_len",
                 "trajectory_migration_attempts",
+                "trajectory_migration_backoff_skips",
                 "trajectory_remote_hits",
                 "trajectory_migration_fallbacks",
             ):

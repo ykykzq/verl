@@ -340,6 +340,8 @@ class TrajectoryMigrationConfig(BaseConfig):
     transfer_timeout_s: float = 30.0
     storage_preflight: bool = True
     strict_remote_hit: bool = False
+    retry_backoff_s: float = 1.0
+    max_retry_backoff_s: float = 30.0
     backend_options: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -351,6 +353,12 @@ class TrajectoryMigrationConfig(BaseConfig):
             or self.transfer_timeout_s <= 0
         ):
             raise ValueError("trajectory_migration.transfer_timeout_s must be finite and positive")
+        for name in ("retry_backoff_s", "max_retry_backoff_s"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"trajectory_migration.{name} must be finite and non-negative")
+        if self.max_retry_backoff_s < self.retry_backoff_s:
+            raise ValueError("trajectory_migration.max_retry_backoff_s must be >= retry_backoff_s")
 
 
 @dataclass

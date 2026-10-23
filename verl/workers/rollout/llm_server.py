@@ -22,6 +22,7 @@ import hashlib
 import logging
 import math
 import os
+import time
 from dataclasses import asdict, is_dataclass
 from typing import Any, Optional
 from uuid import uuid4
@@ -72,6 +73,7 @@ class LLMServerClient:
         self._lb_require_acquire_fields: list[str] | None = None
         self._lb_require_release_fields: list[str] | None = None
         self._joint_generation_calls: dict[str, asyncio.Future] = {}
+        self._migration_retries: dict[str, tuple[float, float]] = {}
 
     def _trajectory_migration_config(self) -> Any | None:
         rollout_config = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
@@ -351,6 +353,13 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         if migration_config is None or self._load_balancer is None:
             return None
 
+        retry_after, _ = self._migration_retries.get(request_id, (0.0, 0.0))
+        if time.monotonic() < retry_after:
+            final_output.extra_fields["trajectory_migration_backoff_skips"] = (
+                final_output.extra_fields.get("trajectory_migration_backoff_skips", 0) + 1
+            )
+            return None
+
         trajectory_summary = {
             "request_id": request_id,
             "prompt_tokens": len(prompt_ids),
@@ -392,6 +401,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     request_id=request_id,
                     decision_id=decision_id,
                 )
+                self._migration_retries.pop(request_id, None)
                 return {"resume_source": True}
             mode = decision.get("mode", "remote_prefix")
             source_version = decision.get("source_version", source_metadata["weight_version"])
@@ -435,7 +445,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 request_id=request_id,
                 decision_id=decision_id,
             )
-            return {
+            self._migration_retries.pop(request_id, None)
+            result = {
                 "source_server_id": source_server_id,
                 "target_server_id": decision["target_server_id"],
                 "checkpoint_index": checkpoint_index,
@@ -446,6 +457,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 "target_version": target_version,
                 "migration_ticket": ticket,
             }
+            if "remote_write_status" in ticket:
+                result["remote_write_status"] = ticket["remote_write_status"]
+            return result
         except asyncio.CancelledError:
             await asyncio.shield(
                 self._rollback_trajectory_migration(
@@ -469,6 +483,12 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 source_server_id,
             )
             final_output.extra_fields.setdefault("trajectory_migration_failures", []).append(str(error))
+            _, previous_delay = self._migration_retries.get(request_id, (0.0, 0.0))
+            delay = min(
+                float(getattr(migration_config, "max_retry_backoff_s", 30.0)),
+                max(float(getattr(migration_config, "retry_backoff_s", 1.0)), previous_delay * 2),
+            )
+            self._migration_retries[request_id] = (time.monotonic() + delay, delay)
             if getattr(migration_config, "strict_remote_hit", False):
                 raise RuntimeError(f"strict trajectory migration failed: {error}") from error
             return None
@@ -483,9 +503,12 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         **kwargs: Any,
     ) -> TokenOutput:
         if not self._joint_scheduling_enabled():
-            return await self._generate_segments(
-                request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, **kwargs
-            )
+            try:
+                return await self._generate_segments(
+                    request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, **kwargs
+                )
+            finally:
+                self._migration_retries.pop(request_id, None)
         prompt_ids = normalize_token_ids(prompt_ids)
         budget = sampling_params.get("max_tokens", sampling_params.get("max_new_tokens"))
         if budget is None:
@@ -528,6 +551,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             failed = True
             raise
         finally:
+            self._migration_retries.pop(request_id, None)
             cleanup_timeout = float(getattr(self._trajectory_migration_config(), "transfer_timeout_s", 30.0))
             if not math.isfinite(cleanup_timeout) or cleanup_timeout <= 0:
                 logger.warning("invalid trajectory cleanup timeout %r; using 30 seconds", cleanup_timeout)
@@ -816,6 +840,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             final_output.extra_fields["forced_prefill_tokens"] = forced_prefill_tokens
         if migration_config is not None:
             final_output.extra_fields.setdefault("trajectory_migration_attempts", 0)
+            final_output.extra_fields.setdefault("trajectory_migration_backoff_skips", 0)
             final_output.extra_fields.setdefault("trajectory_migration_failures", [])
             final_output.extra_fields["trajectory_segments"] = trajectory_segments
             final_output.extra_fields["forced_prefill_tokens"] = forced_prefill_tokens or 0

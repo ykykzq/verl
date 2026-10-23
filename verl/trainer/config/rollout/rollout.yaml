@@ -272,6 +272,9 @@ trajectory_migration:
   min_score_improvement: 0.0
   kv_transfer_backend: remote_prefix
   transfer_timeout_s: 30.0
+  # Continue decoding on the source between failed transfer attempts.
+  retry_backoff_s: 1.0
+  max_retry_backoff_s: 30.0
 
   # Passed to RTP-LLM as matching --<key> <value> arguments. Typical KVCM
   # settings include kvcm_server_address and kvcm_instance_group. Environment

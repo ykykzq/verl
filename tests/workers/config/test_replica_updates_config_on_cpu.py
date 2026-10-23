@@ -63,3 +63,15 @@ def test_cross_version_recompute_allows_prefix_cache_to_be_disabled():
 def test_fine_grained_updates_require_rtp_llm():
     with pytest.raises(ValueError, match="rtp_llm"):
         RolloutConfig(name="vllm", fine_grained_weight_update={"enabled": True})
+
+
+@pytest.mark.parametrize("field", ["retry_backoff_s", "max_retry_backoff_s"])
+@pytest.mark.parametrize("value", [-1, float("nan"), float("inf"), True])
+def test_migration_backoff_requires_finite_nonnegative_numbers(field, value):
+    with pytest.raises(ValueError, match=field):
+        TrajectoryMigrationConfig(**{field: value})
+
+
+def test_migration_backoff_cap_cannot_be_below_initial_delay():
+    with pytest.raises(ValueError, match="max_retry_backoff_s"):
+        TrajectoryMigrationConfig(retry_backoff_s=2, max_retry_backoff_s=1)

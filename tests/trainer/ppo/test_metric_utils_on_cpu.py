@@ -322,12 +322,15 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.batch.non_tensor_batch = {
             "remote_reuse_len": [0, 512],
             "trajectory_migration_attempts": [1, 2],
+            "trajectory_migration_backoff_skips": [2, 4],
             "trajectory_remote_hits": [0, 1],
             "trajectory_migration_fallbacks": [1, 1],
         }
         metrics = compute_data_metrics(self.batch, use_critic=False)
         self.assertEqual(metrics["rollout/remote_reuse_len/sum"], 512)
         self.assertEqual(metrics["rollout/trajectory_migration_attempts/sum"], 3)
+        self.assertEqual(metrics["rollout/trajectory_migration_backoff_skips/sum"], 6)
+        self.assertEqual(metrics["rollout/trajectory_migration_backoff_skips/mean"], 3)
         self.assertEqual(metrics["rollout/trajectory_remote_hits/sum"], 1)
         self.assertEqual(metrics["rollout/trajectory_migration_fallbacks/sum"], 2)
 

@@ -608,6 +608,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     for key in (
         "remote_reuse_len",
         "trajectory_migration_attempts",
+        "trajectory_migration_backoff_skips",
         "trajectory_remote_hits",
         "trajectory_migration_fallbacks",
     ):
