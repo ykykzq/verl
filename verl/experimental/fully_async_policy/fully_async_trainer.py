@@ -709,6 +709,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.reward_tensor = None
         self.reward_extra_infos_dict = {}
 
+        # Select synchronization cycles; worker trace names use global_steps to
+        # distinguish individual optimizer steps within each selected cycle.
         steps = self.config.global_profiler.steps
         should_profile = steps is not None and (self.current_param_version + 1) in steps
         self._fit_start_profile(should_profiler=should_profile)
@@ -1242,7 +1244,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print(f"[FullyAsyncTrainer] Load from checkpoint folder: {global_step_folder}")
         # set global step
         self.current_param_version = int(global_step_folder.split("global_step_")[-1])
-        self.global_steps = self.current_param_version * self.trigger_parameter_sync_step + 1
+        # Restore completed optimizer steps. _fit_loop advances to the next step,
+        # just as it does when starting from zero on a fresh run.
+        self.global_steps = self.current_param_version * self.trigger_parameter_sync_step
         self.last_ckpt_version = self.current_param_version
         print(
             f"[FullyAsyncTrainer] Setting global step to {self.global_steps}, "

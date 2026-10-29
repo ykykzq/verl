@@ -1707,6 +1707,8 @@ class RTPLLMReplica(RolloutReplica):
                 "PYTHONPATH",
                 "ENABLE_FLASHINFER_TRTLLM_GEN",
                 "MASTER_METRICS",
+                "LD_PRELOAD",
+                "JE_ARROW_MALLOC_CONF",
             ):
                 if value := os.environ.get(var):
                     env_vars[var] = value

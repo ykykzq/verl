@@ -127,6 +127,71 @@ The wrapper also retains the parent script's migration default when no override
 is supplied; preparing DeepScaleR data does not provision a KV service.
 OSS model, dataset and output paths remain independent of KV storage.
 
+### Qwen2.5-32B SDK Runtime Compatibility
+
+The same launcher supports `MODEL_PATH=/mnt/fuse/Qwen/Qwen2.5-32B-Instruct`.
+The October 29 L20C validation completed ten cumulative updates, including a
+checkpoint-5 restart, using the CUDA130 KVCM SDK `2026_09_15_17_40`. It required
+two distinct fixes: a rebuilt RTP wheel with the private curl archive fully
+linked, and a runtime override for the SDK's own unsafe synchronous DNS curl.
+The private curl fix alone does not repair the SDK binary.
+
+For that container's vendor curl 7.61.1 / OpenSSL 1.1 combination, opt into the
+validated runtime configuration before invoking the recipe:
+
+```bash
+export VERL_RTP_LLM_SDK_CURL_PRELOAD=/usr/lib64/libcrypto.so.1.1:/usr/lib64/libssl.so.1.1:/usr/lib64/libcurl.so.4
+MODEL_PATH=/mnt/fuse/Qwen/Qwen2.5-32B-Instruct \
+DATA_DIR="$HOME/verl/data/deepscaler" \
+N_RESPONSES=4 TRAIN_MINI_BATCH_SIZE=8 MAX_RESPONSE_LENGTH=8192 \
+bash examples/grpo_trainer/run_qwen3_5_27b_fsdp2_deepscaler.sh \
+  trainer.nnodes=1 trainer.n_gpus_per_node=4 \
+  rollout.nnodes=3 rollout.n_gpus_per_node=4 \
+  actor_rollout_ref.rollout.tensor_model_parallel_size=4
+```
+
+`scripts/rtp_llm_runtime.py` prepares `LD_PRELOAD` and sets
+`JE_ARROW_MALLOC_CONF=background_thread:false` before execing the driver Python
+interpreter. Other allocator options and unrelated preloads are retained.
+The paired Arrow setting is necessary for the observed full-entry import
+crash; `MALLOC_CONF` and `ARROW_DEFAULT_MEMORY_POOL=system` did not fix it.
+Before training, a separate process verifies that global curl has AsynchDNS,
+imports the complete training entry, and exits cleanly. A crash, failed import,
+or timeout stops launch. The resulting environment is forwarded explicitly to
+Ray workers and each RTP TP rank, including when Ray was started earlier.
+
+This is an explicit compatibility option, not a default choice of system
+libraries. Paths and ABI-compatible dependencies must exist in every worker
+environment, including a separately configured RTP conda environment. Do not
+override the two resulting variables differently through Ray's runtime config.
+For another entry point use
+`python3 scripts/rtp_llm_runtime.py -m <training.module> ...`.
+
+Before using another image, run the same full-entry check in a fresh process on
+**each node**, with the selected libraries already in `LD_PRELOAD`:
+
+```bash
+LD_PRELOAD="$VERL_RTP_LLM_SDK_CURL_PRELOAD" \
+JE_ARROW_MALLOC_CONF=background_thread:false \
+python3 scripts/rtp_llm_runtime.py --check-runtime \
+  verl.experimental.fully_async_policy.fully_async_main
+```
+
+An import check is not an SDK ABI or KV correctness guarantee. Also run RTP's
+`test_concurrent_native_gpu_reads_on_all_rollout_ranks` with
+`RTP_NATIVE_KV_WORKERS_PER_NODE=2`, `RTP_NATIVE_KV_READER_THREADS=4`, and
+`RTP_NATIVE_KV_READ_REPEATS=10`, then repeat checkpoint save/restore training.
+Export the actual `LD_PRELOAD` and `JE_ARROW_MALLOC_CONF` when running this
+standalone test; the VERL-specific option is applied only by the launcher.
+This exercises 320 cross-node byte checks over 64 KiB and 64 MiB GPU buffers.
+The native test requires idle GPUs, a matching RTP wheel, and a configured
+KVCM service; see RTP's `docs/backend/remote_cache_build.md`.
+
+Rebuilding the SDK with an asynchronous resolver remains the upstream fix.
+The observed SDK/Arrow interaction and earlier intermittent TLS assertion are
+not proven resolved for arbitrary dependency combinations. The ten-update run
+is short validation, not evidence of convergence or RDMA KV transport.
+
 ## Reward and Acceptance
 
 Both `agentica-org/DeepScaleR-Preview-Dataset` and `deepscaler` route to the

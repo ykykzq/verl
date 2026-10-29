@@ -149,4 +149,13 @@ def get_ppo_ray_runtime_env(config=None):
         val = os.environ.get(key)
         if val is not None:
             runtime_env["env_vars"][key] = val
+    # Ray daemons may predate the launch shell. Explicitly pass the SDK/Arrow
+    # compatibility environment so it is installed before remote Python imports.
+    if config is not None:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.select(config, "actor_rollout_ref.rollout.name", default=None) == "rtp_llm":
+            for key in ("LD_PRELOAD", "JE_ARROW_MALLOC_CONF"):
+                if (value := os.environ.get(key)) is not None:
+                    runtime_env["env_vars"][key] = value
     return runtime_env

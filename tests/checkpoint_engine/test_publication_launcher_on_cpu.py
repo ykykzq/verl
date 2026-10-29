@@ -29,4 +29,10 @@ def test_27b_launcher_sets_configurable_publication_wait_timeout(tmp_path, confi
         timeout=10,
         check=True,
     )
-    assert f"actor_rollout_ref.rollout.weight_publication.wait_timeout_s={expected}" in result.stdout.splitlines()
+    arguments = [line for line in result.stdout.splitlines() if not line.startswith("+ ")]
+    assert arguments[:3] == [
+        str(repo / "scripts/rtp_llm_runtime.py"),
+        "-m",
+        "verl.experimental.fully_async_policy.fully_async_main",
+    ]
+    assert f"actor_rollout_ref.rollout.weight_publication.wait_timeout_s={expected}" in arguments

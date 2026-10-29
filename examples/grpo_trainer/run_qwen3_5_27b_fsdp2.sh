@@ -56,7 +56,8 @@ CONCURRENT_SAMPLES_PER_REPLICA=${CONCURRENT_SAMPLES_PER_REPLICA:-8}
 # Large snapshots and serial replica installs can exceed the library's default wait.
 WEIGHT_PUBLICATION_WAIT_TIMEOUT_S=${WEIGHT_PUBLICATION_WAIT_TIMEOUT_S:-1800}
 
-python3 -m verl.experimental.fully_async_policy.fully_async_main \
+# The wrapper execs a fresh interpreter so optional SDK/Arrow settings precede imports.
+python3 "${VERL_ROOT}/scripts/rtp_llm_runtime.py" -m verl.experimental.fully_async_policy.fully_async_main \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \

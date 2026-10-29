@@ -387,15 +387,19 @@ class TestTPLaunch(unittest.IsolatedAsyncioTestCase):
 
     async def test_launches_concurrently_and_exposes_only_rank_zero(self):
         replica, created, handles = self.make_replica()
-        with patch.dict(os.environ, {"RTP_LLM_NATIVE_DIAGNOSTICS_DIR": "/tmp/rtp-native-evidence"}):
+        runtime_environment = {
+            "RTP_LLM_NATIVE_DIAGNOSTICS_DIR": "/tmp/rtp-native-evidence",
+            "LD_PRELOAD": "/opt/runtime/libssl.so:/opt/runtime/libcurl.so",
+            "JE_ARROW_MALLOC_CONF": "background_thread:false",
+        }
+        with patch.dict(os.environ, runtime_environment):
             await asyncio.wait_for(replica.launch_servers(), 2)
         self.assertEqual(replica.server_handle, handles[0])
         self.assertEqual(len(handles), 4)
         for rank, (options, kwargs) in enumerate(created):
             self.assertEqual(options["name"], f"rtp_llm_server_2_{rank}")
-            self.assertEqual(
-                options["runtime_env"]["env_vars"]["RTP_LLM_NATIVE_DIAGNOSTICS_DIR"], "/tmp/rtp-native-evidence"
-            )
+            for key, value in runtime_environment.items():
+                self.assertEqual(options["runtime_env"]["env_vars"][key], value)
             self.assertEqual(kwargs["cuda_visible_devices"], "4,5,6,7")
             self.assertEqual(kwargs["workers"], [replica.workers[rank]])
             handles[rank].configure_tp_peers.remote.assert_awaited_once_with(handles[:rank] + handles[rank + 1 :])

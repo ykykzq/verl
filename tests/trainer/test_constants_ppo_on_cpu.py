@@ -15,6 +15,7 @@
 import os
 from unittest.mock import patch
 
+import pytest
 from omegaconf import OmegaConf
 
 from verl.trainer.constants_ppo import NVTX_INJECTION_ENV, get_ppo_ray_runtime_env
@@ -49,3 +50,27 @@ def test_nvtx_injection_override_can_be_opted_out():
         env_vars = get_ppo_ray_runtime_env(_config("torch"))["env_vars"]
 
     assert NVTX_INJECTION_ENV not in env_vars
+
+
+@pytest.mark.parametrize("rollout_name", ["rtp_llm", "vllm"])
+def test_rtp_runtime_compatibility_reaches_remote_workers(rollout_name):
+    inherited = {
+        "LD_PRELOAD": "/opt/runtime/libssl.so:/opt/runtime/libcurl.so",
+        "JE_ARROW_MALLOC_CONF": "background_thread:false",
+    }
+    config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"name": rollout_name}}})
+    with patch.dict(os.environ, inherited, clear=True):
+        env_vars = get_ppo_ray_runtime_env(config)["env_vars"]
+    for key, value in inherited.items():
+        if rollout_name == "rtp_llm":
+            assert env_vars[key] == value
+        else:
+            assert key not in env_vars
+
+
+def test_rtp_runtime_compatibility_does_not_choose_host_libraries_by_default():
+    config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"name": "rtp_llm"}}})
+    with patch.dict(os.environ, {}, clear=True):
+        env_vars = get_ppo_ray_runtime_env(config)["env_vars"]
+    assert "LD_PRELOAD" not in env_vars
+    assert "JE_ARROW_MALLOC_CONF" not in env_vars
