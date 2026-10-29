@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional
 
 import torch
@@ -46,7 +47,11 @@ def _fused_linear_for_ppo_fwd(
     probs = logits.softmax(dim=-1)
     entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
 
-    if _FLASH_ATTN_CROSS_ENTROPY_AVAILABLE:
+    if (
+        _FLASH_ATTN_CROSS_ENTROPY_AVAILABLE
+        and logits.is_cuda
+        and os.environ.get("VERL_DISABLE_FLASH_ATTN_CE", "0") != "1"
+    ):
         per_token_entropy_loss = cross_entropy_loss(logits, input_ids)[0]
         token_log_probs = -per_token_entropy_loss
     else:

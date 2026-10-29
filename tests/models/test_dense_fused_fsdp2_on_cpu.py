@@ -143,10 +143,21 @@ def _check_case(device, dtype, backend, tie_word_embeddings, reshard_after_forwa
 
 
 def _cpu_worker(rank, rendezvous, tie_word_embeddings, reshard_after_forward):
+    from verl.utils.experimental import torch_functional as experimental_F
+
+    def cuda_only_cross_entropy(logits, labels):
+        assert logits.is_cuda, "FlashAttention cross entropy cannot execute on CPU tensors"
+        return torch.nn.functional.cross_entropy(logits, labels, reduction="none"), None
+
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=90))
     try:
-        _check_case(torch.device("cpu"), torch.float32, "torch", tie_word_embeddings, reshard_after_forward)
+        # Exercise CPU execution even when the optional CUDA-only kernel imports.
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(experimental_F, "_FLASH_ATTN_CROSS_ENTROPY_AVAILABLE", True)
+            monkeypatch.setattr(experimental_F, "cross_entropy_loss", cuda_only_cross_entropy, raising=False)
+            monkeypatch.delenv("VERL_DISABLE_FLASH_ATTN_CE", raising=False)
+            _check_case(torch.device("cpu"), torch.float32, "torch", tie_word_embeddings, reshard_after_forward)
     finally:
         dist.destroy_process_group()
 

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 _MODULE_PATH = Path(__file__).resolve().parents[2] / "verl" / "utils" / "experimental" / "torch_functional.py"
 _SPEC = importlib.util.spec_from_file_location("_experimental_torch_functional", _MODULE_PATH)
@@ -26,9 +27,16 @@ _SPEC.loader.exec_module(experimental_F)
 
 
 @pytest.mark.parametrize("hidden_shape", [(7, 5), (2, 7, 5)])
-def test_fused_linear_for_ppo_chunked_fallback_matches_torch(monkeypatch, hidden_shape):
+@pytest.mark.parametrize("flash_available", [False, True])
+def test_fused_linear_for_ppo_chunked_fallback_matches_torch(monkeypatch, hidden_shape, flash_available):
+    def cuda_only_cross_entropy(logits, labels):
+        assert logits.is_cuda, "FlashAttention cross entropy cannot execute on CPU tensors"
+        return torch.nn.functional.cross_entropy(logits, labels, reduction="none"), None
+
     monkeypatch.setattr(experimental_F, "_LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY", None)
-    monkeypatch.setattr(experimental_F, "_FLASH_ATTN_CROSS_ENTROPY_AVAILABLE", False)
+    monkeypatch.setattr(experimental_F, "_FLASH_ATTN_CROSS_ENTROPY_AVAILABLE", flash_available)
+    monkeypatch.setattr(experimental_F, "cross_entropy_loss", cuda_only_cross_entropy, raising=False)
+    monkeypatch.delenv("VERL_DISABLE_FLASH_ATTN_CE", raising=False)
     torch.manual_seed(42)
 
     temperature = 0.7
@@ -39,7 +47,7 @@ def test_fused_linear_for_ppo_chunked_fallback_matches_torch(monkeypatch, hidden
     grad_log_probs = torch.randn(hidden_shape[:-1])
     grad_entropy = torch.randn(hidden_shape[:-1])
 
-    log_probs, entropy = experimental_F.FusedLinearForPPO()(hidden, weight, labels, temperature)
+    log_probs, entropy = experimental_F.FusedLinearForPPO(chunk_size=3)(hidden, weight, labels, temperature)
     torch.autograd.backward((log_probs, entropy), (grad_log_probs, grad_entropy))
 
     expected_hidden = hidden.detach().clone().requires_grad_(True)
@@ -57,6 +65,38 @@ def test_fused_linear_for_ppo_chunked_fallback_matches_torch(monkeypatch, hidden
     torch.testing.assert_close(entropy, expected_entropy)
     torch.testing.assert_close(hidden.grad, expected_hidden.grad)
     torch.testing.assert_close(weight.grad, expected_weight.grad)
+
+
+@pytest.mark.parametrize("flash_available", [False, True])
+@pytest.mark.parametrize("disable_flash_ce", [None, "0", "1"])
+def test_fused_linear_for_ppo_cuda_cross_entropy_dispatch(monkeypatch, flash_available, disable_flash_ce):
+    calls = []
+
+    def cuda_cross_entropy(logits, labels):
+        assert logits.is_cuda and labels.is_cuda
+        assert logits.shape == (3, 7) and logits.dtype == torch.float32
+        assert labels.shape == (3,) and labels.dtype == torch.int64
+        calls.append(True)
+        return logits.new_zeros(labels.shape), None
+
+    monkeypatch.setattr(experimental_F, "_FLASH_ATTN_CROSS_ENTROPY_AVAILABLE", flash_available)
+    monkeypatch.setattr(experimental_F, "cross_entropy_loss", cuda_cross_entropy, raising=False)
+    if disable_flash_ce is None:
+        monkeypatch.delenv("VERL_DISABLE_FLASH_ATTN_CE", raising=False)
+    else:
+        monkeypatch.setenv("VERL_DISABLE_FLASH_ATTN_CE", disable_flash_ce)
+
+    # Fake CUDA tensors verify dispatch and the kernel input contract without
+    # pretending that this CPU test executes or validates a CUDA kernel.
+    with FakeTensorMode():
+        hidden = torch.empty(3, 5, device="cuda", dtype=torch.bfloat16)
+        weight = torch.empty(7, 5, device="cuda", dtype=torch.bfloat16)
+        labels = torch.empty(3, device="cuda", dtype=torch.int64)
+        log_probs, entropy = experimental_F._fused_linear_for_ppo_fwd(hidden, weight, labels, 0.7)
+        assert log_probs.shape == entropy.shape == (3,)
+        assert log_probs.dtype == torch.float32 and entropy.dtype == torch.bfloat16
+
+    assert bool(calls) == (flash_available and disable_flash_ce != "1")
 
 
 def test_fused_linear_for_ppo_dispatches_to_liger(monkeypatch):
