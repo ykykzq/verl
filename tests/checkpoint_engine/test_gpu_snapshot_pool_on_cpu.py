@@ -34,6 +34,7 @@ class Worker:
         self.ignored_source_names = []
         self.gates, self.failures = {}, {}
         self.entered = defaultdict(asyncio.Event)
+        self.finished = defaultdict(asyncio.Event)
         self.gpu_snapshot_rpc = SimpleNamespace(remote=self.remote)
 
     def remote(self, method, *args):
@@ -46,13 +47,16 @@ class Worker:
 
     async def dispatch(self, method, *args):
         self.entered[method].set()
-        if method in self.gates:
-            await self.gates[method].wait()
-        if method in self.failures:
-            raise self.failures[method]
-        result = await getattr(self, method)(*args)
-        assert_metadata(result)
-        return result
+        try:
+            if method in self.gates:
+                await self.gates[method].wait()
+            if method in self.failures:
+                raise self.failures[method]
+            result = await getattr(self, method)(*args)
+            assert_metadata(result)
+            return result
+        finally:
+            self.finished[method].set()
 
     async def describe(self):
         return {
@@ -209,6 +213,139 @@ async def test_receive_convert_scatter_and_install_two_versions_without_tensor_r
         assert harness.pool.slots.latest == 2
     finally:
         await harness.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_tp_columns_overlap_after_all_receives_and_preserve_chunk_order(monkeypatch):
+    harness = Harness()
+    exporting = None
+    try:
+        await harness.start()
+        await harness.pool.begin(1)
+        clock = SimpleNamespace(now=0.0)
+        monkeypatch.setattr(
+            "verl.checkpoint_engine.gpu_snapshot_pool.time", SimpleNamespace(perf_counter=lambda: clock.now)
+        )
+        left, right = harness.workers[:2]
+        right.gates["receive_input"] = received = asyncio.Event()
+        for worker in (left, right):
+            worker.gates["convert"] = asyncio.Event()
+            worker.gates["store_chunk"] = asyncio.Event()
+        exporting = asyncio.create_task(harness.input(1))
+        await asyncio.wait_for(left.finished["receive_input"].wait(), timeout=1)
+        await asyncio.wait_for(right.entered["receive_input"].wait(), timeout=1)
+        assert not any(worker.entered["convert"].is_set() for worker in (left, right))
+        received.set()
+        await asyncio.wait_for(
+            asyncio.gather(*(worker.entered["convert"].wait() for worker in (left, right))), timeout=1
+        )
+        clock.now = 2.0
+        for worker in (left, right):
+            worker.gates["convert"].set()
+        await asyncio.wait_for(
+            asyncio.gather(*(worker.entered["store_chunk"].wait() for worker in (left, right))), timeout=1
+        )
+        assert not any(worker.entered["store_chunk"].is_set() for worker in harness.workers[2:])
+        assert harness.pool.io_lock.locked()
+        assert all(worker.outputs for worker in (left, right))
+        with pytest.raises(RuntimeError, match="previous GPU input"):
+            await harness.pool.prepare_input(1, "next", [12], "torch.float32")
+        clock.now = 7.0
+        for worker in (left, right):
+            worker.gates["store_chunk"].set()
+        await exporting
+        assert harness.pool.completed == {(0, "layer"), (1, "layer")}
+        metrics = harness.pool.status()["metrics"]
+        assert metrics["conversion_s"] == 4.0
+        assert metrics["shard_distribution_s"] == 10.0
+        assert metrics["conversion_and_distribution_wall_s"] == 7.0
+    finally:
+        await harness.cleanup()
+        if exporting is not None:
+            await asyncio.gather(exporting, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_seal_converts_tp_columns_concurrently_and_accumulates_wall_time(monkeypatch):
+    harness = Harness()
+    sealing = None
+    try:
+        await harness.start()
+        await harness.pool.begin(1)
+        await harness.input(1)
+        previous = harness.pool.metrics.get("conversion_and_distribution_wall_s", 0)
+        clock = SimpleNamespace(now=0.0)
+        monkeypatch.setattr(
+            "verl.checkpoint_engine.gpu_snapshot_pool.time", SimpleNamespace(perf_counter=lambda: clock.now)
+        )
+        for worker in harness.workers[:2]:
+            worker.entered["convert"].clear()
+            worker.gates["convert"] = asyncio.Event()
+        sealing = asyncio.create_task(harness.pool.seal(1))
+        await asyncio.wait_for(
+            asyncio.gather(*(worker.entered["convert"].wait() for worker in harness.workers[:2])), timeout=1
+        )
+        assert harness.pool.io_lock.locked()
+        assert not harness.pool.slots.versions[1]["ready"]
+        clock.now = 3.0
+        for worker in harness.workers[:2]:
+            worker.gates["convert"].set()
+        snapshot = await sealing
+        assert snapshot.version == harness.pool.slots.latest == 1
+        assert harness.pool.metrics["conversion_and_distribution_wall_s"] == previous + 3.0
+    finally:
+        await harness.cleanup()
+        if sealing is not None:
+            await asyncio.gather(sealing, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["input", "seal"])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_parallel_columns_drain_before_unlock_on_failure_or_cancellation(stage, cancel):
+    harness = Harness()
+    operation = None
+    try:
+        await harness.start()
+        await harness.pool.begin(1)
+        if stage == "seal":
+            await harness.input(1)
+        left, right = harness.workers[:2]
+        for worker in (left, right):
+            worker.entered.clear()
+            worker.finished.clear()
+        method = "store_chunk" if stage == "input" else "convert"
+        right.gates[method] = gate = asyncio.Event()
+        if not cancel:
+            left.failures[method] = RuntimeError("column failed")
+        operation = asyncio.create_task(harness.input(1) if stage == "input" else harness.pool.seal(1))
+        await asyncio.wait_for(right.entered[method].wait(), timeout=1)
+        await asyncio.wait_for(left.finished["release_outputs" if cancel else method].wait(), timeout=1)
+        if cancel:
+            cancelled = harness.pool.ingest_task if stage == "input" else operation
+            cancelled.cancel()
+            await asyncio.sleep(0)
+            cancelled.cancel()
+            await asyncio.sleep(0)
+        assert not operation.done()
+        assert harness.pool.io_lock.locked()
+        assert harness.pool.slots.latest is None
+        assert not harness.pool.slots.versions[1]["ready"]
+        if stage == "input":
+            assert right.outputs
+        gate.set()
+        with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
+            await operation
+        assert right.finished["release_outputs"].is_set()
+        assert not right.outputs
+        assert not harness.pool.io_lock.locked()
+        assert harness.pool.staging.version == 1
+        with pytest.raises(RuntimeError, match="restart"):
+            await harness.pool.seal(1)
+    finally:
+        await harness.cleanup()
+        if operation is not None:
+            await asyncio.gather(operation, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -734,12 +871,21 @@ async def test_stage_timings_reset_each_export_and_install_keeps_its_version():
         harness.pool.metrics["source_transfer_s"] = 1000
         harness.pool.metrics["conversion_s"] = 1000
         harness.pool.metrics["shard_distribution_s"] = 1000
+        harness.pool.metrics["conversion_and_distribution_wall_s"] = 1000
         await harness.export(2)
         metrics = harness.pool.status()["metrics"]
         assert metrics["export_version"] == 2
         assert metrics["last_install_version"] == 1
         assert metrics["last_install_replica_rank"] == 1
-        assert all(metrics[name] < 1000 for name in ("source_transfer_s", "conversion_s", "shard_distribution_s"))
+        assert all(
+            metrics[name] < 1000
+            for name in (
+                "source_transfer_s",
+                "conversion_s",
+                "shard_distribution_s",
+                "conversion_and_distribution_wall_s",
+            )
+        )
         assert harness.pool.status()["initialized"] is True
         await harness.pool.close()
         assert harness.pool.status()["initialized"] is False

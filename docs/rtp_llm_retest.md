@@ -256,3 +256,47 @@ RDMA 导出现在按 `min(bucket_bytes, floor(staging_bytes / pipeline_depth / 1
 
 验收顺序保持：原生跨节点字节一致 → 两个 TP4 长前缀真实命中 → 4+3×TP4 非零参数更新
 → RDMA 与迁移联合运行。本地 CPU/语法测试不能代替以上四项硬件验收。
+
+## 7. Qwen2.5-32B 恢复与导出复测（2026-10-25）
+
+已知基线完成 5/10 次真实更新，checkpoint 5 在两节点校验并成功加载；
+恢复后的首次 rollout 发生原生 `longjmp` 崩溃，尚未完成第 6 步。
+保留两节点的 `global_step_5` 和历史日志，用同一 checkpoint 验证后续修复。
+更换 salt、成功 fresh start 或仅加载 checkpoint 都不能算恢复训练通过。
+
+本轮修正包含：FSDP2 fused head 通过注册的 forward 进入 unshard/reshard 生命周期；
+Qwen2 配置没有 `head_dim` 时使用 `hidden_size / num_attention_heads` 推导 KV 容量；
+RTP 将 bundled XQA 限定为实际编译的 SM90，SM100 使用可用的其他 attention 后端。
+硬件验收应分别启用 fused head，验证 BF16 log-prob、entropy、梯度和真实参数更新：
+
+```bash
+torchrun --standalone --nproc-per-node=4 \
+  tests/models/test_dense_fused_fsdp2_on_cpu.py \
+  --device cuda --dtype bfloat16 --backend torch
+```
+
+Triton/Liger 后端需要各自安装依赖并分别验收。恢复主实验前可以继续使用已验证的
+`use_fused_kernels=False`、`ENABLE_XQA=False`、
+`ENABLE_FLASHINFER_TRTLLM_GEN=True`，避免同时改变多个实验变量。
+本次设备虽名为 L20C，实际报告 SM100、183359 MiB 显存，不使用旧 L20 的 MFU 假设。
+两槽 GPU 快照实测需要 11386394624 bytes/GPU，继续配置 12 GiB 上限。
+
+GPU 快照的独立 TP 列现在并行转换和分发；源张量全接收屏障、每列传输顺序、
+单输入内存约束和一次安装一个 replica 保持不变。CPU 测试验证并发及失败/取消等待；
+实际 NCCL 并发传输和性能仍须集群复测。每次 seal 日志及 publisher status 包含：
+
+- `export_s`：整次快照导出墙钟时间。
+- `source_transfer_s`：源张量接收等待时间。
+- `conversion_and_distribution_wall_s`：并行转换及分发的整组墙钟时间。
+- `conversion_s`、`shard_distribution_s`：各列时间之和，可能重叠，不可相加当作墙钟时间。
+
+第 2 步 rank-0 trace 的 82.06 秒导出区间中，771 次 all-gather kernel 仅累计
+0.19 秒，3084 次 SendRecv 累计 22.27 秒，末次发送至下一张量 all-gather 的
+770 个间隔累计 53.44 秒。这支持优先减少接收端逐列处理的等待，但不能据此预测加速倍数，
+也不能将其他 rank 的 NCCL kernel 累计时间当作硬件带宽。
+
+原生崩溃仍待定位。设置 `RTP_LLM_NATIVE_DIAGNOSTICS_DIR` 后，driver 会将其传给所有
+RTP rank，保存对应 PID 的 maps 和库 Build ID；详见 RTP 的
+`docs/backend/remote_cache_build.md`。先运行原生并发 KV 读验收，再恢复 checkpoint 5
+完成第 6-10 步、非零参数差值、安装一致性、最终评估、checkpoint 10 和第 7 步 profile。
+比较导出耗时需相同模型、batch、快照槽位、迁移配置，并增加不启用 profiler 的对照。

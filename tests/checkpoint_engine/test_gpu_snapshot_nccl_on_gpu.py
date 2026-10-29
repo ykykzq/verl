@@ -3,9 +3,11 @@
 
 """Opt-in CUDA/NCCL acceptance with synthetic runtime tensors, without RTP."""
 
+import asyncio
 import contextlib
 import json
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -62,6 +64,8 @@ class GPUAcceptanceActor:
         torch.cuda.set_device(0)
         self.rank = rank
         self.tp_rank = rank % tp_size
+        self.conversion_ready = asyncio.Event()
+        self.conversion_gate = asyncio.Event()
         self.worker = GPUSnapshotWorker(
             LocalAdapter(),
             SimpleNamespace(
@@ -117,12 +121,42 @@ class GPUAcceptanceActor:
     async def prepare(self, slot, version):
         import torch
 
+        self.conversion_ready.clear()
+        self.conversion_gate.clear()
         await self.worker.reserve(slot)
         self.worker.outputs = {
             entry["name"]: expected_tensor(entry["shape"], entry["dtype"], version, self.tp_rank, index)
             for index, entry in enumerate(runtime_layout())
         }
         torch.cuda.synchronize()
+
+    async def wait_conversion_ready(self):
+        await self.conversion_ready.wait()
+
+    async def release_conversion(self):
+        self.conversion_gate.set()
+
+    async def gpu_snapshot_rpc(self, method, *args):
+        if method == "convert":
+            self.conversion_ready.set()
+            await self.conversion_gate.wait()
+            return [
+                {"name": name, "shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+                for name, tensor in self.worker.outputs.items()
+            ]
+        if method == "release_outputs":
+            self.worker.outputs.clear()
+            return None
+        if method == "finish_conversion":
+            return None
+        # This synthetic communicator omits the pool's reserved source rank.
+        if method == "send_output":
+            chunk, destination = args
+            return await self.worker.send_output(chunk, destination - 1)
+        if method == "store_chunk":
+            slot, chunk, source = args
+            return await self.worker.store_chunk(slot, chunk, source - 1 if source is not None else None)
+        raise ValueError(f"unsupported acceptance RPC {method}")
 
     async def store_chunk(self, slot, chunk, source):
         await self.worker.store_chunk(slot, chunk, source)
@@ -247,31 +281,39 @@ def test_directed_nccl_integer_and_float_bytes():
 
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_gpu_shard_columns_and_pinned_versions(tp_size):
-    from verl.checkpoint_engine.gpu_snapshot import GPUWeightSnapshot, SnapshotSlots, plan_layout
+    from verl.checkpoint_engine.gpu_snapshot import GPUWeightSnapshot, plan_layout
+    from verl.checkpoint_engine.gpu_snapshot_pool import GPUSnapshotPool, settle
 
     with gpu_actors(replicas=2, tp_size=tp_size) as (ray, actors, descriptions, timeout):
         plan = plan_layout([item["layout"] for item in descriptions], replicas=2, tp_size=tp_size, chunk_bytes=32)
         assert all(chunk.owner % tp_size == chunk.tp_rank for chunk in plan.chunks)
         assert all(plan.owner_bytes), "fixture must store chunks on both replicas"
-        slots = SnapshotSlots(2)
+        pool = GPUSnapshotPool(
+            [SimpleNamespace(replica_rank=i, workers=actors[i * tp_size : (i + 1) * tp_size]) for i in range(2)],
+            SimpleNamespace(slots=2),
+        )
+        pool.plan = plan
+        slots = pool.slots
+
+        async def seal_concurrent_columns(version):
+            sealing = asyncio.create_task(pool.seal(version))
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(actor.wait_conversion_ready.remote() for actor in actors[:tp_size])),
+                    timeout=timeout,
+                )
+            finally:
+                await settle([actor.release_conversion.remote() for actor in actors[:tp_size]])
+                await settle([sealing])
+            return sealing.result()
 
         def publish(version):
             slot = slots.reserve(version)
             ray.get([actor.prepare.remote(slot, version) for actor in actors], timeout=timeout)
-            for chunk in plan.chunks:
-                source = chunk.tp_rank
-                if chunk.owner == source:
-                    ray.get(actors[source].store_chunk.remote(slot, chunk, None), timeout=timeout)
-                else:
-                    ray.get(
-                        [
-                            actors[source].send_output.remote(chunk, chunk.owner),
-                            actors[chunk.owner].store_chunk.remote(slot, chunk, source),
-                        ],
-                        timeout=timeout,
-                    )
-            slots.commit(version)
-            return GPUWeightSnapshot(version, slot, plan.layout_hash)
+            pool.staging = GPUWeightSnapshot(version, slot, plan.layout_hash)
+            pool.completed = set()
+            pool.started = time.perf_counter()
+            return asyncio.run(seal_concurrent_columns(version))
 
         def fetch(snapshot):
             assert snapshot.layout_hash == plan.layout_hash

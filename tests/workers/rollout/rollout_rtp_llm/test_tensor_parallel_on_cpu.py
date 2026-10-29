@@ -54,6 +54,23 @@ def remote(method):
 
 
 class TestTPConfiguration(unittest.TestCase):
+    def test_qwen2_capacity_derives_head_dim_when_config_omits_it(self):
+        from transformers import Qwen2Config
+
+        server = make_server()
+        server.model_config.hf_config = Qwen2Config(
+            hidden_size=5120, num_attention_heads=40, num_key_value_heads=8, num_hidden_layers=64
+        )
+        server.config.max_num_seqs = 64
+        server.config.max_model_len = 10240
+        server.config.prompt_length = 2048
+        server.config.response_length = 8192
+        with patch.object(server, "_kv_cache_mem_mib", return_value=4096):
+            self.assertEqual(server._max_concurrency(), 5)
+            # An explicit head dimension remains authoritative for other models.
+            server.model_config.hf_config.head_dim = 256
+            self.assertEqual(server._max_concurrency(), 2)
+
     def test_tp4_constructs_four_distinct_ranks_with_shared_ports(self):
         servers = [make_server(rank=rank) for rank in range(4)]
         self.assertEqual([server.tp_rank for server in servers], [0, 1, 2, 3])
@@ -370,11 +387,15 @@ class TestTPLaunch(unittest.IsolatedAsyncioTestCase):
 
     async def test_launches_concurrently_and_exposes_only_rank_zero(self):
         replica, created, handles = self.make_replica()
-        await asyncio.wait_for(replica.launch_servers(), 2)
+        with patch.dict(os.environ, {"RTP_LLM_NATIVE_DIAGNOSTICS_DIR": "/tmp/rtp-native-evidence"}):
+            await asyncio.wait_for(replica.launch_servers(), 2)
         self.assertEqual(replica.server_handle, handles[0])
         self.assertEqual(len(handles), 4)
         for rank, (options, kwargs) in enumerate(created):
             self.assertEqual(options["name"], f"rtp_llm_server_2_{rank}")
+            self.assertEqual(
+                options["runtime_env"]["env_vars"]["RTP_LLM_NATIVE_DIAGNOSTICS_DIR"], "/tmp/rtp-native-evidence"
+            )
             self.assertEqual(kwargs["cuda_visible_devices"], "4,5,6,7")
             self.assertEqual(kwargs["workers"], [replica.workers[rank]])
             handles[rank].configure_tp_peers.remote.assert_awaited_once_with(handles[:rank] + handles[rank + 1 :])

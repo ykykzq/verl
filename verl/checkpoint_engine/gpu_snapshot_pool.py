@@ -1,6 +1,7 @@
 """CPU metadata coordinator for immutable, TP-column-sharded GPU snapshots."""
 
 import asyncio
+import logging
 import math
 import re
 import time
@@ -10,6 +11,7 @@ import torch
 from verl.checkpoint_engine.gpu_snapshot import GPUWeightSnapshot, SnapshotSlots, plan_layout, tensor_dtype
 
 _VISION_PREFIX_RE = re.compile(r"^(model\.)?(visual|vision_tower|vision_model)\.")
+logger = logging.getLogger(__name__)
 
 
 async def settle(calls):
@@ -184,8 +186,7 @@ class GPUSnapshotPool:
                 self.metrics["source_transfer_s"] = (
                     self.metrics.get("source_transfer_s", 0) + time.perf_counter() - started
                 )
-                for i in destinations:
-                    await self.convert_and_store(i, name)
+                await self._convert_columns_and_store(destinations, name)
             except BaseException as error:
                 self.fatal_error = f"GPU snapshot input {name} failed: {type(error).__name__}: {error}"
                 raise
@@ -201,7 +202,19 @@ class GPUSnapshotPool:
         await settle([self.ingest_task])
         self.ingest_task = None
 
+    async def _convert_columns_and_store(self, tp_ranks, name=None, is_last=False):
+        """Measure group wall time while the caller holds the shared I/O lock."""
+        started = time.perf_counter()
+        try:
+            # Columns own disjoint workers; preserve transfer order within each column.
+            await settle([self.convert_and_store(i, name, is_last) for i in tp_ranks])
+        finally:
+            self.metrics["conversion_and_distribution_wall_s"] = (
+                self.metrics.get("conversion_and_distribution_wall_s", 0) + time.perf_counter() - started
+            )
+
     async def convert_and_store(self, tp_rank, name=None, is_last=False):
+        """Conversion/distribution metrics sum column durations, which may overlap."""
         started = time.perf_counter()
         outputs = await self.call(tp_rank, "convert", name, is_last)
         self.metrics["conversion_s"] = self.metrics.get("conversion_s", 0) + time.perf_counter() - started
@@ -238,8 +251,7 @@ class GPUSnapshotPool:
         async with self.io_lock:
             self.require_open()
             try:
-                for i in range(self.tp_size):
-                    await self.convert_and_store(i, is_last=True)
+                await self._convert_columns_and_store(range(self.tp_size), is_last=True)
                 expected = {(i, name) for i, layout in enumerate(self.plan.tensors) for name, _, _ in layout}
                 if self.completed != expected:
                     raise ValueError(f"GPU snapshot is incomplete: {len(expected - self.completed)} missing tensors")
@@ -248,6 +260,7 @@ class GPUSnapshotPool:
                 self.slots.commit(version)
                 self.staging = None
                 self.metrics["export_s"] = time.perf_counter() - self.started
+                logger.info("GPU snapshot sealed version=%s metrics=%s", version, self.metrics)
                 return snapshot
             except BaseException as error:
                 self.fatal_error = f"GPU snapshot seal failed: {error}"

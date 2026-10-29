@@ -396,7 +396,16 @@ class RTPLLMHttpServer:
         try:
             kv_heads = int(text_config.num_key_value_heads)
             kv_heads = max(1, math.ceil(kv_heads / getattr(self.config, "tensor_model_parallel_size", 1)))
-            head_dim = int(text_config.head_dim)
+            head_dim = getattr(text_config, "head_dim", None)
+            if head_dim is None:
+                hidden_size = int(text_config.hidden_size)
+                attention_heads = int(text_config.num_attention_heads)
+                if attention_heads <= 0 or hidden_size % attention_heads:
+                    raise ValueError("cannot derive an integral attention head dimension")
+                head_dim = hidden_size // attention_heads
+            head_dim = int(head_dim)
+            if head_dim <= 0:
+                raise ValueError("attention head dimension must be positive")
             layer_types = list(getattr(text_config, "layer_types", None) or [])
             full_layers = sum(1 for t in layer_types if "full" in str(t)) or int(text_config.num_hidden_layers)
         except (AttributeError, TypeError, ValueError):
@@ -571,6 +580,10 @@ class RTPLLMHttpServer:
 
         self.backend_manager = BackendManager(cfg)
         self.backend_manager.start()
+        if os.environ.get("RTP_LLM_NATIVE_DIAGNOSTICS_DIR"):
+            from rtp_llm.utils.native_diagnostics import capture_native_diagnostics
+
+            capture_native_diagnostics(f"rollout_ready_replica_{self.replica_rank}_tp_{self.tp_rank}")
         self.engine = self.backend_manager.engine
         self._cfg = cfg
         self._set_cache_key_salt(self.global_steps)
@@ -1689,6 +1702,7 @@ class RTPLLMReplica(RolloutReplica):
             for var in (
                 "VERL_RTP_LLM_START_PORT",
                 "RTP_LLM_LOG_LEVEL",
+                "RTP_LLM_NATIVE_DIAGNOSTICS_DIR",
                 "LOG_LEVEL",
                 "PYTHONPATH",
                 "ENABLE_FLASHINFER_TRTLLM_GEN",
