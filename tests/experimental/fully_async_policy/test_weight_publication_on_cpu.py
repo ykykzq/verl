@@ -51,7 +51,7 @@ def config():
         ("async_training.use_dynamic_resource_scheduling", True, "dynamic"),
         ("actor_rollout_ref.model.lora.rank", 8, "LoRA"),
         ("rollout.nnodes", 0, "standalone"),
-        ("actor_rollout_ref.rollout.name", "vllm", "rtp_llm"),
+        ("actor_rollout_ref.rollout.name", "vllm", "trainer-side HF snapshot plan"),
         ("actor_rollout_ref.rollout.fine_grained_weight_update.enabled", False, "fine_grained"),
     ],
 )

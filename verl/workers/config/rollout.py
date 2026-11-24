@@ -169,16 +169,28 @@ class JointSchedulingConfig(BaseConfig):
     """Weight-centered admission, migration and independently paced updates."""
 
     enabled: bool = False
+    policy: str = "joint"
+    laminar_poll_interval_s: float = 5.0
+    laminar_source_max_kv_usage: float = 0.5
+    laminar_destination_max_kv_usage: float = 0.95
     kv_capacity_tokens: int = 0
     max_batch_size: int = 0
     kv_block_size_tokens: int = 16
+    # Prefix accounting is a routing estimate; the native allocator remains authoritative.
+    kv_admission_mode: str = "maximum"
+    kv_growth_tokens: int = 256
     poll_interval_s: float = 0.1
     update_cooldown_s: float = 5.0
     min_decode_window_s: float = 2.0
     min_decode_tokens: int = 64
-    max_defer_s: float = 30.0
+    # None disables forced catch-up; decode protection and capacity still apply.
+    max_defer_s: float | None = None
+    # Completed prompt groups, independent of optimizer batch size.
+    completed_queue_size: int = 128
     evacuation_timeout_s: float = 5.0
     sparse_request_threshold: int = 1
+    # version_kl retains the legacy probe gate; version disables all tail probes.
+    staleness_mode: str = "version_kl"
     staleness_version_gap: int = 2
     tail_tokens: int = 32
     tail_kl_threshold: float = 0.1
@@ -188,23 +200,34 @@ class JointSchedulingConfig(BaseConfig):
     overload_threshold: float = 0.9
 
     def __post_init__(self):
+        if self.policy not in ("joint", "laminar"):
+            raise ValueError("rollout scheduling policy must be joint or laminar")
+        if not 0 <= self.laminar_source_max_kv_usage <= self.laminar_destination_max_kv_usage <= 1:
+            raise ValueError("Laminar KV thresholds must be ordered fractions in [0, 1]")
+        if self.kv_admission_mode not in ("maximum", "prefix"):
+            raise ValueError("joint_scheduling.kv_admission_mode must be maximum or prefix")
+        if self.staleness_mode not in ("version_kl", "version"):
+            raise ValueError("joint_scheduling.staleness_mode must be version_kl or version")
         integer_minima = {
             "kv_capacity_tokens": 1 if self.enabled else 0,
             "max_batch_size": 1 if self.enabled else 0,
             "kv_block_size_tokens": 1,
+            "kv_growth_tokens": 1,
             "min_decode_tokens": 0,
             "sparse_request_threshold": 0,
             "staleness_version_gap": 1,
             "tail_tokens": 1,
             "max_concurrent_probes": 1,
+            "completed_queue_size": 1,
         }
         for name, minimum in integer_minima.items():
             value = getattr(self, name)
             if type(value) is not int or value < minimum:
                 raise ValueError(f"joint_scheduling.{name} must be an integer >= {minimum}")
-        positive = {"poll_interval_s", "max_defer_s", "probe_timeout_s"}
+        positive = {"poll_interval_s", "laminar_poll_interval_s", "max_defer_s", "probe_timeout_s"}
         for name in (
             "poll_interval_s",
+            "laminar_poll_interval_s",
             "update_cooldown_s",
             "min_decode_window_s",
             "max_defer_s",
@@ -214,6 +237,8 @@ class JointSchedulingConfig(BaseConfig):
             "probe_timeout_s",
         ):
             value = getattr(self, name)
+            if name == "max_defer_s" and value is None:
+                continue
             if (
                 type(value) not in (int, float)
                 or not math.isfinite(value)
@@ -256,14 +281,44 @@ class GPUSnapshotConfig(BaseConfig):
     max_conversion_bytes: int = 8 << 30
     max_tensor_bytes: int = 4 << 30
     chunk_bytes: int = 256 << 20
+    bucket_bytes: int = 0  # 0 retains the legacy per-tensor path
+    pipeline_depth: int = 0  # opt-in: two input and two output slots
     operation_timeout_s: float = 120.0
     reserve_timeout_s: float = 600.0
+    conversion_location: str = "rollout"
+    trainer_tp_ranks: list[int] = field(default_factory=list)
+    cache_conversion_plan: bool = False
+    memory_planning: str = "legacy"
+    converter_replica_rank: Optional[int] = None
 
     def __post_init__(self):
+        if self.conversion_location not in {"rollout", "trainer"}:
+            raise ValueError("conversion_location must be rollout or trainer")
+        if self.conversion_location == "trainer":
+            if not self.cache_conversion_plan or self.memory_planning != "role":
+                raise ValueError("trainer conversion requires cached plans and role memory budgeting")
+            if not self.trainer_tp_ranks or any(type(r) is not int or r < 0 for r in self.trainer_tp_ranks):
+                raise ValueError("trainer conversion requires an explicit trainer_tp_ranks mapping")
+        if type(self.cache_conversion_plan) is not bool:
+            raise ValueError("cache_conversion_plan must be bool")
+        if self.cache_conversion_plan and self.pipeline_depth != 2:
+            raise ValueError("cached conversion plans require the bounded pipeline")
+        if self.memory_planning not in {"legacy", "role"}:
+            raise ValueError("GPU snapshot memory_planning must be legacy or role")
+        if self.memory_planning == "role":
+            from verl.checkpoint_engine.snapshot_memory import snapshot_memory_role
+
+            snapshot_memory_role(self, 0, 0)
         for name in ("slots", "max_bytes_per_gpu", "max_conversion_bytes", "max_tensor_bytes", "chunk_bytes"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"weight_publication.gpu_snapshot.{name} must be a positive integer")
+        if type(self.bucket_bytes) is not int or not 0 <= self.bucket_bytes <= self.max_tensor_bytes:
+            raise ValueError("GPU bucket_bytes must be zero or fit max_tensor_bytes")
+        if type(self.pipeline_depth) is not int or self.pipeline_depth not in (0, 2):
+            raise ValueError("GPU pipeline_depth must be 0 or 2")
+        if self.pipeline_depth and (not self.bucket_bytes or 2 * self.bucket_bytes > self.max_tensor_bytes):
+            raise ValueError("GPU pipeline requires two buckets within max_tensor_bytes")
         if self.slots < 2:
             raise ValueError("GPU publication requires at least two version slots")
         if self.chunk_bytes > min(self.max_bytes_per_gpu, self.max_tensor_bytes):
@@ -292,21 +347,21 @@ class WeightPublicationConfig(BaseConfig):
             raise ValueError("weight_publication.transport must be 'ray', 'mooncake_rdma' or 'nccl_gpu'")
         if self.transport != "ray" and not self.enabled:
             raise ValueError(f"{self.transport} transport requires weight_publication.enabled=True")
-        if isinstance(self.gpu_snapshot, (dict, DictConfig)):
+        if isinstance(self.gpu_snapshot, dict | DictConfig):
             values = self.gpu_snapshot
             if isinstance(values, DictConfig):
                 values = OmegaConf.to_container(values, resolve=True)
             object.__setattr__(self, "gpu_snapshot", GPUSnapshotConfig(**values))
         elif not isinstance(self.gpu_snapshot, GPUSnapshotConfig):
             raise TypeError("weight_publication.gpu_snapshot must be dict, DictConfig, or GPUSnapshotConfig")
-        if isinstance(self.relay, (dict, DictConfig)):
+        if isinstance(self.relay, dict | DictConfig):
             relay = self.relay
             if isinstance(relay, DictConfig):
                 relay = OmegaConf.to_container(relay, resolve=True)
             object.__setattr__(self, "relay", WeightRelayConfig(**relay))
         elif not isinstance(self.relay, WeightRelayConfig):
             raise TypeError("weight_publication.relay must be dict, DictConfig, or WeightRelayConfig")
-        if isinstance(self.joint_scheduling, (dict, DictConfig)):
+        if isinstance(self.joint_scheduling, dict | DictConfig):
             joint = self.joint_scheduling
             if isinstance(joint, DictConfig):
                 joint = OmegaConf.to_container(joint, resolve=True)
@@ -322,8 +377,12 @@ class TrajectoryMigrationConfig(BaseConfig):
     """Dynamic scheduling of an in-progress trajectory across rollout replicas."""
 
     enabled: bool = False
+    # Keep version-fenced continuation/cache support without moving trajectories.
+    scheduling_enabled: bool = True
     allow_cross_version_recompute: bool = False
     checkpoint_tokens: int = 64
+    checkpoint_mode: str = "periodic"
+    progress_poll_interval_s: float = 1.0
     scorer_class: str = "verl.workers.rollout.trajectory_scheduler.LoadAwareTrajectoryReplicaScorer"
     scorer_kwargs: dict = field(default_factory=dict)
     gate_classes: list[str] = field(
@@ -345,6 +404,16 @@ class TrajectoryMigrationConfig(BaseConfig):
     backend_options: dict = field(default_factory=dict)
 
     def __post_init__(self):
+        if type(self.scheduling_enabled) is not bool:
+            raise ValueError("trajectory_migration.scheduling_enabled must be boolean")
+        if self.checkpoint_mode not in ("periodic", "on_demand"):
+            raise ValueError("trajectory_migration.checkpoint_mode must be periodic or on_demand")
+        if (
+            type(self.progress_poll_interval_s) not in (int, float)
+            or not math.isfinite(self.progress_poll_interval_s)
+            or self.progress_poll_interval_s <= 0
+        ):
+            raise ValueError("trajectory_migration.progress_poll_interval_s must be finite and positive")
         if self.checkpoint_tokens <= 0:
             raise ValueError("trajectory_migration.checkpoint_tokens must be positive")
         if (
@@ -418,6 +487,15 @@ class RolloutConfig(BaseConfig):
     logprobs_mode: Optional[str] = "processed_logprobs"
     scheduling_policy: Optional[str] = "fcfs"
 
+    # RTP-specific opt-ins. Keep legacy defaults for existing experiments.
+    rtp_scheduler_mode: str = "fifo"
+    rtp_decode_prefill_ratio: str = "1"
+    # Queue up to max_num_seqs, while separately bounding initialized native KV.
+    rtp_separate_kv_admission: bool = False
+    rtp_remote_cache_lookup_policy: str = "legacy"
+    rtp_remote_cache_write_policy: str = "legacy"
+    rtp_reprefill_profile_dir: Optional[str] = None
+
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
 
@@ -428,6 +506,8 @@ class RolloutConfig(BaseConfig):
 
     # Ray max_concurrency of the rollout server actor.
     ray_actor_max_concurrency: int = 1024
+    # Router-level trajectory RPC limit, independent of native decode/KV capacity.
+    max_concurrent_requests_per_replica: Optional[int] = None
 
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size: Optional[int] = None
@@ -510,6 +590,25 @@ class RolloutConfig(BaseConfig):
     def __post_init__(self):
         """Validate the rollout config"""
         if self.name == "rtp_llm":
+            if self.rtp_scheduler_mode not in {"fifo", "ratio"}:
+                raise ValueError("rtp_scheduler_mode must be fifo or ratio")
+            if self.rtp_separate_kv_admission and self.rtp_scheduler_mode != "ratio":
+                raise ValueError("rtp_separate_kv_admission requires the ratio scheduler")
+            ratio = self.rtp_decode_prefill_ratio
+            if not isinstance(ratio, str) or not (
+                (ratio.isdecimal() and int(ratio) >= 0)
+                or (ratio.startswith("1/") and ratio[2:].isdecimal() and int(ratio[2:]) > 0)
+            ):
+                raise ValueError("rtp_decode_prefill_ratio must be N or 1/N, with nonnegative integer N")
+            if self.rtp_remote_cache_write_policy not in {"legacy", "migration_only"}:
+                raise ValueError("rtp_remote_cache_write_policy must be legacy or migration_only")
+            if self.rtp_remote_cache_lookup_policy not in {"legacy", "migration_only"}:
+                raise ValueError("rtp_remote_cache_lookup_policy must be legacy or migration_only")
+            if self.rtp_reprefill_profile_dir is not None and (
+                not isinstance(self.rtp_reprefill_profile_dir, str)
+                or not self.rtp_reprefill_profile_dir.startswith("/")
+            ):
+                raise ValueError("rtp_reprefill_profile_dir must be an absolute container path")
             if type(self.tensor_model_parallel_size) is not int or self.tensor_model_parallel_size < 1:
                 raise ValueError("rtp_llm tensor_model_parallel_size must be a positive integer")
             for field_name in ("data_parallel_size", "pipeline_model_parallel_size", "expert_parallel_size"):
@@ -599,10 +698,10 @@ class RolloutConfig(BaseConfig):
                 FineGrainedWeightUpdateConfig(**OmegaConf.to_container(self.fine_grained_weight_update, resolve=True)),
             )
 
-        if self.fine_grained_weight_update.enabled and self.name != "rtp_llm":
-            raise ValueError("fine-grained weight updates currently support rollout.name=rtp_llm only")
+        if self.fine_grained_weight_update.enabled and self.name not in ("rtp_llm", "vllm"):
+            raise ValueError("fine-grained weight updates require rollout.name=rtp_llm or vllm")
 
-        if isinstance(self.weight_publication, (dict, DictConfig)):
+        if isinstance(self.weight_publication, dict | DictConfig):
             publication = self.weight_publication
             if isinstance(publication, DictConfig):
                 publication = OmegaConf.to_container(publication, resolve=True)
@@ -610,10 +709,25 @@ class RolloutConfig(BaseConfig):
         elif not isinstance(self.weight_publication, WeightPublicationConfig):
             raise TypeError("rollout.weight_publication must be dict, DictConfig, or WeightPublicationConfig")
         if self.weight_publication.enabled:
-            if self.name != "rtp_llm":
-                raise ValueError("weight_publication requires rollout.name=rtp_llm")
+            if self.name not in ("rtp_llm", "vllm"):
+                raise ValueError("weight_publication requires rollout.name=rtp_llm or vllm")
             if not self.fine_grained_weight_update.enabled:
                 raise ValueError("weight_publication requires fine_grained_weight_update.enabled=True")
+        if self.name == "vllm" and self.fine_grained_weight_update.enabled:
+            publication = self.weight_publication
+            if (
+                not publication.enabled
+                or publication.transport != "nccl_gpu"
+                or self.tensor_model_parallel_size != 1
+                or self.pipeline_model_parallel_size != 1
+                or self.data_parallel_size != 1
+                or publication.gpu_snapshot.conversion_location != "trainer"
+                or not publication.gpu_snapshot.cache_conversion_plan
+                or self.quantization is not None
+            ):
+                raise ValueError(
+                    "vLLM fine-grained updates require unquantized TP1 NCCL publication with a trainer-side HF snapshot plan"
+                )
 
         if isinstance(self.trajectory_migration, dict):
             object.__setattr__(
@@ -634,16 +748,20 @@ class RolloutConfig(BaseConfig):
             )
 
         if self.trajectory_migration.enabled:
-            if self.name != "rtp_llm":
-                raise ValueError("trajectory migration currently supports rollout.name=rtp_llm only")
+            if self.name not in ("rtp_llm", "vllm"):
+                raise ValueError("trajectory migration requires rollout.name=rtp_llm or vllm")
+            if self.name == "vllm" and not self.weight_publication.enabled:
+                raise ValueError("vLLM trajectory migration requires versioned weight_publication")
             if self.trajectory_migration.kv_transfer_backend != "remote_prefix":
-                raise ValueError("rtp_llm trajectory migration currently requires kv_transfer_backend=remote_prefix")
+                raise ValueError("trajectory migration requires kv_transfer_backend=remote_prefix")
             if not self.enable_prefix_caching and not self.trajectory_migration.allow_cross_version_recompute:
                 raise ValueError("rtp_llm trajectory migration requires rollout.enable_prefix_caching=True")
 
         if self.weight_publication.joint_scheduling.enabled:
             if not self.trajectory_migration.enabled:
                 raise ValueError("joint_scheduling requires trajectory_migration.enabled=True")
+            if not self.trajectory_migration.scheduling_enabled:
+                raise ValueError("joint_scheduling requires trajectory migration scheduling")
             if not self.trajectory_migration.allow_cross_version_recompute:
                 raise ValueError("joint_scheduling requires trajectory_migration.allow_cross_version_recompute=True")
             if not self.enable_prefix_caching:

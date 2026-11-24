@@ -35,6 +35,7 @@ class JointReplicaScheduler:
         self.clock = time.monotonic
         self.latest_version: int | None = None
         self.trajectories: dict[str, Trajectory] = {}
+        self._placed_usage: dict[str | None, tuple[int, int]] = {}
         self.reservations: dict[str, str] = {}
         self.pending_since: dict[str, float] = {}
         self.updated_at: dict[str, float] = {}
@@ -52,6 +53,12 @@ class JointReplicaScheduler:
         block = self.config.kv_block_size_tokens
         return ((tokens + block - 1) // block) * block
 
+    def reservation_tokens(self, prompt_tokens, max_new_tokens, generated_tokens=0):
+        remaining = max_new_tokens
+        if self.config.kv_admission_mode == "prefix":
+            remaining = min(max_new_tokens, generated_tokens + self.config.kv_growth_tokens)
+        return self.rounded_tokens(prompt_tokens + remaining)
+
     def register(self, request_id, prompt_tokens, max_new_tokens):
         if request_id in self.trajectories:
             raise ValueError(f"trajectory {request_id!r} is already registered")
@@ -65,20 +72,39 @@ class JointReplicaScheduler:
         sequence_limits = [m.get("max_sequence_tokens") for m in self.engine_limits.values()]
         if sequence_limits and all(v is not None and prompt_tokens + max_new_tokens > v for v in sequence_limits):
             raise ValueError("trajectory exceeds every replica's sequence limit")
-        self.trajectories[request_id] = Trajectory(prompt_tokens, max_new_tokens, budget)
+        self.trajectories[request_id] = Trajectory(
+            prompt_tokens, max_new_tokens, self.reservation_tokens(prompt_tokens, max_new_tokens)
+        )
+        self._adjust_usage(None, self.trajectories[request_id].capacity_tokens, 1)
 
     def finish(self, request_id):
-        self.trajectories.pop(request_id, None)
+        record = self.trajectories.pop(request_id, None)
+        if record is not None:
+            self._adjust_usage(record.server_id, -record.capacity_tokens, -1)
         self.reservations.pop(request_id, None)
         # A Ray await cancellation is not backend completion. Running probes
         # keep their transient reservations until both scoring RPCs settle.
 
+    def _adjust_usage(self, server_id, token_delta, count_delta):
+        tokens, count = self._placed_usage.get(server_id, (0, 0))
+        if count + count_delta:
+            self._placed_usage[server_id] = (tokens + token_delta, count + count_delta)
+        else:
+            self._placed_usage.pop(server_id, None)
+
+    def _place(self, record, server_id):
+        self._adjust_usage(record.server_id, -record.capacity_tokens, -1)
+        record.server_id = server_id
+        self._adjust_usage(server_id, record.capacity_tokens, 1)
+
     def usage(self, server_id, exclude=None):
-        tokens, count = 0, 0
-        for rid, record in self.trajectories.items():
-            if rid != exclude and record.server_id == server_id:
-                tokens += record.capacity_tokens
-                count += 1
+        # Progress previews can evaluate every replica on each polling tick.
+        # Use the ownership totals rather than rescanning all active requests.
+        tokens, count = self._placed_usage.get(server_id, (0, 0))
+        excluded = self.trajectories.get(exclude)
+        if excluded is not None and excluded.server_id == server_id:
+            tokens -= excluded.capacity_tokens
+            count -= 1
         for rid, target in self.reservations.items():
             record = self.trajectories.get(rid)
             if rid != exclude and target == server_id and record is not None and record.server_id != server_id:
@@ -95,21 +121,30 @@ class JointReplicaScheduler:
         record = self.trajectories[request_id]
         sequence_limit = self.engine_limits.get(server_id, {}).get("max_sequence_tokens")
         return (
-            tokens + record.capacity_tokens <= self.config.kv_capacity_tokens
+            tokens + record.capacity_tokens <= self.kv_limit(server_id)
             and count + 1 <= self.batch_limit(server_id)
             and (sequence_limit is None or record.prompt_tokens + record.max_new_tokens <= sequence_limit)
         )
 
+    def kv_limit(self, server_id):
+        actual = self.engine_limits.get(server_id, {}).get("kv_capacity_tokens")
+        return min(self.config.kv_capacity_tokens, actual) if actual is not None else self.config.kv_capacity_tokens
+
     def batch_limit(self, server_id):
         actual = self.engine_limits.get(server_id, {}).get("max_batch_size")
-        return min(self.config.max_batch_size, actual) if actual is not None else self.config.max_batch_size
+        rpc_limit = self.engine_limits.get(server_id, {}).get("max_concurrent_requests")
+        return min(x for x in (self.config.max_batch_size, actual, rpc_limit) if x is not None)
+
+    def defer_deadline(self, since):
+        limit = self.config.max_defer_s
+        return math.inf if limit is None else since + limit
 
     def protected(self, record, deadline=math.inf):
         if record.moved_at == -math.inf:
             return False
         return self.clock() - record.moved_at < self.config.min_decode_window_s or (
             record.generated_tokens - record.moved_tokens < self.config.min_decode_tokens
-            and self.clock() < min(deadline, record.moved_at + self.config.max_defer_s)
+            and self.clock() < min(deadline, self.defer_deadline(record.moved_at))
         )
 
     def prepare(self, version, states):
@@ -137,12 +172,16 @@ class JointReplicaScheduler:
                 type(actual) is not int or actual <= 0 or self.config.kv_block_size_tokens % actual
             ):
                 raise ValueError(f"joint KV block accounting is incompatible with replica {sid}: {actual}")
-            for key in ("max_sequence_tokens", "max_batch_size"):
+            for key in ("max_sequence_tokens", "max_batch_size", "kv_capacity_tokens", "max_concurrent_requests"):
                 value = meta.get(key)
                 if value is not None and (type(value) is not int or value <= 0):
                     raise ValueError(f"invalid {key} capacity reported by replica {sid}")
             self.engine_limits.setdefault(sid, {}).update(
-                {k: meta[k] for k in ("max_sequence_tokens", "max_batch_size") if meta.get(k) is not None}
+                {
+                    k: meta[k]
+                    for k in ("max_sequence_tokens", "max_batch_size", "kv_capacity_tokens", "max_concurrent_requests")
+                    if meta.get(k) is not None
+                }
             )
 
     def acquire(self, request_id, states, preferred=None):
@@ -157,21 +196,21 @@ class JointReplicaScheduler:
                 raise RuntimeError("No available servers in load balancer")
             if record.generated_tokens:
                 raise RuntimeError("Joint trajectory continuation requires migration")
-            record.server_id = None
+            self._place(record, None)
         candidates = [
             sid
             for sid, state in states.items()
-            if state["lifecycle_state"] == "SERVING"
-            and (self.latest_version is None or self.version(state["weight_version"]) >= self.latest_version)
-            and sid not in self.evacuating
-            and self.fits(sid, request_id)
+            if state["lifecycle_state"] == "SERVING" and sid not in self.evacuating and self.fits(sid, request_id)
         ]
         if not candidates:
             raise RuntimeError("No available servers in load balancer")
+        # Publication is not installation. Continue admitting on the newest
+        # serving version until the first newer replica becomes ready. An
+        # evacuating source is excluded above so it can actually drain.
         newest = max(self.version(states[sid]["weight_version"]) for sid in candidates)
         candidates = [sid for sid in candidates if self.version(states[sid]["weight_version"]) == newest]
         sid = preferred if preferred in candidates else min(candidates, key=lambda s: (self.usage(s)[1], s))
-        record.server_id = sid
+        self._place(record, sid)
         record.weight_version = states[sid]["weight_version"]
         return sid
 
@@ -196,7 +235,7 @@ class JointReplicaScheduler:
             if now - self.updated_at.get(sid, -math.inf) < self.config.update_cooldown_s:
                 continue
             if any(
-                self.protected(r, self.pending_since[sid] + self.config.max_defer_s)
+                self.protected(r, self.defer_deadline(self.pending_since[sid]))
                 for r in self.trajectories.values()
                 if r.server_id == sid
             ):
@@ -206,7 +245,7 @@ class JointReplicaScheduler:
             candidates.append(sid)
         if not candidates:
             return {"server_id": None, "reason": "cooldown, protected decode, or no eligible replica"}
-        deadlines = [s for s in candidates if now - self.pending_since[s] >= self.config.max_defer_s]
+        deadlines = [s for s in candidates if now >= self.defer_deadline(self.pending_since[s])]
         if deadlines:
             sid = min(deadlines, key=lambda s: (self.pending_since[s], self.usage(s)[1], s))
             self.evacuating.setdefault(sid, now)
@@ -235,6 +274,10 @@ class JointReplicaScheduler:
             return {"server_id": sid, "reason": "bounded evacuation expired"}
         return {"server_id": None, "reason": f"evacuating {sid}"}
 
+    def version_stale(self, source_version, target_version):
+        source, target = self.version(source_version), self.version(target_version)
+        return source >= 0 and target - source >= self.config.staleness_version_gap
+
     def target(self, request_id, source_id, source_metadata, snapshots, required):
         record = self.trajectories.get(request_id)
         if record is None:
@@ -248,19 +291,31 @@ class JointReplicaScheduler:
         if required and source is not None and source.lifecycle_state == "SERVING":
             if source.metadata.get("weight_version") == old_version:
                 return source_id, "resume source"
-        fresh = required or (
-            record.staleness.get("source_version") == old_version
-            and record.staleness.get("kl", -1.0) >= self.config.tail_kl_threshold
-        )
+        version_only = self.config.staleness_mode == "version"
+        if version_only:
+            # Only installed, serving versions can be continuation targets.
+            # Publication metadata alone does not make a new version usable.
+            stale = any(
+                replica.lifecycle_state == "SERVING"
+                and self.version_stale(old_version, replica.metadata.get("weight_version"))
+                and self.compatible(source_metadata, replica.metadata, False)
+                for replica in snapshots
+            )
+        else:
+            stale = (
+                record.staleness.get("source_version") == old_version
+                and record.staleness.get("kl", -1.0) >= self.config.tail_kl_threshold
+            )
+        fresh = required or stale
         candidates = []
         for replica in snapshots:
             sid, meta = replica.server_id, replica.metadata
             if replica.lifecycle_state != "SERVING" or sid in self.evacuating or not self.fits(sid, request_id):
                 continue
-            if sid in self.pending_since and self.clock() + self.config.min_decode_window_s >= (
-                self.pending_since[sid] + self.config.max_defer_s
-            ):
-                continue
+            # A pending publication is not an update lease. Reservation and
+            # post-commit decode protection fence this destination against
+            # select_update; its original publication deadline must not veto
+            # every same-version target before evacuation can start.
             same = meta.get("weight_version") == old_version
             if not self.compatible(source_metadata, meta, same and not (required and unavailable)):
                 continue
@@ -269,21 +324,23 @@ class JointReplicaScheduler:
                     continue
                 if same and not (required and unavailable):
                     continue
-                if not required and meta.get("weight_version") != record.staleness.get("target_version"):
-                    continue
+                if not required:
+                    if version_only and not self.version_stale(old_version, meta.get("weight_version")):
+                        continue
+                    if not version_only and meta.get("weight_version") != record.staleness.get("target_version"):
+                        continue
             elif sid == source_id or not same:
                 continue
             candidates.append(sid)
         if fresh and candidates:
             return min(
                 candidates, key=lambda s: (-self.version(by_id[s].metadata.get("weight_version")), self.usage(s)[1], s)
-            ), "staleness or version-fenced continuation"
+            ), "version-gap staleness" if version_only and not required else "staleness or version-fenced continuation"
         if source_id in self.evacuating and candidates:
             return max(candidates, key=lambda s: (self.usage(s)[1], self.usage(s)[0], s)), "same-version evacuation"
         tokens, count = self.usage(source_id)
-        overloaded = (
-            tokens >= self.config.kv_capacity_tokens * self.config.overload_threshold
-            or count >= self.batch_limit(source_id)
+        overloaded = tokens >= self.kv_limit(source_id) * self.config.overload_threshold or count >= self.batch_limit(
+            source_id
         )
         candidates = [s for s in candidates if self.usage(s)[1] + 1 < count]
         if overloaded and candidates:
@@ -299,7 +356,7 @@ class JointReplicaScheduler:
 
     def commit_migration(self, request_id, target_id, resume_source=False):
         record = self.trajectories[request_id]
-        record.server_id = target_id
+        self._place(record, target_id)
         if not resume_source:
             record.moved_at = self.clock()
             record.moved_tokens = record.generated_tokens
@@ -316,10 +373,15 @@ class JointReplicaScheduler:
         ):
             raise ValueError("invalid cumulative trajectory token count")
         record.generated_tokens = generated_tokens
+        capacity = self.reservation_tokens(record.prompt_tokens, record.max_new_tokens, generated_tokens)
+        self._adjust_usage(server_id, capacity - record.capacity_tokens, 0)
+        record.capacity_tokens = capacity
         record.weight_version = version
         return record
 
     def maybe_probe(self, request_id, prefix_ids, states, metadata, servers):
+        if self.config.staleness_mode == "version":
+            return
         record = self.trajectories[request_id]
         now = self.clock()
         if (
@@ -352,7 +414,7 @@ class JointReplicaScheduler:
             used, count = self.usage(sid)
             limit = self.engine_limits.get(sid, {}).get("max_sequence_tokens")
             return (
-                used + budget <= self.config.kv_capacity_tokens
+                used + budget <= self.kv_limit(sid)
                 and count + 1 <= self.batch_limit(sid)
                 and (limit is None or len(prefix_ids) + 1 <= limit)
             )
@@ -423,6 +485,7 @@ class JointReplicaScheduler:
     def status(self):
         return dict(
             latest_version=self.latest_version,
+            staleness_mode=self.config.staleness_mode,
             registered_trajectories=len(self.trajectories),
             evacuating=dict(self.evacuating),
             pending_since=dict(self.pending_since),

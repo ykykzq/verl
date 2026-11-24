@@ -6,11 +6,15 @@ It preserves the existing admission/drain/re-prefill scheduling and installs
 exactly one rollout replica at a time. CPU relay publication remains available
 as `mooncake_rdma`; the original Ray snapshot transport remains the default.
 
+For conversion on trainer GPUs with cached RTP rules and role-specific memory
+budgets, see [trainer-side conversion](trainer_conversion.md). The data flow
+below describes the default rollout conversion path.
+
 ## Data Flow
 
 1. Reserve an immutable version slot before exporting. The trainer's existing
    per-tensor FSDP collective produces full HF tensors on GPU. Rank zero sends
-   the required tensors to the TP workers of one conversion replica.
+   the required tensors to the conversion workers, one per TP column.
 2. Each RTP worker uses its actual loader, TP rank and resident runtime layout
    to convert those tensors without overwriting inference weights. CUDA IPC
    connects each checkpoint worker to its local RTP process.
@@ -24,13 +28,48 @@ as `mooncake_rdma`; the original Ray snapshot transport remains the default.
    its TP-local tensors with directed NCCL sends/receives, and installs them
    directly without another HF-to-runtime transformation.
 
-The first implementation retains FSDP's full per-tensor export and sends source
-tensors to the conversion TP ranks that need them. It does not directly
-reshard each trainer's local FSDP shard. These source transfers and conversion
-are part of export latency. Publication and installation share a transfer lock
-at tensor boundaries; slot or working-buffer exhaustion applies bounded
-backpressure. Serving on other replicas continues, but GPU compute, memory
-bandwidth and NCCL traffic can still contend with decoding.
+All modes retain FSDP's full per-tensor export; they do not directly reshard each
+trainer's local FSDP shard. The default per-tensor mode shares a transfer lock
+between publication and installation. Bucket mode uses a separate communicator
+and lock per TP column for installation, so fetching a sealed older snapshot
+can overlap publication of a new one. Version pins protect the fetched storage.
+Slot or working-buffer exhaustion applies bounded backpressure. Serving on
+other replicas continues, but GPU compute, memory bandwidth and NCCL traffic
+can still contend with decoding.
+
+## Bucket Pipeline
+
+Both options below are under `actor_rollout_ref.rollout.weight_publication.gpu_snapshot`:
+
+| `bucket_bytes` | `pipeline_depth` | Behavior |
+| --- | --- | --- |
+| 0 | 0 | Original per-tensor publication |
+| Positive | 0 | Packed source buckets and independent per-TP installation fetch |
+| Positive | 2 | Two input buffers, two output batches, and receive/convert/distribute overlap |
+
+For example, `bucket_bytes=536870912` and `pipeline_depth=2` enable a 512 MiB
+target bucket size. Only depths 0 and 2 are accepted; depth 2 requires
+`2 * bucket_bytes <= max_tensor_bytes`. These flags belong in the resolved
+launch configuration on every node. Changing modes requires fresh actors;
+communicator topology cannot be switched in place.
+
+The pipeline has separate input and output credits. Receiving bucket `k+1`
+can overlap converting `k` and distributing `k-1`. An input credit is returned
+only after conversion has completed and released its IPC input reference.
+An output credit is returned after persistent shard copies and remote DMA
+complete and RTP acknowledges that output batch's release. Input broadcast,
+shard distribution and per-TP fetch use independent communicators. Enqueuing a
+CUDA operation does not acknowledge completion. Sealing drains every stage,
+performs the converter's final flush and validates full runtime tensor coverage.
+
+Converters are chosen independently per TP column: prefer actor rank zero's
+node, then other trainer nodes, then stable worker order. This reuses the
+fully-async NCCL multi-sender topology; trainer ranks on the source node act as
+broadcast relays. Every trainer still drains the same FSDP generator. Each
+input broadcast completes on device before its participants advance to the
+next FSDP collective, preserving collective ordering across communicators.
+The overlap is on the rollout pipeline; FSDP all-gather and input broadcast do
+not run concurrently. Replica installation remains limited to one at a time.
 
 NCCL removes CPU tensor staging and Python payload serialization from this
 path. It does not remove PCIe from machines whose GPU/NIC topology uses PCIe.
@@ -51,14 +90,26 @@ are protected, the next export waits up to `reserve_timeout_s`.
 | `max_conversion_bytes` | 8 GiB | Pending input clones, outputs and estimated loader workspace |
 | `max_tensor_bytes` | 4 GiB | Aggregate temporary source/install tensor storage per GPU |
 | `chunk_bytes` | 256 MiB | Runtime shard transfer size |
+| `bucket_bytes` | 0 | Target packed source/install bucket size; 0 disables buckets |
+| `pipeline_depth` | 0 | 0 disables pipelining; 2 enables two input and two output slots |
 | `operation_timeout_s` | 120 s | Native transfer and temporary-buffer wait bounds |
 | `reserve_timeout_s` | 600 s | Version-slot backpressure bound |
 
-Before KV-cache allocation, RTP reserves the three byte budgets above plus its
-IPC bucket. Layout planning also checks the actual per-owner storage across
-all slots. Large individual HF tensors still require a full temporary tensor
-on conversion ranks; runtime distribution itself is chunked. A configured
-limit must fit that largest source tensor as well as each local runtime tensor.
+Before KV-cache allocation, RTP reserves persistent storage, conversion working
+memory and temporary tensor storage plus its IPC bucket. Pipeline mode doubles
+the conversion-memory reservation to cover two live output batches. Version
+slots and pipeline buffer slots are distinct: persistent versions are bounded
+by `slots` and `max_bytes_per_gpu`, while all input/install temporary buffers
+on a worker share `max_tensor_bytes`. Layout planning checks actual per-owner
+storage across all version slots.
+
+A single HF or runtime tensor may exceed `bucket_bytes`; that tensor is put
+in its own bucket and must still fit `max_tensor_bytes`. Large HF tensors need
+full temporary storage on conversion ranks; runtime distribution is chunked.
+When two large inputs cannot coexist within the budget, allocation waits for
+the preceding conversion to release its input. The source likewise drops an
+older, completed broadcast buffer before allocating a larger one. A configured
+limit must fit the largest source tensor and each local runtime tensor.
 Custom loader kernels may require more than their conservative workspace
 estimate; real CUDA peak-memory validation remains necessary. These defaults
 are not evidence that Qwen3.8-27B fits a particular L20C memory configuration.
@@ -79,8 +130,16 @@ quarantine for a proven application-level error.
 
 `WeightPublisher.get_status()` exposes per-version slots/readers, per-GPU shard
 bytes, staging and tensor progress, fatal state and export/conversion/transfer/
-install timings. Strict learning and remote-KV acceptance remain separate from
-weight transfer success.
+install timings. Pipeline metrics additionally report the selected topology,
+input/output high-water counts and per-bucket `pipeline_events`. These events
+measure host spans including RPC and waiting; they are not kernel utilization
+or precise DMA bandwidth measurements. Strict learning and remote-KV acceptance
+remain separate from weight transfer success.
+
+Shutdown closes admission before draining pending allocation, reception,
+conversion, distribution and installation. Partially allocated inputs or
+failed distribution poison the pool and retain owned storage for worker
+restart; closing a failed pool cannot discard those owners.
 
 Run the [validation guide](gpu_snapshot_validation.md) in this order: directed
 NCCL and storage fidelity, actual RTP TP4 conversion/install, native remote KV

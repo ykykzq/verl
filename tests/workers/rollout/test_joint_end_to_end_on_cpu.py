@@ -153,7 +153,7 @@ async def eventually(predicate, timeout=3):
 
 
 @pytest.mark.asyncio
-async def test_publication_evacuates_checkpoints_then_recomputes_survivors_and_admits_only_fresh_requests():
+async def test_publication_migrates_checkpoints_and_keeps_admitting_on_ready_replicas():
     joint = {
         "enabled": True,
         "kv_capacity_tokens": 128,
@@ -231,21 +231,23 @@ async def test_publication_evacuates_checkpoints_then_recomputes_survivors_and_a
 
         await scheduler.publish(SimpleNamespace(version=1))
         await eventually(lambda: "s1" in router._joint.evacuating)
-        tasks["new"] = asyncio.create_task(client.generate("new", prompt_ids=[1, 2], sampling_params={"max_tokens": 2}))
-        await eventually(lambda: "new" in router._joint.trajectories)
-        assert router._joint.trajectories["new"].server_id is None
-        assert not any(rid == "new" for backend in backends.values() for rid, _, _ in backend.generated)
-
         evacuate.set()
         await eventually(lambda: ("b", 4) in reached)
         await asyncio.wait_for(manager.first_update_started.wait(), 1)
         assert manager.transfers[-1] == ("s1", 1, (0, 0))
         assert backends["s0"].migrations[0] == ("b", "remote_prefix", [1, 2, 10, 11])
         assert router._joint.usage("s0") == (24, 3)
-        assert not tasks["new"].done()
+
+        tasks["during_install"] = asyncio.create_task(
+            client.generate("during_install", prompt_ids=[1, 2], sampling_params={"max_tokens": 2})
+        )
+        during_install = await asyncio.wait_for(tasks["during_install"], 1)
+        assert during_install.extra_fields["max_global_steps"] == 0
+        assert ("during_install", 0, [1, 2]) in backends["s0"].generated
 
         manager.release_first_update.set()
         await eventually(lambda: router.get_replica_states()["s1"]["weight_version"] == 1)
+        tasks["new"] = asyncio.create_task(client.generate("new", prompt_ids=[1, 2], sampling_params={"max_tokens": 2}))
         await eventually(lambda: "s0" in router._joint.evacuating)
         clock[0] += 0.1
         await scheduler.wait_for_version(1, timeout_s=2)

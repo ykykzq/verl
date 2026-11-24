@@ -719,8 +719,47 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update", scheduled=True)
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
-        output = self.actor.train_mini_batch(data=data)
-        return output.cpu() if output is not None else None
+        timing = nullcontext()
+        timing_dir = os.environ.get("VERL_ACTOR_TIMING_DIR")
+        if timing_dir:
+            from verl.utils.flops_counter import get_device_flops
+            from verl.workers.actor_timing import ActorUpdateTiming
+
+            def minibatch_metadata(args, kwargs):
+                batch = kwargs.get("data", args[0] if args else None)
+                token_lengths = tu.get(batch, "global_token_num", default=None)
+                return {
+                    "global_sequences": None if token_lengths is None else len(token_lengths),
+                    "global_valid_input_tokens": None if token_lengths is None else sum(token_lengths),
+                    "global_max_input_tokens": None if token_lengths is None else max(token_lengths, default=0),
+                }
+
+            timing = ActorUpdateTiming(
+                self.actor,
+                timing_dir,
+                cuda=torch.cuda,
+                rank=torch.distributed.get_rank(),
+                world_size=torch.distributed.get_world_size(),
+                metadata={
+                    "global_step": tu.get(data, "actor_timing_global_step", default=None),
+                    "previous_weight_version": tu.get(data, "actor_timing_previous_weight_version", default=None),
+                    "local_batch_size": len(data),
+                    "global_mini_batch_size": tu.get(data, "mini_batch_size", default=None),
+                    "epochs": tu.get(data, "epochs", default=1),
+                    "data_parallel_size": self.actor.engine.get_data_parallel_size(),
+                    "micro_batch_size_per_gpu": self.actor.engine_config.micro_batch_size_per_gpu,
+                    "dynamic_batch_size": self.actor.engine_config.use_dynamic_bsz,
+                    "param_offload": self.actor.engine.is_param_offload_enabled,
+                    "optimizer_offload": self.actor.engine.is_optimizer_offload_enabled,
+                    "verify_parameter_updates": self.actor.optimizer_config.verify_parameter_updates,
+                    "cuda_device_name": torch.cuda.get_device_name(),
+                    "mfu_promised_tflops_per_gpu": get_device_flops(),
+                },
+                minibatch_metadata=minibatch_metadata,
+            )
+        with timing:
+            output = self.actor.train_mini_batch(data=data)
+            return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
@@ -741,22 +780,43 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return ray.get_runtime_context().get_node_id() if torch.distributed.get_rank() == 0 else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def initialize_gpu_snapshot(self, world_size, unique_id, timeout_s):
+    async def get_gpu_snapshot_node_id(self):
+        import ray
+
+        return ray.get_runtime_context().get_node_id()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def get_conversion_source_layout(self):
+        from verl.checkpoint_engine.conversion_layout import trainer_source_layout
+
+        return trainer_source_layout(self.actor.engine, getattr(torch, self.config.rollout.dtype))
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def initialize_gpu_snapshot(
+        self, world_size, unique_id, timeout_s, actor_ranks=None, pipeline=False, conversion_location="rollout"
+    ):
         from verl.checkpoint_engine.gpu_snapshot_transport import DirectedNCCL
 
-        if torch.distributed.get_rank() == 0:
+        rank = torch.distributed.get_rank()
+        input_rank = actor_ranks[rank] if pipeline else (0 if rank == 0 else -1)
+        if input_rank >= 0:
             if getattr(self, "_gpu_snapshot_sender", None) is not None:
                 raise RuntimeError("GPU snapshot sender is already initialized; close it or restart the worker")
             self._gpu_snapshot_sender = DirectedNCCL(timeout_s)
-            await self._gpu_snapshot_sender.initialize(world_size, unique_id, 0)
+            await self._gpu_snapshot_sender.initialize(world_size, unique_id, input_rank)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def initialize_trainer_conversion_plan(self, bundles):
+        from verl.checkpoint_engine.trainer_conversion import initialize_trainer_plan
+
+        return await initialize_trainer_plan(self, bundles, self.config.rollout.weight_publication.gpu_snapshot)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def close_gpu_snapshot(self):
-        if torch.distributed.get_rank() == 0:
-            sender = getattr(self, "_gpu_snapshot_sender", None)
-            if sender is not None:
-                await sender.close()
-                del self._gpu_snapshot_sender
+        sender = getattr(self, "_gpu_snapshot_sender", None)
+        if sender is not None:
+            await sender.close()
+            del self._gpu_snapshot_sender
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def export_gpu_snapshot(self, global_steps: int, publisher):
@@ -767,6 +827,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         assert "actor" in self.role, "GPU snapshot export only supports actor role"
         weights, peft_config = self.actor.engine.get_per_tensor_param()
+        snapshot_config = self.config.rollout.weight_publication.gpu_snapshot
+        if getattr(snapshot_config, "conversion_location", "rollout") == "trainer":
+            if peft_config is not None:
+                raise ValueError("trainer conversion requires full merged weights")
+            from verl.checkpoint_engine.trainer_conversion import export_trainer_converted
+
+            return await export_trainer_converted(
+                self, global_steps, publisher, weights, getattr(torch, self.config.rollout.dtype), snapshot_config
+            )
+        if getattr(snapshot_config, "pipeline_depth", 0) and peft_config is None:
+            from verl.checkpoint_engine.gpu_snapshot_pipeline import export_pipeline
+
+            return await export_pipeline(
+                self, global_steps, publisher, weights, getattr(torch, self.config.rollout.dtype), snapshot_config
+            )
+        if getattr(snapshot_config, "bucket_bytes", 0) and peft_config is None:
+            from verl.checkpoint_engine.gpu_snapshot_bucket import export_buckets
+
+            return await export_buckets(
+                self, global_steps, publisher, weights, getattr(torch, self.config.rollout.dtype), snapshot_config
+            )
         source = torch.distributed.get_rank() == 0
         failure = ValueError("GPU snapshots require full, merged weights") if peft_config is not None else None
         started = time.perf_counter()

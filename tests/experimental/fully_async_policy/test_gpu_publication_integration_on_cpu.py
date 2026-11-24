@@ -11,6 +11,7 @@ from tests.experimental.fully_async_policy.test_weight_publication_on_cpu import
     trainer_module,
 )
 from verl.checkpoint_engine.gpu_snapshot import GPUWeightSnapshot
+from verl.workers.config.rollout import GPUSnapshotConfig
 
 
 @pytest.mark.asyncio
@@ -49,11 +50,19 @@ async def test_gpu_export_settles_all_training_ranks_before_seal_and_publishes_m
 
 
 @pytest.mark.asyncio
-async def test_gpu_setup_initializes_source_and_storage_concurrently(monkeypatch):
+@pytest.mark.parametrize("pipeline", [False, True])
+async def test_gpu_setup_initializes_source_and_storage_concurrently(monkeypatch, pipeline):
     from verl.checkpoint_engine import weight_publication
 
     source_ready, storage_ready = asyncio.Event(), asyncio.Event()
     info = {"world_size": 13, "unique_id": (1, 2), "timeout_s": 2}
+    if pipeline:
+        info.update(actor_ranks=[0, 1, -1], pipeline=True)
+    nodes = ["trainer-local", "trainer-local", "other-node"]
+
+    async def configure(publisher, source_nodes):
+        assert source_nodes == (nodes if pipeline else None)
+        return info
 
     async def source(**kwargs):
         assert kwargs == info
@@ -65,7 +74,7 @@ async def test_gpu_setup_initializes_source_and_storage_concurrently(monkeypatch
         await source_ready.wait()
 
     handle = SimpleNamespace(
-        configure_gpu=RemoteMethod(lambda publisher: asyncio.sleep(0, result=info)),
+        configure_gpu=RemoteMethod(configure),
         initialize_gpu=RemoteMethod(storage),
     )
     calls = []
@@ -77,11 +86,18 @@ async def test_gpu_setup_initializes_source_and_storage_concurrently(monkeypatch
     instance = Trainer.__new__(Trainer)
     instance.config = config()
     instance.config.actor_rollout_ref.rollout.weight_publication.transport = "nccl_gpu"
+    if pipeline:
+        instance.config.actor_rollout_ref.rollout.weight_publication.gpu_snapshot = {
+            "bucket_bytes": 512 << 20,
+            "pipeline_depth": 2,
+        }
     instance.rollouter = SimpleNamespace(
         get_replicas=RemoteMethod(lambda: asyncio.sleep(0, result=["replica"])),
         get_load_balancer=RemoteMethod(lambda: asyncio.sleep(0, result="router")),
     )
     instance.actor_rollout_wg = SimpleNamespace(initialize_gpu_snapshot=lambda **kwargs: [source(**kwargs)])
+    if pipeline:
+        instance.actor_rollout_wg.get_gpu_snapshot_node_id = lambda: [asyncio.sleep(0, result=node) for node in nodes]
     await asyncio.wait_for(instance._setup_checkpoint_manager(), 2)
     assert calls[0]["gpu_snapshot_config"].slots == 2
     assert "relay_config" not in calls[0]
@@ -114,7 +130,9 @@ async def test_gpu_export_failure_drains_collective_iterator(monkeypatch):
 
     worker = ActorRolloutRefWorker.__new__(ActorRolloutRefWorker)
     worker.role = "actor"
-    worker.config = SimpleNamespace(rollout=SimpleNamespace(dtype="bfloat16"))
+    worker.config = SimpleNamespace(
+        rollout=SimpleNamespace(dtype="bfloat16", weight_publication=SimpleNamespace(gpu_snapshot=GPUSnapshotConfig()))
+    )
     worker.actor = SimpleNamespace(engine=SimpleNamespace(get_per_tensor_param=lambda: (weights(), None)))
     errors = []
 
@@ -329,7 +347,9 @@ async def test_source_releases_acknowledged_cast_before_next_fsdp_tensor(monkeyp
 
     worker = ActorRolloutRefWorker.__new__(ActorRolloutRefWorker)
     worker.role = "actor"
-    worker.config = SimpleNamespace(rollout=SimpleNamespace(dtype="bfloat16"))
+    worker.config = SimpleNamespace(
+        rollout=SimpleNamespace(dtype="bfloat16", weight_publication=SimpleNamespace(gpu_snapshot=GPUSnapshotConfig()))
+    )
     worker.actor = SimpleNamespace(engine=SimpleNamespace(get_per_tensor_param=lambda: (weights(), None)))
     worker._gpu_snapshot_sender = SimpleNamespace(transfer=send)
     publisher = SimpleNamespace(

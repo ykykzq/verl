@@ -27,6 +27,7 @@ import json
 import logging
 import math
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -52,7 +53,17 @@ from verl.utils.device import (
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.rtp_llm_rollout.build_capabilities import require_remote_cache_build
+from verl.workers.rollout.rtp_llm_rollout.build_capabilities import (
+    require_remote_cache_build,
+    require_runtime_build_features,
+    require_selected_checkpoint_build,
+)
+from verl.workers.rollout.rtp_llm_rollout.reprefill_profile import (
+    RePrefillProfileError,
+    first_output_aux,
+    validate_profile_context,
+    writer_for_server,
+)
 from verl.workers.rollout.rtp_llm_rollout.ray_weight_transfer import (
     rebuild_ipc_tensor,
     rebuild_shared_memory,
@@ -159,6 +170,17 @@ class RTPLLMHttpServer:
         self.rollout_mode = rollout_mode
         self.workers = workers
         self.replica_rank = replica_rank
+        self._snapshot_memory_role = None
+        publication = getattr(self.config, "weight_publication", None)
+        if getattr(publication, "transport", None) == "nccl_gpu":
+            from verl.checkpoint_engine.snapshot_memory import snapshot_memory_role
+
+            self._snapshot_memory_role = snapshot_memory_role(
+                publication.gpu_snapshot,
+                replica_rank,
+                self.config.checkpoint_engine.update_weights_bucket_megabytes * 1024 * 1024,
+            )
+        self._replica_capacity = None
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
@@ -173,6 +195,7 @@ class RTPLLMHttpServer:
         self._rejecting = False
         self._request_admission_lock = asyncio.Lock()
         self._inflight: dict[str, asyncio.Future] = {}
+        self._request_progress: dict[str, dict[str, Any]] = {}
         self._request_counter = itertools.count(1)
         self._accepted_migrations: dict[str, dict[str, Any]] = {}
         self._weight_update_lock = asyncio.Lock()
@@ -303,6 +326,10 @@ class RTPLLMHttpServer:
             "kv_block_size_tokens": block_size,
             "max_sequence_tokens": sequence_limit,
             "max_batch_size": batch_limit if type(batch_limit) is int and batch_limit > 0 else None,
+            "kv_capacity_tokens": getattr(self, "_planned_kv_capacity_tokens", None),
+            "native_initialized_kv_limit": self._native_kv_capacity()
+            if getattr(self.config, "rtp_separate_kv_admission", False)
+            else batch_limit,
             "kv_transfer_backends": backends,
             "kv_transfer_domain": self._kv_transfer_domain() if backends else None,
             "kv_transfer_namespace": self._cache_key_salt(self.global_steps) if backends else None,
@@ -336,14 +363,17 @@ class RTPLLMHttpServer:
         snapshot_reserve_mib = 0
         publication = getattr(self.config, "weight_publication", None)
         if getattr(publication, "transport", None) == "nccl_gpu":
-            snapshot = publication.gpu_snapshot
-            snapshot_reserve_mib = (
-                math.ceil(
-                    (snapshot.max_bytes_per_gpu + snapshot.max_conversion_bytes + snapshot.max_tensor_bytes)
-                    / (1024 * 1024)
+            from verl.checkpoint_engine.snapshot_memory import snapshot_memory_role
+
+            role = getattr(self, "_snapshot_memory_role", None)
+            if role is None:
+                role = snapshot_memory_role(
+                    publication.gpu_snapshot,
+                    getattr(self, "replica_rank", 0),
+                    self.config.checkpoint_engine.update_weights_bucket_megabytes * 1024 * 1024,
                 )
-                + self.config.checkpoint_engine.update_weights_bucket_megabytes
-            )
+            snapshot_reserve_mib = math.ceil(role.total_bytes / (1024 * 1024))
+            logger.info("snapshot memory role: %s", role.as_dict())
         budget_mib = int(self.config.gpu_memory_utilization * total_mib)
         kv_mib = budget_mib - weights_mib - reserve_mib - snapshot_reserve_mib
         if kv_mib < 1024:
@@ -381,7 +411,7 @@ class RTPLLMHttpServer:
         """
         return min(self.config.max_model_len, self.config.prompt_length + self.config.response_length)
 
-    def _max_concurrency(self) -> int:
+    def _native_kv_capacity(self) -> int:
         """Cap in-flight requests at what the kv cache can hold at full length.
 
         rtp-llm admits up to ``concurrency_limit`` streams and never preempts, so
@@ -390,6 +420,8 @@ class RTPLLMHttpServer:
         full-attention layers; linear-attention blocks are padded to the same
         stride) times the per-layer K+V stride.
         """
+        if getattr(self, "_replica_kv_capacity", None) is not None:
+            return self._replica_kv_capacity
         configured = max(1, self.config.max_num_seqs)
         hf_config = self.model_config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
@@ -409,6 +441,8 @@ class RTPLLMHttpServer:
             layer_types = list(getattr(text_config, "layer_types", None) or [])
             full_layers = sum(1 for t in layer_types if "full" in str(t)) or int(text_config.num_hidden_layers)
         except (AttributeError, TypeError, ValueError):
+            if getattr(self.config, "rtp_separate_kv_admission", False):
+                raise ValueError("cannot safely derive native initialized KV capacity")
             logger.warning("rtp-llm: cannot derive kv cache capacity, using max_num_seqs=%d", configured)
             return configured
 
@@ -419,6 +453,7 @@ class RTPLLMHttpServer:
         # The allocator holds back ~5% of blocks; keep a wider margin so partial-rollout
         # resubmissions after a weight sync still find room.
         usable_blocks = int(total_blocks * 0.9)
+        self._planned_kv_capacity_tokens = usable_blocks * tokens_per_block
         blocks_per_request = math.ceil(self._engine_max_seq_len() / tokens_per_block)
         capacity = max(1, usable_blocks // blocks_per_request)
 
@@ -432,6 +467,43 @@ class RTPLLMHttpServer:
                 configured,
             )
         return min(configured, capacity)
+
+    def _max_concurrency(self) -> int:
+        if getattr(self, "_replica_capacity", None) is not None:
+            return self._replica_capacity
+        if getattr(self.config, "rtp_separate_kv_admission", False):
+            return max(1, self.config.max_num_seqs)
+        return self._native_kv_capacity()
+
+    async def plan_memory_before_launch(self):
+        if self.engine is not None:
+            raise RuntimeError("memory roles must be fixed before engine creation")
+        native_capacity = self._native_kv_capacity()
+        return {
+            "tp_rank": self.tp_rank,
+            "capacity": self._max_concurrency(),
+            "native_kv_capacity": native_capacity,
+            "kv_capacity_tokens": getattr(self, "_planned_kv_capacity_tokens", None),
+            "kv_mib": self._kv_cache_mem_mib(),
+            "snapshot_role": (self._snapshot_memory_role.as_dict() if self._snapshot_memory_role else None),
+        }
+
+    async def freeze_replica_capacity(self, plans):
+        if self.engine is not None or self._replica_capacity is not None:
+            raise RuntimeError("replica capacity is immutable after startup planning")
+        if sorted(p["tp_rank"] for p in plans) != list(range(self.config.tensor_model_parallel_size)):
+            raise ValueError("memory plan must include every TP rank exactly once")
+        local = self._max_concurrency()
+        capacity = min(p["capacity"] for p in plans)
+        if capacity < 1 or capacity > local:
+            raise ValueError("unsafe replica capacity")
+        self._replica_capacity = capacity
+        self._replica_kv_capacity = min(p.get("native_kv_capacity", p["capacity"]) for p in plans)
+        pool_tokens = [p.get("kv_capacity_tokens") for p in plans]
+        self._planned_kv_capacity_tokens = min(pool_tokens) if all(pool_tokens) else None
+        self._replica_memory_plans = plans
+        logger.info("frozen replica memory plans: %s", plans)
+        return capacity
 
     def _build_config(self):
         from rtp_llm.server.server_args.server_args import setup_args
@@ -486,6 +558,17 @@ class RTPLLMHttpServer:
             "--use_triton_pa",
             "1",
         ]
+        scheduler_mode = getattr(self.config, "rtp_scheduler_mode", "fifo")
+        argv += ["--pdfusion_scheduler_mode", "ratio" if scheduler_mode == "ratio" else ""]
+        if scheduler_mode == "ratio":
+            argv += [
+                "--decode_prefill_ratio",
+                str(self.config.rtp_decode_prefill_ratio),
+                "--role_type",
+                "PDFUSION",
+                "--use_batch_decode_scheduler",
+                "False",
+            ]
         if self._remote_prefix_migration_enabled():
             argv += ["--enable_remote_cache", "True"]
             migration_config = self._trajectory_migration_config()
@@ -499,6 +582,11 @@ class RTPLLMHttpServer:
             argv += ["--act_type", "fp16"]
 
         cfg = setup_args(argv)
+        if getattr(self.config, "rtp_separate_kv_admission", False):
+            # Queue ownership is not physical KV ownership. Keep the existing
+            # worst-case growth guarantee inside native admission, including
+            # LOADING / READY / pending decode, rather than closing RPC slots.
+            cfg.runtime_config.fifo_scheduler_config.max_inited_kv_cache_streams = self._native_kv_capacity()
         cfg.server_config.ip = self._server_address
         # Qwen3.5 shares its config with the VL variant, so rtp-llm flags it multimodal and
         # would spin up a local ViT process on the rollout GPU. Keep the ViT remote (i.e. absent)
@@ -541,8 +629,31 @@ class RTPLLMHttpServer:
             sys.argv = saved_argv
 
     def _boot_engine_impl(self):
+        features = []
+        if getattr(self.config, "rtp_scheduler_mode", "fifo") == "ratio":
+            features.append("pd_ready_queue")
+        if getattr(self.config, "rtp_remote_cache_lookup_policy", "legacy") == "migration_only":
+            features.append("request_remote_cache_lookup")
+        write_policy = getattr(self.config, "rtp_remote_cache_write_policy", "legacy")
+        if write_policy not in {"legacy", "migration_only"}:
+            raise ValueError("invalid rtp_remote_cache_write_policy")
+        os.environ["RTP_LLM_REMOTE_CACHE_WRITE_POLICY"] = write_policy
+        if write_policy == "migration_only":
+            features += ["explicit_migration_kv_export", "migration_only_remote_write"]
+        profile_dir = getattr(self.config, "rtp_reprefill_profile_dir", None)
+        if profile_dir:
+            features += ["request_phase_profile", "prefill_batch_cuda_profile", "explicit_reprefill_profile_seal"]
+            os.makedirs(profile_dir, exist_ok=True)
+            os.environ["RTP_LLM_REPREFILL_PROFILE_DIR"] = profile_dir
+            os.environ["RTP_LLM_PROFILE_REPLICA_RANK"] = str(self.replica_rank)
+            os.environ["RTP_LLM_PROFILE_TP_RANK"] = str(self.tp_rank)
+        else:
+            os.environ.pop("RTP_LLM_REPREFILL_PROFILE_DIR", None)
+        require_runtime_build_features(*features)
         if self._remote_prefix_migration_enabled():
             require_remote_cache_build()
+            if getattr(self._trajectory_migration_config(), "checkpoint_mode", "periodic") == "on_demand":
+                require_selected_checkpoint_build()
 
         from rtp_llm.config.server_config_setup import (
             set_parallelism_config,
@@ -832,6 +943,9 @@ class RTPLLMHttpServer:
     def _build_generate_config(self, sampling_params: dict[str, Any], max_tokens: int):
         from rtp_llm.config.generate_config import GenerateConfig
 
+        remote_lookup_policy = getattr(self.config, "rtp_remote_cache_lookup_policy", "legacy")
+        if remote_lookup_policy not in ("legacy", "migration_only"):
+            raise ValueError("rtp_remote_cache_lookup_policy must be legacy or migration_only")
         top_k = sampling_params.get("top_k", 0)
         # verl encodes "disabled" as -1; rtp-llm uses 0.
         top_k = 0 if top_k is None or top_k < 0 else top_k
@@ -859,7 +973,7 @@ class RTPLLMHttpServer:
             # Reuse is valid within one weight version; release_kv_cache() clears
             # all reusable entries before the next weight sync.
             reuse_cache=True,
-            enable_remote_cache=self._remote_prefix_migration_enabled(),
+            enable_remote_cache=self._remote_prefix_migration_enabled() and remote_lookup_policy == "legacy",
             # An unset timeout falls back to rtp-llm's 2h max_rpc_timeout_ms, so a stall would
             # only surface after two hours; bound it so failures are visible quickly.
             timeout_ms=int(float(os.environ.get("VERL_RTP_LLM_GENERATE_TIMEOUT_S", "3600")) * 1000),
@@ -877,6 +991,7 @@ class RTPLLMHttpServer:
         migration_ticket: Optional[dict[str, Any]] = None,
         expected_source_version: int | str | None = None,
         session_id: Optional[str] = None,
+        profile_context: Optional[dict[str, Any]] = None,
     ) -> TokenOutput:
         """Generate one request using the common rollout RPC contract.
 
@@ -911,12 +1026,31 @@ class RTPLLMHttpServer:
             generate_config=generate_config,
         )
 
+        profile_writer = writer_for_server(self, getattr(self.config, "rtp_reprefill_profile_dir", None))
+        profile_fields = {}
+        if profile_writer is not None:
+            profile_fields = {
+                **validate_profile_context(profile_context, len(prompt_ids)),
+                "native_request_id": generate_input.request_id,
+                "backend_request_id": request_id,
+                "prefix_tokens": len(prompt_ids),
+                "replica_rank": self.replica_rank,
+                "tp_rank": getattr(self, "tp_rank", 0),
+                "ticket_mode": accepted_migration.get("mode", accepted_migration.get("backend"))
+                if accepted_migration is not None
+                else None,
+                "cache_read_policy": getattr(self.config, "rtp_remote_cache_lookup_policy", "legacy"),
+            }
+            if profile_fields["context_missing"]:
+                profile_fields["logical_request_id"] = session_id or request_id
+
         token_ids: list[int] = []
         probs: list[float] = []
         remote_reuse_len = 0
+        first_output_recorded = False
 
         async def consume():
-            nonlocal remote_reuse_len
+            nonlocal remote_reuse_len, first_output_recorded
             stream = await self.visitor.enqueue(generate_input)
             try:
                 async for outputs in stream:
@@ -928,6 +1062,15 @@ class RTPLLMHttpServer:
                         probs.extend(output.aux_info.softmax_probs)
                     if output.aux_info is not None:
                         remote_reuse_len = max(remote_reuse_len, int(getattr(output.aux_info, "remote_reuse_len", 0)))
+                    if profile_writer is not None and token_ids and not first_output_recorded:
+                        profile_writer.emit(
+                            "request_first_output",
+                            **profile_fields,
+                            output_tokens=len(token_ids),
+                            remote_reuse_tokens=remote_reuse_len,
+                            aux_info=first_output_aux(output.aux_info),
+                        )
+                        first_output_recorded = True
             finally:
                 await stream.aclose()
 
@@ -952,6 +1095,13 @@ class RTPLLMHttpServer:
                     if accepted_migration is not None and pending == accepted_migration:
                         self._accepted_migrations.pop(request_id, None)
                     logger.debug("rejecting migrated request %s: %s", request_id, reason)
+                    if profile_writer is not None:
+                        profile_writer.emit(
+                            "request_rejected",
+                            **profile_fields,
+                            installed_weight_version=self.global_steps,
+                            rejection_reason=reason,
+                        )
                     return TokenOutput(
                         token_ids=[],
                         log_probs=None,
@@ -960,6 +1110,13 @@ class RTPLLMHttpServer:
                     )
                 if self._rejecting:
                     logger.debug("rejecting request %s: replica left rotation while generation is paused", request_id)
+                    if profile_writer is not None:
+                        profile_writer.emit(
+                            "request_rejected",
+                            **profile_fields,
+                            installed_weight_version=self.global_steps,
+                            rejection_reason="replica left rotation",
+                        )
                     return TokenOutput(
                         token_ids=[],
                         log_probs=None,
@@ -971,6 +1128,30 @@ class RTPLLMHttpServer:
                     if accepted_migration is not None and accepted_migration.get("mode") == "recompute":
                         generate_config.reuse_cache = False
                         generate_config.enable_remote_cache = False
+                    elif (
+                        accepted_migration is not None
+                        and accepted_migration.get("mode", accepted_migration.get("backend")) == "remote_prefix"
+                    ):
+                        # The ticket has been revalidated under the admission lock.
+                        # Ordinary requests keep remote reads off in migration_only mode.
+                        generate_config.enable_remote_cache = self._remote_prefix_migration_enabled()
+                    if profile_writer is not None:
+                        previous_version = profile_fields.get("previous_weight_version")
+                        version_changed = ("initial" if previous_version is None else previous_version) != (
+                            "initial" if admitted_global_steps is None else admitted_global_steps
+                        )
+                        profile_fields.update(
+                            installed_weight_version=admitted_global_steps,
+                            reuse_cache=generate_config.reuse_cache,
+                            enable_remote_cache=generate_config.enable_remote_cache,
+                            recompute_candidate=(
+                                bool(profile_fields.get("generated_before", 0))
+                                and (version_changed or profile_fields["ticket_mode"] == "recompute")
+                            )
+                            if not profile_fields["context_missing"]
+                            else None,
+                        )
+                        profile_writer.emit("request_admitted", **profile_fields)
                     # Consume in a task so abort_all_requests can cancel it: a request
                     # still queued for kv cache blocks never yields, so a cooperative
                     # flag would not reach it.
@@ -978,21 +1159,47 @@ class RTPLLMHttpServer:
                     if accepted_migration is not None:
                         self._accepted_migrations.pop(request_id, None)
                     self._inflight[request_id] = task
+                    if not hasattr(self, "_request_progress"):
+                        self._request_progress = {}
+                    self._request_progress[request_id] = {
+                        "token_ids": token_ids,
+                        "prompt_ids": prompt_ids,
+                        "weight_version": "initial" if admitted_global_steps is None else admitted_global_steps,
+                        "generation_id": generate_input.request_id,
+                    }
                     break
             await self._wait_for_generation()
         aborted = False
+        profile_failed = False
+        terminal_error = None
         try:
             await task
         except asyncio.CancelledError:
             aborted = True
+            terminal_error = "CancelledError"
+        except RePrefillProfileError:
+            profile_failed = True
+            raise
         except Exception as e:
             # A stalled or timed-out request must not take the rollouter down; hand back
             # whatever was generated and let verl resume it as a partial rollout.
             aborted = True
+            terminal_error = type(e).__name__
             logger.warning(f"rtp-llm generate {request_id} failed after {len(token_ids)} tokens: {e}")
         finally:
             async with self._request_admission_lock:
-                self._inflight.pop(request_id, None)
+                if self._inflight.get(request_id) is task:
+                    self._inflight.pop(request_id, None)
+                    self._request_progress.pop(request_id, None)
+            if profile_writer is not None and not profile_failed:
+                profile_writer.emit(
+                    "request_terminal",
+                    **profile_fields,
+                    output_tokens=len(token_ids),
+                    remote_reuse_tokens=remote_reuse_len,
+                    aborted=aborted,
+                    error_type=terminal_error,
+                )
 
         # A completed request must expose its generated response. An aborted request may
         # legitimately have no token yet and will be resumed by the fully-async client.
@@ -1009,7 +1216,9 @@ class RTPLLMHttpServer:
         migration_enabled = self._trajectory_migration_config() is not None
         reached_eos = bool(token_ids) and token_ids[-1] == self.eos_token_id
         migration_checkpoint = migration_enabled and not aborted and not reached_eos and len(token_ids) >= max_tokens
-        if aborted:
+        if reached_eos:
+            stop_reason = "completed"  # EOS can race a selected-request pause.
+        elif aborted:
             stop_reason = "aborted"
         elif migration_enabled:
             stop_reason = "length" if migration_checkpoint else "completed"
@@ -1018,6 +1227,7 @@ class RTPLLMHttpServer:
         extra_fields = {
             "global_steps": admitted_global_steps,
             "migration_checkpoint": migration_checkpoint,
+            "reached_eos": reached_eos,
             "remote_reuse_len": remote_reuse_len,
         }
         if accepted_migration is not None and accepted_migration.get("mode", "remote_prefix") == "remote_prefix":
@@ -1062,21 +1272,81 @@ class RTPLLMHttpServer:
         await asyncio.to_thread(self._set_cache_key_salt, global_steps)
         self.global_steps = global_steps
 
-    async def abort_request(self, request_id: str, timeout_s: float = 120.0) -> dict[str, Any]:
-        """Cancel one trajectory without disturbing other requests on this replica."""
+    async def get_request_progress(self, request_id: str) -> dict[str, Any]:
+        """Read a consistent prefix without stopping native decoding."""
         async with self._request_admission_lock:
+            progress = getattr(self, "_request_progress", {}).get(request_id)
+            task = self._inflight.get(request_id)
+            if progress is None or task is None or task.done():
+                return {"found": False}
+            tokens = list(progress["token_ids"])
+            return {
+                "found": True,
+                "generated_tokens": len(tokens),
+                "prefix_ids": list(progress["prompt_ids"]) + tokens,
+                "generation_id": progress["generation_id"],
+                "weight_version": progress["weight_version"],
+            }
+
+    async def abort_request(
+        self,
+        request_id: str,
+        timeout_s: float = 120.0,
+        expected_generation_id: int | None = None,
+        preserve_kv: bool = False,
+    ) -> dict[str, Any]:
+        """Settle one selected trajectory; optionally finish normally to persist its KV."""
+        async with self._request_admission_lock:
+            progress = getattr(self, "_request_progress", {}).get(request_id)
+            if expected_generation_id is not None and (
+                progress is None or progress["generation_id"] != expected_generation_id
+            ):
+                return {"aborted": False, "request_id": request_id, "reason": "generation changed"}
             self._accepted_migrations.pop(request_id, None)
             task = self._inflight.get(request_id)
+            if task is not None and not task.done():
+                if preserve_kv:
+                    if progress is None:
+                        return {
+                            "aborted": False,
+                            "request_id": request_id,
+                            "reason": "native generation not registered",
+                        }
+                    checkpoint = getattr(self.engine, "request_kv_checkpoint", None)
+                    if not callable(checkpoint):
+                        raise RuntimeError("selected KV migration requires request_kv_checkpoint in the RTP wheel")
+                    accepted = await asyncio.to_thread(checkpoint, progress["generation_id"])
+                    if not accepted:
+                        return {
+                            "aborted": False,
+                            "request_id": request_id,
+                            "reason": "native generation changed or not decoding",
+                        }
+                else:
+                    task.cancel()
         if task is None:
             return {"aborted": False, "request_id": request_id, "reason": "request not found"}
-        task.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
-        except asyncio.CancelledError:
-            pass
-        except (asyncio.TimeoutError, TimeoutError):
+        except asyncio.CancelledError as error:
+            if preserve_kv:
+                if task.cancelled() and self._abort_requested:
+                    # A replica-wide weight drain can supersede the selected
+                    # checkpoint. The consumer has settled, but its KV was not
+                    # preserved: return the ordinary aborted segment so the
+                    # client replans with version fencing, never a KV ticket.
+                    return {
+                        "aborted": False,
+                        "request_id": request_id,
+                        "preserve_kv": False,
+                        "reason": "selected checkpoint superseded by replica drain",
+                    }
+                raise RuntimeError("selected native KV checkpoint was cancelled before completion") from error
+        except (asyncio.TimeoutError, TimeoutError) as error:
+            if preserve_kv:
+                raise RuntimeError("selected native KV checkpoint did not settle before its deadline") from error
             return {"aborted": False, "request_id": request_id, "reason": "abort timed out"}
-        return {"aborted": True, "request_id": request_id}
+        return {"aborted": True, "request_id": request_id, "preserve_kv": preserve_kv}
 
     async def prepare_trajectory_migration(
         self,
@@ -1091,6 +1361,11 @@ class RTPLLMHttpServer:
         if backend != "remote_prefix" or not self._remote_prefix_migration_enabled():
             raise RuntimeError(f"KV transfer backend {backend!r} is not enabled on the source replica")
         source = self.get_trajectory_migration_capabilities()
+        explicit_export = getattr(self.config, "rtp_remote_cache_write_policy", "legacy") == "migration_only"
+        if explicit_export and (
+            type(target_metadata.get("replica_rank")) is not int or target_metadata["replica_rank"] == self.replica_rank
+        ):
+            raise RuntimeError("migration-only export requires a different target replica")
         if source["model_id"] != target_metadata.get("model_id"):
             raise RuntimeError("source and target model identities differ")
         if source["weight_version"] != target_metadata.get("weight_version"):
@@ -1108,17 +1383,41 @@ class RTPLLMHttpServer:
                 "reason": "no_complete_block",
                 "minimum_prefix_tokens": source["kv_block_size_tokens"] + 1,
             }
-        wait_fn = getattr(self.engine, "wait_remote_prefix_status", None)
+        operation = "export_remote_prefix" if explicit_export else "wait_remote_prefix_status"
+        wait_fn = getattr(self.engine, operation, None)
         if not callable(wait_fn):
-            raise RuntimeError("remote-prefix migration requires an RTP wheel with wait_remote_prefix_status")
+            raise RuntimeError(f"remote-prefix migration requires an RTP wheel with {operation}")
         # TP0's native coordinator includes every required rank and FinishWrite.
         # Waiting on idle non-owner ranks would not prove this prefix was stored.
-        status = await asyncio.wait_for(
-            asyncio.to_thread(wait_fn, prefix, self._cache_key_salt(self.global_steps), int(timeout_s * 1000)),
-            timeout=timeout_s,
-        )
+        # The final streamed token can arrive before the scheduler submits
+        # release-time KV writes. Retry only missing registration within the
+        # original deadline; completed write failures must never be hidden.
+        export_started = time.monotonic()
+        deadline = export_started + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("remote KV prefix was not registered before its deadline")
+            status = await asyncio.wait_for(
+                asyncio.to_thread(
+                    wait_fn, prefix, self._cache_key_salt(self.global_steps), max(1, int(remaining * 1000))
+                ),
+                timeout=remaining,
+            )
+            # Explicit export is submitted at most once. A timeout never causes
+            # a second write while the first still owns source buffers.
+            if explicit_export or not isinstance(status, dict) or status.get("status") != "unavailable":
+                break
+            await asyncio.sleep(min(0.01, max(0, deadline - time.monotonic())))
         if not isinstance(status, dict):
             raise RuntimeError("invalid remote prefix write status")
+        if explicit_export and status.get("status") == "local_prefix_unavailable":
+            return {
+                "status": "deferred",
+                "reason": "local_prefix_unavailable",
+                "remote_write_status": status,
+                "export_host_s": time.monotonic() - export_started,
+            }
         if status.get("status") == "timeout":
             raise asyncio.TimeoutError(f"remote KV prefix write timed out: {status}")
         if status.get("status") != "success":
@@ -1138,6 +1437,9 @@ class RTPLLMHttpServer:
             "kv_transfer_namespace": source["kv_transfer_namespace"],
             "source_replica_rank": self.replica_rank,
             "remote_write_status": status,
+            "explicit_export": explicit_export,
+            "target_replica_rank": target_metadata.get("replica_rank"),
+            "export_host_s": time.monotonic() - export_started,
         }
 
     @staticmethod
@@ -1180,7 +1482,15 @@ class RTPLLMHttpServer:
         backend = ticket.get("backend")
         if ticket.get("mode", backend) != backend:
             return "trajectory migration mode differs from its backend"
-        if backend == "recompute":
+        if backend == "local_prefix":
+            # A version barrier rebuilt this prefix on this exact replica. This
+            # ticket grants local continuation only; it never enables KVCM reads.
+            if ticket.get("v15_local_resume") is not True or ticket.get("v14_resume") is not True:
+                return "local prefix requires a version-barrier continuation ticket"
+            if ticket.get("source_replica_rank") != self.replica_rank:
+                return "local prefix continuation belongs to another replica"
+            target_version = ticket.get("weight_version")
+        elif backend == "recompute":
             if ticket.get("mode") != "recompute":
                 return "recompute requires an explicit migration mode"
             config = self._trajectory_migration_config()
@@ -1200,6 +1510,13 @@ class RTPLLMHttpServer:
                 return "recompute requires distinct source and target weight versions"
             target_version = ticket.get("target_version")
         else:
+            if getattr(self.config, "rtp_remote_cache_write_policy", "legacy") == "migration_only":
+                if ticket.get("source_replica_rank") == self.replica_rank:
+                    return "remote prefix requires cross-replica movement"
+                if ticket.get("explicit_export") is not True:
+                    return "remote prefix lacks explicit migration export"
+                if ticket.get("target_replica_rank") != self.replica_rank:
+                    return "remote prefix export belongs to another target replica"
             if backend not in capabilities["kv_transfer_backends"]:
                 return "target does not support the ticket's KV backend"
             target_version = ticket.get("weight_version")
@@ -1377,8 +1694,34 @@ class RTPLLMHttpServer:
 
             return await self._settled_device_call(describe)
 
+    async def prepare_conversion_plan(self, source_layout, transport):
+        async with self._gpu_snapshot_lock:
+            if self._gpu_snapshot is not None:
+                raise RuntimeError("cannot change a plan during a conversion round")
+
+            def prepare():
+                plan = self.weight_manager.prepare_runtime_conversion_plan(source_layout, transport)
+                self._conversion_plan = plan
+                return {
+                    "plan_hash": plan.plan_hash,
+                    "manifest": plan.manifest,
+                    "rule_construction_s": plan.build_seconds,
+                }
+
+            return await self._settled_device_call(prepare)
+
+    async def export_conversion_plan(self):
+        async with self._gpu_snapshot_lock:
+            plan = getattr(self, "_conversion_plan", None)
+            if plan is None:
+                raise RuntimeError("no validated conversion plan")
+            return {"plan_hash": plan.plan_hash, "payload": plan.export()}
+
     async def begin_gpu_snapshot(self, version: int, max_pending_bytes: int):
         async with self._gpu_snapshot_lock:
+            role = getattr(self, "_snapshot_memory_role", None)
+            if role is not None and not role.converter:
+                raise RuntimeError("conversion refused on a GPU without reserved workspace")
             if self._gpu_snapshot is not None:
                 raise RuntimeError("a GPU snapshot conversion is already active")
             if type(version) is not int or version < 0:
@@ -1386,20 +1729,38 @@ class RTPLLMHttpServer:
 
             def begin():
                 set_expandable_segments(False)
-                converter = self.weight_manager.create_runtime_snapshot_converter(max_pending_bytes)
-                self._gpu_snapshot = {"version": version, "converter": converter, "outputs": [], "failed": False}
+                snapshot_config = getattr(getattr(self.config, "weight_publication", None), "gpu_snapshot", None)
+                if getattr(snapshot_config, "cache_conversion_plan", False):
+                    converter = self.weight_manager.create_planned_conversion_round(version, max_pending_bytes)
+                else:
+                    converter = self.weight_manager.create_runtime_snapshot_converter(max_pending_bytes)
+                self._gpu_snapshot = {
+                    "version": version,
+                    "converter": converter,
+                    "outputs": [],
+                    "output_batches": {},
+                    "failed": False,
+                }
                 return {"version": version, "required_names": sorted(converter.required_names)}
 
             return await self._settled_device_call(begin)
 
-    async def convert_gpu_snapshot(self, name: Optional[str], payload: Optional[bytes], is_last: bool = False):
+    async def convert_gpu_snapshot_bucket(self, entries, payload, is_last=False, output_key=None):
+        return await self.convert_gpu_snapshot(None, payload, is_last, bucket_entries=entries, output_key=output_key)
+
+    async def convert_gpu_snapshot(
+        self, name: Optional[str], payload: Optional[bytes], is_last: bool = False, bucket_entries=None, output_key=None
+    ):
         async with self._gpu_snapshot_lock:
             state = self._gpu_snapshot
             if state is None or state["failed"]:
                 raise RuntimeError("GPU snapshot conversion is inactive or failed")
-            if state["outputs"]:
+            batches = state.setdefault("output_batches", {})
+            if state["outputs"] or (output_key is None and batches):
                 raise RuntimeError("release GPU snapshot outputs after DMA before converting another input")
-            if (name is None) != (payload is None) or (name is None and not is_last):
+            if output_key is not None and (output_key in batches or len(batches) >= 2):
+                raise RuntimeError("pipeline output slots are full or still in use")
+            if bucket_entries is None and ((name is None) != (payload is None) or (name is None and not is_last)):
                 raise ValueError("snapshot input requires a name and CUDA IPC payload, or an empty final call")
 
             def convert():
@@ -1408,12 +1769,45 @@ class RTPLLMHttpServer:
                     tensor = rebuild_ipc_tensor(payload, get_device_id())
                     if tensor.device.type != "cuda":
                         raise ValueError("GPU snapshot input must be a CUDA IPC tensor")
-                    inputs.append((name, tensor))
+                    if bucket_entries is None:
+                        inputs.append((name, tensor))
+                    else:
+                        from verl.checkpoint_engine.gpu_snapshot import tensor_dtype
+                        from verl.checkpoint_engine.gpu_snapshot_bucket import views
+                        import math
+
+                        if tensor.dtype != torch.uint8 or tensor.ndim != 1 or not tensor.is_contiguous():
+                            raise ValueError("snapshot bucket must be contiguous uint8 storage")
+                        end, names = 0, set()
+                        for key, shape, dtype, offset, size in bucket_entries:
+                            expected = math.prod(shape) * torch.empty((), dtype=tensor_dtype(dtype)).element_size()
+                            if (
+                                key in names
+                                or offset < end
+                                or offset % 16
+                                or size != expected
+                                or offset + size > tensor.numel()
+                            ):
+                                raise ValueError("invalid snapshot bucket metadata")
+                            end = offset + size
+                            names.add(key)
+                        inputs = views(tensor, bucket_entries)
+                elif bucket_entries and not is_last:
+                    raise ValueError("bucket entries require a payload")
                 # Save owners before serializing or returning; cancellation cannot
                 # discard storage which a coordinator may already have mapped.
-                state["outputs"] = state["converter"].add(inputs, is_last=is_last)
+                outputs = state["converter"].add(inputs, is_last=is_last)
+                role = getattr(self, "_snapshot_memory_role", None)
+                if role is not None and role.conversion_output_bytes:
+                    retained = sum(t.nbytes for group in batches.values() for _, t in group)
+                    if retained + sum(t.nbytes for _, t in outputs) > role.conversion_output_bytes:
+                        raise RuntimeError("completed conversion outputs exceed reserved memory")
+                if output_key is None:
+                    state["outputs"] = outputs
+                else:
+                    batches[output_key] = outputs
                 result = []
-                for key, tensor in state["outputs"]:
+                for key, tensor in outputs:
                     if tensor.device.type != "cuda":
                         raise ValueError("GPU snapshot output must be a CUDA tensor")
                     result.append(
@@ -1432,21 +1826,29 @@ class RTPLLMHttpServer:
                 state["failed"] = True
                 raise
 
-    async def release_gpu_snapshot_outputs(self):
+    async def release_gpu_snapshot_outputs(self, output_key=None):
         """Coordinator acknowledgement that all output DMA has completed."""
         async with self._gpu_snapshot_lock:
             if self._gpu_snapshot is not None:
-                self._gpu_snapshot["outputs"].clear()
+                if output_key is None:
+                    self._gpu_snapshot["outputs"].clear()
+                else:
+                    del self._gpu_snapshot["output_batches"][output_key]
 
     async def close_gpu_snapshot(self):
         async with self._gpu_snapshot_lock:
             state = self._gpu_snapshot
             if state is None:
                 return
-            if state["outputs"]:
+            if state["outputs"] or state.get("output_batches"):
                 raise RuntimeError("release GPU snapshot outputs after DMA before closing")
+            metrics = dict(getattr(state["converter"], "metrics", {}))
+            metrics.update(version=state["version"], plan_hash=getattr(state["converter"], "plan_hash", None))
             await self._settled_device_call(state["converter"].close)
             self._gpu_snapshot = None
+            self._last_conversion_metrics = metrics
+            logger.info("conversion round metrics: %s", metrics)
+            return metrics
 
     async def begin_weight_update_from_ipc(self, round_id: str, descriptor: dict[str, Any]):
         """Register a reusable IPC buffer for one Ray-controlled update round."""
@@ -1626,6 +2028,69 @@ class RTPLLMHttpServer:
     async def stop_profile(self):
         pass
 
+    async def prepare_reprefill_profile_shutdown(self):
+        """Close admission and drain this actor; caller waits for every TP rank."""
+        if not getattr(self.config, "rtp_reprefill_profile_dir", None):
+            return {"enabled": False, "ready": False}
+        task = getattr(self, "_reprefill_prepare_task", None)
+        if task is None:
+            task = asyncio.create_task(self._prepare_reprefill_profile_shutdown_impl())
+            self._reprefill_prepare_task = task
+        return await asyncio.shield(task)
+
+    async def _prepare_reprefill_profile_shutdown_impl(self):
+        health = getattr(self, "_tp_health_task", None)
+        if health is not None and not health.done():
+            health.cancel()
+            await asyncio.gather(health, return_exceptions=True)
+        await self.abort_all_requests(reject_request=True)
+        await self._await_engine_drain()
+        self._reprefill_shutdown_prepared = True
+        return {"ready": True, "replica_rank": self.replica_rank, "tp_rank": self.tp_rank}
+
+    async def finalize_reprefill_profile(self):
+        """Freeze this rank's profile after training and verify native drain evidence.
+
+        All TP ranks must invoke this concurrently, after the producer and weight
+        publisher have stopped. This is separate from the per-step profiler API.
+        """
+        directory = getattr(self.config, "rtp_reprefill_profile_dir", None)
+        if not directory:
+            return {"enabled": False}
+        if not getattr(self, "_reprefill_shutdown_prepared", False):
+            raise RuntimeError("profile finalization requires the all-rank preparation barrier")
+        task = getattr(self, "_reprefill_finalize_task", None)
+        if task is None:
+            task = asyncio.create_task(self._finalize_reprefill_profile_impl(directory))
+            self._reprefill_finalize_task = task
+        # A caller timeout must not interrupt a native seal or turn a later
+        # retry into a second finalization of the same profile.
+        return await asyncio.shield(task)
+
+    async def _finalize_reprefill_profile_impl(self, directory):
+        import importlib
+        from verl.workers.rollout.rtp_llm_rollout.reprefill_profile_seal import seal_native_profile
+
+        seal_requested_us = time.time_ns() // 1000
+        native = importlib.import_module("libth_transformer")
+        seal = getattr(native, "seal_reprefill_profile", None)
+        if not callable(seal):
+            raise RuntimeError("native RTP build lacks the explicit profile seal API")
+        await self._settled_device_call(seal, 30000)
+        server_task = getattr(self, "_server_task", None)
+        if server_task is not None and not server_task.done():
+            server_task.cancel()
+            await asyncio.gather(server_task, return_exceptions=True)
+        return await asyncio.to_thread(
+            seal_native_profile,
+            directory,
+            host=socket.gethostname(),
+            pid=os.getpid(),
+            replica_rank=self.replica_rank,
+            tp_rank=self.tp_rank,
+            seal_requested_us=seal_requested_us,
+        )
+
 
 class RTPLLMReplica(RolloutReplica):
     def __init__(
@@ -1751,6 +2216,8 @@ class RTPLLMReplica(RolloutReplica):
                 for rank, server in enumerate(self.servers)
             ]
         )
+        plans = await asyncio.gather(*[server.plan_memory_before_launch.remote() for server in self.servers])
+        await asyncio.gather(*[server.freeze_replica_capacity.remote(plans) for server in self.servers])
         await asyncio.gather(*[server.launch_server.remote() for server in self.servers])
         await self.servers[0].start_tp_health_monitor.remote()
 

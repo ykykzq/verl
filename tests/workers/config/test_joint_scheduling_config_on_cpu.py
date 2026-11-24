@@ -33,7 +33,8 @@ def test_joint_scheduling_normalizes_nested_configuration(container):
     joint = config.weight_publication.joint_scheduling
     assert joint.enabled and joint.kv_capacity_tokens == 16384 and joint.max_batch_size == 8
     assert joint.min_decode_tokens == 64
-    assert joint.max_defer_s == 30
+    assert joint.max_defer_s is None
+    assert joint.completed_queue_size == 128
 
 
 @pytest.mark.parametrize(
@@ -49,6 +50,14 @@ def test_joint_scheduling_normalizes_nested_configuration(container):
         ("update_cooldown_s", float("nan")),
         ("min_decode_window_s", -1),
         ("max_defer_s", 0),
+        ("max_defer_s", -1),
+        ("max_defer_s", float("nan")),
+        ("max_defer_s", float("inf")),
+        ("max_defer_s", True),
+        ("completed_queue_size", 0),
+        ("completed_queue_size", True),
+        ("completed_queue_size", 1.5),
+        ("completed_queue_size", None),
         ("evacuation_timeout_s", -1),
         ("staleness_version_gap", 0),
         ("tail_tokens", 0),
@@ -64,6 +73,15 @@ def test_joint_scheduling_rejects_invalid_limits(field, value):
     values["weight_publication"]["joint_scheduling"][field] = value
     with pytest.raises(ValueError, match=field):
         RolloutConfig(**values)
+
+
+@pytest.mark.parametrize("deadline", [None, 30.0])
+def test_joint_scheduling_accepts_disabled_or_explicit_deadline(deadline):
+    values = joint_rollout_config()
+    values["weight_publication"]["joint_scheduling"].update(max_defer_s=deadline, completed_queue_size=1)
+    joint = RolloutConfig(**values).weight_publication.joint_scheduling
+    assert joint.max_defer_s == deadline
+    assert joint.completed_queue_size == 1
 
 
 @pytest.mark.parametrize(

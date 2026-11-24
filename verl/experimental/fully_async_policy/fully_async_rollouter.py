@@ -14,9 +14,12 @@
 
 import asyncio
 import collections
+import json
 import logging
 import os
+import socket
 import time
+from pathlib import Path
 from pprint import pformat
 
 import numpy as np
@@ -31,6 +34,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
     safe_create_task,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.fully_async_policy.rollout_metrics import consumed_tokens, required_prompt_groups
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, ResourcePoolManager
@@ -314,7 +318,26 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         """
         worker = self._select_best_worker()
         output_future = worker.generate_sequences.remote(prompts)
-        return await asyncio.wrap_future(output_future.future())
+        # Shield the ObjectRef waiter: cancelling its local Future does not
+        # cancel a Ray async-actor task or prove its backend cleanup completed.
+        waiter = asyncio.wrap_future(output_future.future())
+        try:
+            return await asyncio.shield(waiter)
+        except asyncio.CancelledError as cancellation:
+            ray.cancel(output_future, recursive=False)
+            deadline = asyncio.get_running_loop().time() + 60.0
+            while not waiter.done():
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise RuntimeError("agent-loop cancellation did not settle within 60 seconds") from cancellation
+                try:
+                    await asyncio.wait({waiter}, timeout=0.1)
+                except asyncio.CancelledError:
+                    pass  # A second cancellation must not interrupt cleanup.
+            try:
+                waiter.result()
+            except ray.exceptions.TaskCancelledError:
+                pass
+            raise
 
     def _select_best_worker(self):
         """Select the best worker, simple round-robin load balancing"""
@@ -421,7 +444,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
-        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
+        self.required_samples = required_prompt_groups(config)
         self.concurrent_samples_per_replica: int = config.async_training.get("concurrent_samples_per_replica", 16)
         self.max_required_samples = None
         self.max_concurrent_samples = None
@@ -482,11 +505,48 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # `_resume_event` signals that the rollouter is currently running (paused == False).
         self._resume_event = asyncio.Event()
         self._resume_event.set()
+        self._admission_changed = asyncio.Event()
+        self._result_delivery_lock = asyncio.Lock()
+        self._admission_blocked_seconds = collections.defaultdict(float)
+        self._admission_blocked_since = None
+        self._admission_block_reason = None
+        self._delivery_wait_host_seconds = 0.0
+        self._delivery_started = {}
+        self._queue_trace_errors = 0
+        self._generating_groups = 0
+        self._generated_groups = 0
+        self._rejected_groups = 0
+        self._delivery_acked_groups = 0
+        self._delivery_unconfirmed_groups = 0
 
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
         async with self.lock:
             self.message_queue_client = message_queue_client
+
+    def _joint_scheduling_config(self):
+        config = getattr(self, "config", None)
+        if config is None:
+            return None
+        joint = config.actor_rollout_ref.rollout.get("weight_publication", {}).get("joint_scheduling", {})
+        return joint if joint.get("enabled", False) else None
+
+    def _continuous_admission_enabled(self):
+        config = getattr(self, "config", None)
+        return self._joint_scheduling_config() is not None or (
+            config is not None and not config.async_training.get("sample_budget_enabled", True)
+        )
+
+    def _concurrent_groups_per_replica(self):
+        if self._joint_scheduling_config() is None:
+            return self.concurrent_samples_per_replica
+        rollout = self.config.actor_rollout_ref.rollout
+        limit = rollout.get("max_concurrent_requests_per_replica")
+        if limit is None:
+            return self.concurrent_samples_per_replica
+        if type(limit) is not int or limit <= 0 or limit % rollout.n:
+            raise ValueError("Joint requires a positive per-replica trajectory limit divisible by rollout.n")
+        return limit // rollout.n
 
     async def set_max_required_samples(self):
         async with self.lock:
@@ -501,10 +561,23 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             )
 
             self.max_concurrent_samples = (
-                self.llm_server_manager.get_active_server_count() * self.concurrent_samples_per_replica
+                self.llm_server_manager.get_active_server_count() * self._concurrent_groups_per_replica()
             )
-            self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
-            self.max_queue_size = self.max_required_samples
+            explicit_steps = (
+                self.config.trainer.get("total_training_steps") if hasattr(self.config, "trainer") else None
+            )
+            if explicit_steps is not None:
+                if type(explicit_steps) is not int or not 0 < explicit_steps <= self.total_train_steps:
+                    raise ValueError("trainer.total_training_steps must be positive and fit within the data budget")
+                self.total_train_steps = explicit_steps
+            joint = self._joint_scheduling_config()
+            if not self._continuous_admission_enabled():
+                self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
+            self.max_queue_size = (
+                (joint or self.config.async_training).get("completed_queue_size", 128)
+                if self._continuous_admission_enabled()
+                else self.max_required_samples
+            )
 
             print(
                 f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
@@ -640,6 +713,84 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.step_start_time = time.time()
 
         return timing_raw
+
+    async def _processor_worker_joint(self):
+        """Keep generating while the bounded result queue evicts unconsumed groups.
+
+        Each task owns a workflow credit until delivery settles. The same cap
+        bounds generation and the number of payloads retained by pending delivery.
+        """
+
+        def settle(state):
+            if state["settled"]:
+                return
+            state["settled"] = True
+            if state["accepted"]:
+                if state["delivered"]:
+                    self._delivery_acked_groups += 1
+                else:
+                    self._delivery_unconfirmed_groups += 1
+                self._delivery_wait_host_seconds += time.monotonic() - state["delivery_start"]
+                self._delivery_started.pop(state["sample_identity"])
+            else:
+                self._generating_groups -= 1
+                self._rejected_groups += 1
+            self._record_active_count()
+            self._admission_changed.set()
+
+        async def run_sample(sample, state):
+            def generated():
+                if state["accepted"]:
+                    raise RuntimeError("workflow generation accepted twice")
+                self._generating_groups -= 1
+                self._generated_groups += 1
+                state["accepted"] = True
+                state["delivery_start"] = time.monotonic()
+                self._delivery_started[id(sample)] = state["delivery_start"]
+                self._record_active_count()
+                self._admission_changed.set()
+
+            try:
+                state["delivered"] = await self._process_single_sample_streaming(sample, on_generated=generated)
+                if not state["accepted"]:
+                    raise RuntimeError("workflow returned without generation acceptance")
+            finally:
+                settle(state)
+
+        while True:
+            self._admission_changed.clear()
+            done = {task for task in self.active_tasks if task.done()}
+            for task in done:
+                self.active_tasks.remove(task)
+                await task
+            self._record_active_count()
+            if len(self.active_tasks) >= self.max_concurrent_samples:
+                reason = "completed_delivery_backlog" if self._delivery_started else "generation_concurrency"
+                self._admission_blocked_since = time.monotonic()
+                self._admission_block_reason = reason
+                try:
+                    await self._admission_changed.wait()
+                finally:
+                    self._admission_blocked_seconds[reason] += time.monotonic() - self._admission_blocked_since
+                    self._admission_blocked_since = None
+                    self._admission_block_reason = None
+                continue
+            sample = await self.pending_queue.get()
+            self.pending_queue.task_done()
+            if sample is None:
+                if self.active_tasks:
+                    await asyncio.gather(*self.active_tasks)
+                    self.active_tasks.clear()
+                self._record_active_count()
+                return
+            self._generating_groups += 1
+            state = dict(accepted=False, delivered=False, settled=False, sample_identity=id(sample))
+            task = asyncio.create_task(run_sample(sample, state), name=sample.sample_id)
+            # A task cancelled before its coroutine first runs skips its finally.
+            # The callback owns that case and is idempotent with normal cleanup.
+            task.add_done_callback(lambda _task, lifecycle=state: settle(lifecycle))
+            self.active_tasks.add(task)
+            self._record_active_count()
 
     async def _start_profiling(self):
         """Start rollout profiling on all replicas via LLMServerManager after weight sync."""
@@ -894,19 +1045,20 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
 
     def _record_active_count(self):
-        """Append current (len(self.active_tasks), max_concurrent_samples) to the history used
-        for computing dynamic_resource/rollout_resource_utilization. Call this right after any
-        change (increase or decrease) to self.active_tasks, AND whenever max_concurrent_samples
-        changes (see _update_max_concurrent_samples), so each recorded interval carries the
-        capacity that was actually in effect during it.
+        """Record workflow generation concurrency and its configured capacity.
+
+        For Joint this counts generation and reward work before result delivery.
         """
         max_concurrent = self.max_concurrent_samples if self.max_concurrent_samples is not None else 0
-        self._active_count_history.append((time.time(), len(self.active_tasks), max_concurrent))
+        generation_running = self._generating_groups if self._joint_scheduling_config() else len(self.active_tasks)
+        self._active_count_history.append((time.time(), generation_running, max_concurrent))
 
     async def _processor_worker(self):
         """
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
         """
+        if self._joint_scheduling_config() is not None:
+            return await self._processor_worker_joint()
         while True:
             if self.paused or await self._should_pause_generation():
                 print(
@@ -960,26 +1112,22 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     "[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
                 )
                 while self.active_tasks:
+                    done_tasks, _pending = await asyncio.wait(self.active_tasks, return_when=asyncio.FIRST_COMPLETED)
                     async with self.lock:
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                            for task in done_tasks:
-                                await task
-                            self._record_active_count()
+                        self.active_tasks.difference_update(done_tasks)
+                        for task in done_tasks:
+                            await task
+                        self._record_active_count()
                 break
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
+                done_tasks, _pending = await asyncio.wait(self.active_tasks, return_when=asyncio.FIRST_COMPLETED)
                 async with self.lock:
-                    if self.active_tasks:
-                        done_tasks, self.active_tasks = await asyncio.wait(
-                            self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                        )
-                        for task in done_tasks:
-                            await task
-                        self._record_active_count()
+                    self.active_tasks.difference_update(done_tasks)
+                    for task in done_tasks:
+                        await task
+                    self._record_active_count()
 
             # Submit single sample processing
             if self.paused:
@@ -992,7 +1140,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 )
                 self._record_active_count()
 
-    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
+    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample, *, on_generated=None):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
         # Embed sample_id into prompts for skip management
@@ -1006,17 +1154,30 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
-        rollout_sample.rollout_status = await self.get_statistics()
-
-        success = await self.message_queue_client.put_sample(
-            sample=ray.cloudpickle.dumps(rollout_sample),
-        )
+        if on_generated is not None:
+            on_generated()
+        if self._joint_scheduling_config() is not None:
+            # Serialize commits in generation completion order.
+            async with self._result_delivery_lock:
+                rollout_sample.rollout_status = await self.get_statistics()
+                success = await self.message_queue_client.put_completed_sample(
+                    ray.cloudpickle.dumps(rollout_sample), cost=consumed_tokens(rollout_sample.full_batch)
+                )
+        else:
+            rollout_sample.rollout_status = await self.get_statistics()
+            put = (
+                self.message_queue_client.put_sample_wait
+                if self._continuous_admission_enabled()
+                else self.message_queue_client.put_sample
+            )
+            success = await put(sample=ray.cloudpickle.dumps(rollout_sample))
         if success:
             self.total_generated_samples += 1
             self._step_generated_samples += 1
         else:
             self.dropped_stale_samples += 1
         self.processed_sample_count += 1
+        return success
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -1076,6 +1237,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             if cancelled and not failed:
                 raise asyncio.CancelledError
 
+        # A full completed buffer must not make shutdown uncancellable.
+        if self._continuous_admission_enabled():
+            await self.message_queue_client.put_sample_wait(sample=None)
+
     async def _cleanup_streaming_generation(self, failed: bool):
         # Stop the processor before collecting sample tasks so it cannot submit
         # new generation work after cleanup takes ownership of the task set.
@@ -1089,8 +1254,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         for task in samples:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*samples, return_exceptions=True)
+        results = await asyncio.gather(*samples, return_exceptions=True)
         self.active_tasks.clear()
+        cleanup_errors = [
+            r for r in results if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError)
+        ]
+        if cleanup_errors:
+            raise RuntimeError("rollout task cleanup failed; final evaluation is unsafe") from cleanup_errors[0]
 
         self.feed_task = None
         self.processor_task = None
@@ -1099,11 +1269,25 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.running = False
 
         try:
-            await self.message_queue_client.put_sample(sample=None)
+            if failed and self._continuous_admission_enabled():
+                # Closing preserves every acknowledged queued result. A legacy
+                # put(None) would evict an older completed sample when full.
+                await self.message_queue_client.shutdown()
+            elif not self._continuous_admission_enabled():
+                await self.message_queue_client.put_sample(sample=None)
         except Exception:
             if not failed:
                 raise
             logger.exception("Failed to send the finish signal during rollout cleanup")
+        finally:
+            # A final observation must follow task settlement and queue closure;
+            # a five-second sample from before cancellation cannot prove drain.
+            if self._joint_scheduling_config() is not None:
+                try:
+                    self._emit_queue_state(await self.get_statistics(), final_cleanup=True)
+                except Exception:
+                    self._queue_trace_errors += 1
+                    logger.exception("Failed to obtain final queue-state diagnostics")
 
     async def fit(self):
         """
@@ -1123,7 +1307,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self._resume_event.set()
 
         # Create the main asynchronous task
+        self._fit_stop_requested = False
         generation_task = safe_create_task(self._streaming_generation_main(), name="generation_task")
+        self._generation_task = generation_task
         monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
 
         try:
@@ -1132,6 +1318,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             done, _pending = await asyncio.wait([generation_task, monitor_task], return_when=asyncio.FIRST_EXCEPTION)
             for task in done:
                 task.result()
+        except asyncio.CancelledError:
+            if not self._fit_stop_requested:
+                raise
         except Exception as e:
             print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
             raise
@@ -1148,6 +1337,52 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         print("[FullyAsyncRollouter] Rollouter fit completed")
 
+    async def stop_generation(self):
+        """Settle producer work before final evaluation of a bounded training run."""
+        self._fit_stop_requested = True
+        task = getattr(self, "_generation_task", None)
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            results = await asyncio.gather(task, return_exceptions=True)
+            if isinstance(results[0], BaseException) and not isinstance(results[0], asyncio.CancelledError):
+                raise RuntimeError("rollout shutdown failed; refusing final evaluation") from results[0]
+        return {"stopped": True, "processed_samples": self.processed_sample_count}
+
+    async def finalize_reprefill_profiles(self):
+        """Explicit post-training profiling seal; never part of a measured step."""
+        rollout = self.config.actor_rollout_ref.rollout
+        vllm_joint = rollout.name == "vllm" and rollout.weight_publication.enabled
+        if not vllm_joint and (rollout.name != "rtp_llm" or not getattr(rollout, "rtp_reprefill_profile_dir", None)):
+            return {"enabled": False}
+        manager = getattr(self, "llm_server_manager", None)
+        if manager is None:
+            return {
+                "enabled": True,
+                "sealed": False,
+                "reason": "rollout initialization did not create a server manager",
+            }
+        await self.stop_generation()
+        from verl.workers.rollout.rtp_llm_rollout.reprefill_profile_seal import finalize_server_profiles
+
+        replicas = list(manager.rollout_replicas) + list(getattr(manager, "hybrid_replicas", {}).values())
+        unique_replicas = []
+        for replica in replicas:
+            if replica not in unique_replicas:
+                unique_replicas.append(replica)
+        servers = []
+        expected_tp = int(rollout.tensor_model_parallel_size)
+        for replica in unique_replicas:
+            ranks = list(replica.servers)
+            if len(ranks) != expected_tp:
+                raise RuntimeError("cannot seal a partially initialized rollout replica")
+            servers.extend(ranks)
+        if vllm_joint:
+            seals = await asyncio.gather(*[server.seal_reprefill_profile.remote() for server in servers])
+        else:
+            seals = await finalize_server_profiles(servers)
+        return {"enabled": True, "replicas": len(unique_replicas), "tp_size": expected_tp, "seals": seals}
+
     async def _async_monitor_loop(self):
         """
         Async coroutine for monitoring:
@@ -1156,17 +1391,24 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         last_stats_time = time.time()
         stats_interval = 60.0
-        check_interval = 10.0
+        check_interval = 5.0 if self._joint_scheduling_config() is not None else 10.0
 
         while True:
             async with self.lock:
                 if not self.running:
                     break
             await asyncio.sleep(check_interval)
+            async with self.lock:
+                if not self.running:
+                    break
+            stats = None
+            if self._joint_scheduling_config() is not None:
+                stats = await self.get_statistics()
+                self._emit_queue_state(stats)
             # Print statistics periodically
             current_time = time.time()
             if current_time - last_stats_time >= stats_interval:
-                stats = await self.get_statistics()
+                stats = stats if stats is not None else await self.get_statistics()
                 print(f"[FullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
                 last_stats_time = current_time
 
@@ -1177,8 +1419,47 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     print("[FullyAsyncRollouter][ShouldPause] resume rollouter.")
                     self._resume_event.set()
 
+    def _emit_queue_state(self, stats, final_cleanup=False):
+        """Optional standalone diagnostics; never imports experiment hook modules."""
+        directory = (
+            os.getenv("VERL_QUEUE_TIMING_DIR")
+            or os.getenv("VERL_ASYNC_QUEUE_TRACE_DIR")
+            or os.getenv("JOINT_TRACE_DIR")
+        )
+        if not directory:
+            return
+        try:
+            folder = Path(directory)
+            folder.mkdir(parents=True, exist_ok=True)
+            row = dict(
+                t=time.time(),
+                mono=time.monotonic(),
+                host=socket.gethostname(),
+                pid=os.getpid(),
+                event="queue_state",
+                actor_role="rollouter",
+                replica_rank=None,
+                final_cleanup=final_cleanup,
+                generation_running=stats["joint/running_groups"],
+                delivery_waiting=stats["joint/delivery_waiting_groups"],
+                active_total=stats["monitor/active_tasks_size"],
+                completed_queue_size=stats["monitor/queue/mq_queue_size"],
+                completed_queue_bytes=stats["monitor/queue/storage"]["queue_payload_bytes"],
+                stats=stats,
+            )
+            with (folder / f"queue-state-{socket.gethostname()}-{os.getpid()}.jsonl").open("a") as stream:
+                stream.write(json.dumps(row, allow_nan=False) + "\n")
+        except Exception:
+            self._queue_trace_errors += 1
+            if self._queue_trace_errors == 1:
+                logger.exception("Queue-state diagnostic write failed; see queue_trace_errors")
+
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""
+        # Joint admission closes atomically in prepare_weight_update(), then
+        # reopens per replica after installation. A trainer step is not a gate.
+        if self._continuous_admission_enabled():
+            return False
         queue_stats = await self.message_queue_client.get_statistics()
         queue_size = queue_stats["queue_size"]
 
@@ -1219,7 +1500,32 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "static/staleness_threshold": self.staleness_threshold,
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
+            "monitor/queue/transport": self.message_queue_client.get_transport_statistics(),
+            "monitor/queue/storage": queue_stats,
+            "monitor/queue/trace_errors": self._queue_trace_errors,
         }
+        if self._joint_scheduling_config() is not None:
+            blocked = dict(self._admission_blocked_seconds)
+            if self._admission_blocked_since is not None:
+                blocked[self._admission_block_reason] = blocked.get(self._admission_block_reason, 0.0) + (
+                    time.monotonic() - self._admission_blocked_since
+                )
+            stats.update(
+                {
+                    "joint/accepted_groups": self._generated_groups,
+                    "joint/running_groups": self._generating_groups,
+                    "joint/rejected_groups": self._rejected_groups,
+                    "joint/delivery_waiting_groups": len(self._delivery_started),
+                    "joint/delivery_acked_groups": self._delivery_acked_groups,
+                    "joint/delivery_unconfirmed_groups": self._delivery_unconfirmed_groups,
+                    "joint/outstanding_workflow_limit": self.max_concurrent_samples,
+                    "joint/admission_block_reason": self._admission_block_reason,
+                    "joint/admission_blocked_wall_seconds": blocked,
+                    "joint/completed_delivery_host_seconds": self._delivery_wait_host_seconds,
+                    "joint/observed_delivery_host_seconds": self._delivery_wait_host_seconds
+                    + sum(time.monotonic() - started for started in self._delivery_started.values()),
+                }
+            )
 
         return stats
 
@@ -1321,14 +1627,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         if self.max_required_samples is None:
             return
-        new_val = len(self.llm_server_manager.get_replicas()) * self.concurrent_samples_per_replica
-        new_val = min(new_val, self.max_required_samples)
+        new_val = len(self.llm_server_manager.get_replicas()) * self._concurrent_groups_per_replica()
+        if not self._continuous_admission_enabled():
+            new_val = min(new_val, self.max_required_samples)
         print(
             f"[FullyAsyncRollouter] max_concurrent_samples updated: "
             f"{self.max_concurrent_samples} -> {new_val} "
             f"(active_replicas={len(self.llm_server_manager.get_replicas())})"
         )
         self.max_concurrent_samples = new_val
+        self._admission_changed.set()
         self._record_active_count()
 
     def get_hybrid_replica(self, resource_id: str):

@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import time
+from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from typing import Any, Optional
 from uuid import uuid4
@@ -73,6 +74,7 @@ class LLMServerClient:
         self._lb_require_acquire_fields: list[str] | None = None
         self._lb_require_release_fields: list[str] | None = None
         self._joint_generation_calls: dict[str, asyncio.Future] = {}
+        self._generation_routes: dict[str, tuple] = {}
         self._migration_retries: dict[str, tuple[float, float]] = {}
 
     def _trajectory_migration_config(self) -> Any | None:
@@ -165,6 +167,7 @@ class LLMServerClient:
             mm_processor_kwargs=mm_processor_kwargs,
             **kwargs,
         )
+        self._generation_routes[request_id] = (server_id, server)
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -184,8 +187,9 @@ class LLMServerClient:
             priority_kwargs = (
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
+            backend_request_id = self._vllm_request_id(request_id)
             generation_call = server.generate.remote(
-                request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
+                request_id=backend_request_id,  # use new request_id for each turn
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -209,6 +213,32 @@ class LLMServerClient:
 
                 generation_task.add_done_callback(completed)
                 output: TokenOutput = await asyncio.shield(generation_task)
+            elif self.config.actor_rollout_ref.rollout.name == "rtp_llm":
+                generation_task = asyncio.ensure_future(generation_call)
+                try:
+                    output = await asyncio.shield(generation_task)
+                except asyncio.CancelledError:
+
+                    async def settle_backend():
+                        while not generation_task.done():
+                            # Retry covers cancellation arriving before backend enqueue.
+                            await server.abort_request.remote(request_id=backend_request_id)
+                            await asyncio.wait({generation_task}, timeout=0.05)
+                        if generation_task.cancelled():
+                            raise RuntimeError("RTP generation waiter cancelled before backend settlement")
+                        try:
+                            generation_task.result()
+                        except Exception:
+                            pass  # A settled failed RPC also proves stream closure.
+
+                    cleanup = asyncio.create_task(asyncio.wait_for(settle_backend(), timeout=30.0))
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            pass
+                    cleanup.result()  # Fail closed if termination cannot be proved.
+                    raise
             else:
                 output: TokenOutput = await generation_call
             global_steps = output.extra_fields.get("global_steps")
@@ -218,6 +248,7 @@ class LLMServerClient:
                 output.extra_fields[_ROUTE_SERVER_ID_FIELD] = server_id
             return output
         finally:
+            self._generation_routes.pop(request_id, None)
             self._release_server(
                 server_id,
                 request_id=request_id,
@@ -260,6 +291,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             try:
                 return await super()._acquire_server(request_id, **extra)
             except RuntimeError as e:
+                if "All rollout replicas at request capacity" in str(e):
+                    await asyncio.sleep(0.05)
+                    continue
                 if "No available servers in load balancer" not in str(e):
                     raise
                 if self._fine_grained_weight_update_enabled():
@@ -350,7 +384,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         migration_required: bool = False,
     ) -> dict[str, Any] | None:
         migration_config = self._trajectory_migration_config()
-        if migration_config is None or self._load_balancer is None:
+        if (
+            migration_config is None
+            or self._load_balancer is None
+            or not getattr(migration_config, "scheduling_enabled", True)
+        ):
             return None
 
         retry_after, _ = self._migration_retries.get(request_id, (0.0, 0.0))
@@ -429,7 +467,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     ),
                     timeout=timeout_s,
                 )
-                if ticket.get("status") == "deferred" and ticket.get("reason") == "no_complete_block":
+                if ticket.get("status") == "deferred" and ticket.get("reason") in {
+                    "no_complete_block",
+                    "local_prefix_unavailable",
+                }:
                     await asyncio.wait_for(
                         self._load_balancer.cancel_trajectory_migration.remote(
                             request_id=request_id, decision_id=decision_id
@@ -469,6 +510,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             }
             if "remote_write_status" in ticket:
                 result["remote_write_status"] = ticket["remote_write_status"]
+            if "export_host_s" in ticket:
+                result["export_host_s"] = ticket["export_host_s"]
+                result["explicit_export"] = ticket.get("explicit_export", False)
             return result
         except asyncio.CancelledError:
             await asyncio.shield(
@@ -582,12 +626,86 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     break
             try:
                 cleanup_task.result()
-            except Exception:
+            except Exception as error:
                 if not failed and not cancelled:
                     raise
-                logger.exception("failed to release trajectory registration for %s", request_id)
+                raise RuntimeError(f"failed to settle trajectory {request_id}; refusing unsafe cleanup") from error
             if cancelled and not failed:
                 raise asyncio.CancelledError
+
+    async def _generate_on_demand(self, request_id, *, original_prompt_tokens, generated_before, **kwargs):
+        """Decode continuously; only a migration-eligible request is paused.
+
+        The settled generation RPC is the safe boundary for export. A native
+        generation id fences delayed aborts from a subsequent continuation.
+        """
+        cfg = self._trajectory_migration_config()
+        if not self._joint_scheduling_enabled() or self.config.actor_rollout_ref.rollout.name not in (
+            "rtp_llm",
+            "vllm",
+        ):
+            raise ValueError("on_demand migration requires joint scheduling and rtp_llm or vllm")
+        task = asyncio.create_task(super().generate(request_id=request_id, **kwargs))
+        selected_pause = False
+        try:
+            while not task.done():
+                done, _ = await asyncio.wait({task}, timeout=float(cfg.progress_poll_interval_s))
+                if done:
+                    break
+                route = self._generation_routes.get(request_id)
+                if route is None:
+                    continue  # Not admitted yet; no backend work to interrupt.
+                server_id, server = route
+                progress = await server.get_request_progress.remote(request_id)
+                if task.done() or not progress.get("found") or not progress["generated_tokens"]:
+                    continue
+                generated = generated_before + progress["generated_tokens"]
+                version = progress["weight_version"]
+                await self._load_balancer.report_trajectory_progress.remote(
+                    request_id=request_id,
+                    server_id=server_id,
+                    generated_tokens=generated,
+                    weight_version=version,
+                    prefix_ids=progress["prefix_ids"],
+                )
+                retry_after, _ = self._migration_retries.get(request_id, (0.0, 0.0))
+                if task.done() or time.monotonic() < retry_after:
+                    continue
+                decision = await self._load_balancer.plan_trajectory_migration.remote(
+                    request_id=request_id,
+                    source_server_id=server_id,
+                    trajectory={
+                        "request_id": request_id,
+                        "prompt_tokens": original_prompt_tokens,
+                        "generated_tokens": generated,
+                        "prefix_tokens": len(progress["prefix_ids"]),
+                        "checkpoint_index": 0,
+                    },
+                    source_metadata={"weight_version": version},
+                    preview_only=True,
+                )
+                if task.done() or not decision.get("migrate"):
+                    continue
+                result = await server.abort_request.remote(
+                    request_id,
+                    expected_generation_id=progress["generation_id"],
+                    preserve_kv=decision.get("mode", "remote_prefix") == "remote_prefix",
+                )
+                if result.get("aborted"):
+                    selected_pause = True
+                    break
+            output = await task  # drain native stream before any KV export
+            if selected_pause and not output.extra_fields.get("reached_eos"):
+                # A native KV checkpoint ends normally before max_tokens. It is
+                # a resumable migration boundary, not trajectory completion.
+                output.stop_reason = "aborted"
+                output.extra_fields["migration_checkpoint"] = True
+                output.extra_fields["on_demand_migration_pause"] = True
+            return output
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     async def _generate_segments(
         self,
@@ -630,6 +748,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
         migration_config = self._trajectory_migration_config()
         checkpoint_tokens = int(getattr(migration_config, "checkpoint_tokens", 0)) if migration_config else None
+        scheduling_enabled = migration_config is not None and getattr(migration_config, "scheduling_enabled", True)
+        on_demand = scheduling_enabled and getattr(migration_config, "checkpoint_mode", "periodic") == "on_demand"
         versioned_continuation = migration_config is not None and (
             self._fine_grained_weight_update_enabled()
             or bool(getattr(migration_config, "allow_cross_version_recompute", False))
@@ -669,6 +789,14 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         last_source_server_id = None
         last_source_version = None
         checkpoint_index = 0
+        rollout_config = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
+        profile_enabled = (
+            getattr(rollout_config, "name", None) == "rtp_llm"
+            and getattr(rollout_config, "rtp_reprefill_profile_dir", None) is not None
+        ) or (getattr(rollout_config, "name", None) == "vllm" and self._joint_scheduling_enabled())
+        if profile_enabled and "profile_context" in kwargs:
+            raise ValueError("profile_context is reserved for fully-async continuation identity")
+        profile_attempt = 0
 
         while True:
             if replan_migration:
@@ -698,7 +826,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                         "trajectory migration requires an explicit max_tokens/max_new_tokens or rollout.response_length"
                     )
                 remaining_tokens = original_max_tokens - len(final_output.token_ids)
-                sampling_params[limit_key] = min(checkpoint_tokens, remaining_tokens)
+                sampling_params[limit_key] = (
+                    remaining_tokens
+                    if on_demand or not scheduling_enabled
+                    else min(checkpoint_tokens, remaining_tokens)
+                )
 
             continuation_kwargs = {}
             if versioned_continuation and final_output.token_ids:
@@ -707,11 +839,27 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 )
             if migration_ticket is not None:
                 continuation_kwargs["migration_ticket"] = migration_ticket
+            if profile_enabled:
+                profile_attempt += 1
+                continuation_kwargs["profile_context"] = {
+                    "logical_request_id": str(request_id),
+                    "attempt": profile_attempt,
+                    "original_prompt_tokens": len(prompt_ids),
+                    "generated_before": len(final_output.token_ids),
+                    "previous_weight_version": last_source_version,
+                }
 
             # 1. generate tokens
             try:
-                output = await super().generate(
+                generate = self._generate_on_demand if on_demand else super().generate
+                monitor_kwargs = (
+                    {"original_prompt_tokens": len(prompt_ids), "generated_before": len(final_output.token_ids)}
+                    if on_demand
+                    else {}
+                )
+                output = await generate(
                     request_id=request_id,
+                    **monitor_kwargs,
                     prompt_ids=prompt_ids + final_output.token_ids,
                     sampling_params=sampling_params,
                     image_data=image_data,
@@ -851,6 +999,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         final_output.extra_fields["max_global_steps"] = max_global_steps
         final_output.extra_fields["num_cached_tokens"] = num_cached_tokens
         final_output.extra_fields["remote_reuse_len"] = final_output.remote_reuse_len
+        # Preserve compact per-token version intervals for unified partial rollout too.
+        final_output.extra_fields["trajectory_segments"] = trajectory_segments
         if forced_prefill_tokens is not None:
             final_output.extra_fields["forced_prefill_tokens"] = forced_prefill_tokens
         if migration_config is not None:
@@ -858,7 +1008,6 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             final_output.extra_fields.setdefault("trajectory_migration_backoff_skips", 0)
             final_output.extra_fields.setdefault("trajectory_migration_deferred", 0)
             final_output.extra_fields.setdefault("trajectory_migration_failures", [])
-            final_output.extra_fields["trajectory_segments"] = trajectory_segments
             final_output.extra_fields["forced_prefill_tokens"] = forced_prefill_tokens or 0
             final_output.extra_fields["trajectory_migrations"] = migration_history
             final_output.extra_fields["trajectory_migration_counts"] = {
@@ -1062,13 +1211,20 @@ class LLMServerManager:
             else:
                 joint_config = dict(joint_config)
             joint_kwargs["joint_scheduling_config"] = joint_config
+        server_metadata = deepcopy(getattr(self, "server_metadata", {}))
+        limit = getattr(self.rollout_config, "max_concurrent_requests_per_replica", None)
+        if limit is not None:
+            if type(limit) is not int or limit <= 0:
+                raise ValueError("max_concurrent_requests_per_replica must be a positive integer")
+            for server_id in self.server_addresses:
+                server_metadata.setdefault(server_id, {})["max_concurrent_requests"] = limit
         self.global_load_balancer = get_router_handle(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             router_config_path=getattr(self.rollout_config, "router_config_path", None),
             full_determinism=getattr(self.rollout_config, "full_determinism", False),
             load_balancer_cls=self._load_balancer_cls,
             trajectory_migration_config=migration_config,
-            server_metadata=getattr(self, "server_metadata", {}),
+            server_metadata=server_metadata,
             **joint_kwargs,
         )
 

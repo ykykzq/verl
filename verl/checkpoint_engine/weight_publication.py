@@ -112,7 +112,20 @@ class WeightPublisher:
 
             if relay_config is not None:
                 raise ValueError("GPU snapshots and CPU relay are separate transports")
-            self.gpu_pool = GPUSnapshotPool(replicas, gpu_snapshot_config)
+            if getattr(gpu_snapshot_config, "conversion_location", "rollout") == "trainer":
+                from verl.checkpoint_engine.trainer_conversion import TrainerConversionPool
+
+                self.gpu_pool = TrainerConversionPool(replicas, gpu_snapshot_config)
+            elif getattr(gpu_snapshot_config, "pipeline_depth", 0):
+                from verl.checkpoint_engine.gpu_snapshot_pipeline import PipelineSnapshotPool
+
+                self.gpu_pool = PipelineSnapshotPool(replicas, gpu_snapshot_config)
+            elif getattr(gpu_snapshot_config, "bucket_bytes", 0):
+                from verl.checkpoint_engine.gpu_snapshot_bucket import BucketSnapshotPool
+
+                self.gpu_pool = BucketSnapshotPool(replicas, gpu_snapshot_config)
+            else:
+                self.gpu_pool = GPUSnapshotPool(replicas, gpu_snapshot_config)
         if relay_config is not None:
             from verl.checkpoint_engine.relay_distribution import RelayDistribution
 
@@ -156,9 +169,26 @@ class WeightPublisher:
             status["fatal_error"] = status["fatal_error"] or status["relay"]["fatal_error"]
         return status
 
-    async def configure_gpu(self, publisher):
+    async def configure_gpu(self, publisher, source_nodes=None):
         self.gpu_pool.publisher = publisher
+        if getattr(self.gpu_pool.config, "pipeline_depth", 0):
+            return await self.gpu_pool.describe(source_nodes)
         return await self.gpu_pool.describe()
+
+    async def configure_conversion_plans(self, source_layouts):
+        return await self.gpu_pool.configure_conversion_plans(source_layouts)
+
+    async def export_trainer_plans(self):
+        return await self.gpu_pool.export_trainer_plans()
+
+    async def prepare_trainer_outputs(self, version, rank, sequence, outputs):
+        return await self.gpu_pool.prepare_trainer_outputs(version, rank, sequence, outputs)
+
+    async def finish_trainer_outputs(self, rank, sequence):
+        return await self.gpu_pool.finish_trainer_outputs(rank, sequence)
+
+    async def finish_trainer_round(self, version, rank, seen, metrics):
+        return await self.gpu_pool.finish_trainer_round(version, rank, seen, metrics)
 
     async def initialize_gpu(self):
         return await self.gpu_pool.initialize()
@@ -168,6 +198,12 @@ class WeightPublisher:
 
     async def prepare_gpu_input(self, version, name, shape, dtype):
         return await self.gpu_pool.prepare_input(version, name, shape, dtype)
+
+    async def prepare_gpu_bucket(self, version, tensors):
+        return await self.gpu_pool.prepare_bucket(version, tensors)
+
+    async def gpu_fetch_bucket(self, snapshot, worker_index, tensors, key):
+        return await self.gpu_pool.fetch_bucket(snapshot, worker_index, tensors, key)
 
     async def finish_gpu_input(self):
         return await self.gpu_pool.finish_input()

@@ -58,13 +58,25 @@ class FullyAsyncTaskRunner:
             raise
         finally:
             trainer = self.components.get("trainer")
+            publisher_stopped = trainer is None
             if trainer is not None:
                 try:
                     ray.get(trainer.shutdown_weight_publisher.remote())
+                    publisher_stopped = True
                 except BaseException:
                     if not failed:
                         raise
                     logging.getLogger(__name__).exception("Weight publisher shutdown failed during task cleanup")
+            rollouter = self.components.get("rollouter")
+            if publisher_stopped and rollouter is not None and not failed:
+                rollout = config.actor_rollout_ref.rollout
+                profile_enabled = (rollout.name == "rtp_llm" and rollout.get("rtp_reprefill_profile_dir")) or (
+                    rollout.name == "vllm" and rollout.get("weight_publication", {}).get("enabled", False)
+                )
+                if profile_enabled:
+                    seals = ray.get(rollouter.finalize_reprefill_profiles.remote())
+                    self.components["reprefill_profile_seals"] = seals
+                    print("[ASYNC MAIN] Native re-prefill profiles sealed:", seals, flush=True)
 
     def _initialize_components(self, config) -> None:
         print(f"[ASYNC MAIN] TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")

@@ -205,8 +205,10 @@ actor_rollout_ref:
         update_cooldown_s: 5.0
         min_decode_window_s: 2.0
         min_decode_tokens: 64
-        max_defer_s: 30.0
+        max_defer_s: null
+        completed_queue_size: 128
         evacuation_timeout_s: 5.0
+        staleness_mode: version_kl
         staleness_version_gap: 2
         tail_tokens: 32
         tail_kl_threshold: 0.1
@@ -220,6 +222,16 @@ async_training:
 联合调度要求 `async_training.partial_rollout=true`，使更新中断的 trajectory 保留前缀并续跑；
 配置校验会拒绝关闭此选项，避免将更新中断误当作生成完成。
 
+联合模式持续提交 rollout，不再按 `staleness_threshold` 派生的 step 样本配额或队列阈值暂停；
+并发上限由 replica 数量和 `concurrent_samples_per_replica` 决定，实际准入仍受 router 的版本与容量约束。
+`completed_queue_size` 独立限制已完成待训练的 prompt group 数量，每组包含同一 prompt 的所有 responses，
+默认 128，必须为正整数。缓冲区满时，完成任务在客户端可取消地等待空位，不丢弃旧样本，也不占住
+Ray 队列 actor 的并发槽位；这些任务仍计入 rollouter 并发上限，从而形成有界背压。
+正常结束标记同样等待空位，排在已入队样本之后。失败退出保留原有异常传播与清理路径。
+未开启联合调度时默认保留原有按 step 暂停和队列行为；可显式设置
+`async_training.sample_budget_enabled=false` 使用同样的持续准入和无损队列，
+此时队列容量来自 `async_training.completed_queue_size`。
+
 每次发布先在 router 执行预请求，关闭所有旧版本 replica 的新 trajectory 准入。完整逻辑请求在
 checkpoint 间隙仍保持登记和容量占用，因此已有续跑不会被当作新请求。新请求只进入已安装最新
 发布版本的 replica；所有 replica 暂不可用时在客户端等待，所有可用 replica 被 pin 时发布健康检查
@@ -227,7 +239,7 @@ checkpoint 间隙仍保持登记和容量占用，因此已有续跑不会被当
 
 后台优先选择逻辑 trajectory 较少的 replica 进行排空。checkpoint 上的同版本迁移优先填入已有负载
 的兼容 replica，释放出的 replica 更新后恢复新请求准入。版本、模型、rollout 配置指纹、KVCM domain
-和 namespace 必须匹配。达到排空期限、最长延期，或只剩少量且无法迁移的请求时，执行原地更新；
+和 namespace 必须匹配。达到排空期限、显式配置的最长延期，或只剩少量且无法迁移的请求时，执行原地更新；
 幸存请求保留 token ids，通过显式 recompute ticket 在新版本重新 prefill。高负载 replica 也可向同版本
 低负载 replica 分流。失效源可在兼容的同版本健康 replica 上显式 recompute 恢复。
 
@@ -238,15 +250,21 @@ checkpoint 间隙仍保持登记和容量占用，因此已有续跑不会被当
 实际模型序列上限、权重和运行时工作区也必须纳入部署容量规划。
 
 每次更新后保留 `update_cooldown_s`，每次迁移后保证 `min_decode_window_s` 的连续解码时间。
-`min_decode_tokens` 提供额外的 token 进度保护，但最长延期到期后可放宽该 token 条件，防止停滞请求
-无限阻塞更新；时间窗口仍然保留。连续发布只替换待更新的快照，不重置最早等待时间。即将到达更新
-期限的旧 replica 不再接收迁入请求，避免尾部工作不断被转移到同一台 replica。
+`min_decode_tokens` 提供额外的 token 进度保护。`max_defer_s` 默认 `null`，禁用最大更新延迟及按该
+期限放宽 token 保护的行为；正数可恢复有限延期，零、负数、NaN 和无穷大均拒绝。
+有限延期到期后可放宽 token 条件，时间窗口仍然保留；即将到达该期限的旧 replica 不再接收迁入请求。
+连续发布只替换待更新的快照，不重置最早等待时间。`evacuation_timeout_s=5` 仍限制一次疏散尝试的
+等待时间，与最大更新延迟不同；`null` 不表示必须等所有 trajectory 完成后才能更新。
+禁用最大延期不保证停滞请求下的更新公平性或最坏延迟，仍需监控各副本进度。
 
-版本差达到 `staleness_version_gap` 后，在两个版本上异步 teacher-force 当前完整前缀，只返回最后
+`staleness_mode=version_kl` 保留旧行为：版本差达到 `staleness_version_gap` 后，
+在两个版本上异步 teacher-force 当前完整前缀，只返回最后
 `tail_tokens` 个生成 token 的 raw logprob，计算非负 sampled k3 指标
 `mean(expm1(log_p_new - log_p_old) - (log_p_new - log_p_old))`。超过阈值后在后续 checkpoint 尝试迁到
 较新版本。这个指标是抽样 KL 代理，不是全词表精确 KL；temperature/top-p 等采样变换会影响其解释。
 它衡量当前两个策略在所选前缀上的偏离，不会清除历史 token 的 off-policy 属性，也不剪枝 GRPO 组。
+持续生产可能增加已完成队列中的样本陈旧度；上述运行中 trajectory 的 tail-KL 检查不会筛选这些样本。
+缓冲区容量限制不等于训练价值筛选，也不构成长期收敛保证。
 
 评分仍需要完整前缀前向，并非只计算尾部 token。两端都预留临时 KV 和一个请求槽；容量不足时跳过，
 发布调度不等待评分。超时或过期版本的结果不触发迁移；临时预留保留至两个后端 RPC 都结束，避免
@@ -254,6 +272,22 @@ checkpoint 间隙仍保持登记和容量占用，因此已有续跑不会被当
 生成请求取消时，也要先确认对应后端 RPC 退出，再释放逻辑请求容量。
 
 router 的 `get_status()` 增加 `joint_scheduling`，发布器状态增加 `scheduling_decision`。
+`joint_scheduling.staleness_mode=version` 时不创建尾部评分任务、不预留探针容量，也不使用旧 KL 结果。
+可选跨版本迁移只考虑版本已知、已安装且处于 SERVING 的目标，要求目标比源新至少
+`staleness_version_gap` 个版本；仅发布而未安装的版本不能触发迁移。
+容量、序列长度、布局兼容、疏散状态和解码保护仍生效，决策记录为 `version-gap staleness`。
+权重切换后必需的版本安全续跑不受可选 staleness 阈值限制，即使版本差只有 1 也可重新 prefill。
+
+`trajectory_migration.checkpoint_mode=on_demand` 仅支持 RTP 联合调度：持续生成并定期读取进度，
+只对预判需要迁移的请求发起暂停。预判不占用迁移 reservation；流结束后再正式决策和预留。
+同版本 KV 迁移使用原生 `request_kv_checkpoint` 正常结束选中的流以保存 KV；跨版本续跑可取消后
+保留 token ids。`generation_id` 防止延迟到达的暂停误伤后续续跑，默认 `periodic` 分段路径仍保留。
+
+完整 D 组入口和 trainer 侧转换部署要求见 [trainer conversion](../../../docs/checkpoint_engine/trainer_conversion.md)。
+该入口设置 `max_defer_s=120`、`min_decode_tokens=0`、`min_decode_window_s=2` 和版本差阈值 2，
+不改变通用默认值。120 秒是更新选择兜底，不是安装 SLA，也不会绕过进行中的迁移或 2 秒时间保护；
+原有 5 秒疏散超时仍可更早推进更新并引发 re-prefill。
+
 生成输出保存 `trajectory_segments`、迁移记录及 `forced_prefill_tokens`，保留各段行为版本和 logprob。
 默认使用 CPU snapshot/Ray object store 发布路径，也可开启下述 RDMA relay。两种方式都没有新增完整
 GPU 权重副本。实际 KVCM 传输、teacher-forcing 支持和端到端收益仍需在 GPU 集群验收。

@@ -196,7 +196,10 @@ class SnapshotMemoryTest(unittest.TestCase):
             patch(f"{MODULE}._checkpoint_size_mib", return_value=40 * 1024),
         ):
             actual = instance._kv_cache_mem_mib()
+            instance.config.weight_publication.gpu_snapshot.pipeline_depth = 2
+            pipelined = instance._kv_cache_mem_mib()
         self.assertEqual(actual, int(0.9 * 49152) - 10240 - int(0.05 * 49152) - 20 * 1024 - 512)
+        self.assertEqual(pipelined, actual - 8 * 1024)
 
     def test_runtime_sender_rejects_shared_memory(self):
         with self.assertRaisesRegex(ValueError, "runtime|CUDA"):

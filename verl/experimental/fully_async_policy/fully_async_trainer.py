@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
+from verl.experimental.fully_async_policy.rollout_metrics import record, record_input, required_prompt_groups
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
     assemble_batch_from_rollout_samples,
@@ -52,8 +53,16 @@ def validate_weight_publication_config(config):
     publication = omega_conf_to_dataclass(rollout.get("weight_publication", {}), WeightPublicationConfig)
     if not publication.enabled:
         return
-    if rollout.get("name") != "rtp_llm":
-        raise ValueError("weight_publication requires rollout.name=rtp_llm")
+    if rollout.get("name") not in ("rtp_llm", "vllm"):
+        raise ValueError("weight_publication requires rollout.name=rtp_llm or vllm")
+    if rollout.get("name") == "vllm":
+        if (
+            publication.transport != "nccl_gpu"
+            or rollout.get("tensor_model_parallel_size", 1) != 1
+            or publication.gpu_snapshot.conversion_location != "trainer"
+            or not publication.gpu_snapshot.cache_conversion_plan
+        ):
+            raise ValueError("vLLM publication requires TP1 and a validated trainer-side HF snapshot plan")
     if not rollout.get("fine_grained_weight_update", {}).get("enabled", False):
         raise ValueError("weight_publication requires fine_grained_weight_update.enabled=True")
     if publication.transport == "nccl_gpu":
@@ -73,6 +82,12 @@ def validate_weight_publication_config(config):
             raise ValueError("joint_scheduling requires trajectory_migration.allow_cross_version_recompute=True")
         if not rollout.get("enable_prefix_caching", True):
             raise ValueError("joint_scheduling requires enable_prefix_caching=True for same-version migration")
+        if publication.joint_scheduling.policy == "laminar" and (
+            rollout.get("name") != "vllm"
+            or not migration.get("scheduling_enabled", True)
+            or migration.get("checkpoint_mode") != "on_demand"
+        ):
+            raise ValueError("Laminar requires vLLM and on-demand same-version migration")
     if actor_rollout.actor.get("strategy") not in ("fsdp", "fsdp2"):
         raise ValueError("weight_publication supports FSDP/FSDP2 actors only")
     if actor_rollout.get("hybrid_engine", False):
@@ -209,7 +224,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
-        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
+        self.required_samples = required_prompt_groups(config)
         self._step_wait_times: list[float] = []  # per-collection wait times within the current step (seconds)
         # Per-collection count of samples that actually had to be waited on (not
         # already sitting in the queue at collection start). Parallel to
@@ -310,7 +325,20 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 if publication_config.transport == "nccl_gpu":
                     from verl.checkpoint_engine.gpu_snapshot_pool import settle
 
-                    transport = await self.weight_publisher.configure_gpu.remote(self.weight_publisher)
+                    source_nodes = None
+                    if getattr(publication_config.gpu_snapshot, "pipeline_depth", 0):
+                        source_nodes = await settle([*self.actor_rollout_wg.get_gpu_snapshot_node_id()])
+                    transport = await self.weight_publisher.configure_gpu.remote(self.weight_publisher, source_nodes)
+                    if getattr(publication_config.gpu_snapshot, "cache_conversion_plan", False):
+                        source_layouts = await settle([*self.actor_rollout_wg.get_conversion_source_layout()])
+                        plan_metadata = await self.weight_publisher.configure_conversion_plans.remote(source_layouts)
+                        print("[ConversionPlan] validated", plan_metadata)
+                        if publication_config.gpu_snapshot.conversion_location == "trainer":
+                            bundles = await self.weight_publisher.export_trainer_plans.remote()
+                            acknowledgements = await settle(
+                                [*self.actor_rollout_wg.initialize_trainer_conversion_plan(bundles)]
+                            )
+                            print("[ConversionPlan] trainer acknowledgements", acknowledgements)
                     await settle(
                         [
                             *self.actor_rollout_wg.initialize_gpu_snapshot(**transport),
@@ -526,8 +554,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             flush=True,
         )
 
-        # Collect samples using a simple loop calling get_sample
-        consumer_start = time.time()
+        # Bound each result RPC by both group count and serialized bytes.
+        # The FIFO order, required GRPO group count and termination sentinel are unchanged.
+        consumer_start = time.perf_counter()
+        queue_fetch_rpcs = 0
+        queue_fetch_s = 0.0
         # Snapshot the queue backlog at collection start: samples already sitting
         # in the queue are served instantly and don't reflect actual generation
         # rate, so they must be excluded from the wait-time-per-sample estimate.
@@ -540,31 +571,37 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             pending_wait_samples = 0
         queue_samples = []
         queue_len = 0
-        while len(queue_samples) < self.required_samples:
-            # Get a single sample and wait until there is a sample or None is received
-            sample, queue_len = await self.message_queue_client.get_sample()
-
-            if sample is None:
-                print(
-                    f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
-                    f"Collected {len(queue_samples)}/{self.required_samples} samples"
+        rollout = self.config.actor_rollout_ref.rollout
+        joint_scheduling = rollout.get("weight_publication", {}).get("joint_scheduling", {}).get("enabled", False)
+        terminated = False
+        while len(queue_samples) < self.required_samples and not terminated:
+            fetch_start = time.perf_counter()
+            if joint_scheduling:
+                items = await self.message_queue_client.get_samples(
+                    max_items=min(32, self.required_samples - len(queue_samples)),
+                    max_bytes=64 << 20,
                 )
-                break
-
-            queue_samples.append(sample)
-            print(
-                f"[FullyAsyncTrainer] sample collected {len(queue_samples)}/{self.required_samples}. "
-                f"mq_len: {queue_len}",
-                flush=True,
-            )
-
-            if len(queue_samples) % 64 == 0:
+            else:
+                items = [await self.message_queue_client.get_sample()]
+            queue_fetch_s += time.perf_counter() - fetch_start
+            queue_fetch_rpcs += 1
+            for sample, queue_len in items:
+                if sample is None:
+                    print(
+                        f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
+                        f"Collected {len(queue_samples)}/{self.required_samples} samples"
+                    )
+                    terminated = True
+                    break
+                queue_samples.append(sample)
+            if len(queue_samples) % 64 == 0 or terminated:
                 print(
                     f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
-                    f"mq_len: {queue_len}"
+                    f"mq_len: {queue_len}",
+                    flush=True,
                 )
 
-        consumer_end = time.time()
+        consumer_end = time.perf_counter()
 
         if not queue_samples or len(queue_samples) < self.required_samples:
             print("[FullyAsyncTrainer] not enough samples collected after loop")
@@ -577,13 +614,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f"mq_len: {queue_len}"
         )
 
+        deserialize_start = time.perf_counter()
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
+        deserialize_s = time.perf_counter() - deserialize_start
+        assemble_start = time.perf_counter()
         # Assemble batch - now working directly with RolloutSample objects
         if self.config.trainer.balance_batch:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
         else:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
+        batch.meta_info["fully_async/queue_fetch_rpcs"] = queue_fetch_rpcs
+        batch.meta_info["fully_async/queue_fetch_s"] = queue_fetch_s
+        batch.meta_info["fully_async/deserialize_s"] = deserialize_s
+        batch.meta_info["fully_async/assemble_s"] = time.perf_counter() - assemble_start
+        record("batch_collected", round=int(self.global_steps), wall_seconds=time.perf_counter() - consumer_start)
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
         self._step_wait_times.append(total_wait_time)
         # pending_wait_samples may be 0 when this collection was served entirely
@@ -679,6 +724,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         while True:
             try:
                 await self.fit_step()
+                limit = self.config.trainer.get("total_training_steps")
+                if limit is not None and self.global_steps > limit:
+                    print(f"[FullyAsyncTrainer] Reached explicit update limit: {limit}")
+                    break
             except TrainingStopException:
                 print("[FullyAsyncTrainer] Training stopped by queue termination signal")
                 break
@@ -702,6 +751,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         Args:
             batch_dict: Raw data dictionary
         """
+        record("trainer_round_begin", round=int(self.global_steps))
         self.metrics = {"training/global_step": self.global_steps, "training/epoch": self.epoch}
         self.timing_raw = {}
         # reward message
@@ -741,19 +791,29 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 self.timing_raw["wait_for_enough_samples"] = 0.0
 
             _allocated_start = time.time()
-            batch = await self._fit_generate(None)
-            batch = self._fit_compute_reward(batch)
-            batch = self._fit_compute_log_prob(batch)
-            batch = self._fit_compute_ref_log_prob(batch)
-            batch = self._fit_compute_critic(batch)
-            batch = self._fit_compute_advantage(batch)
+            from verl.experimental.fully_async_policy.batch_acceptance import prepare_learning_batch
+
+            batch = await prepare_learning_batch(self)
+            record_input(batch, self.global_steps)
             batch = self._fit_update_critic(batch)
+            if os.environ.get("VERL_ACTOR_TIMING_DIR"):
+                batch.meta_info["actor_timing_global_step"] = int(self.global_steps)
+                batch.meta_info["actor_timing_previous_weight_version"] = int(self.current_param_version)
             batch = self._fit_update_actor(batch)
             self._fit_update_local_step()
             rollout_reset_timing_raw = await self._fit_update_weights()
             self._fit_dump_data(batch)
             self._record_train_resource_utilization(allocated_time=time.time() - _allocated_start)
 
+        record(
+            "trainer_round_complete",
+            round=int(self.global_steps),
+            weight_version=int(self.current_param_version),
+            timing=dict(self.timing_raw),
+        )
+        limit = self.config.trainer.get("total_training_steps")
+        if limit is not None and self.global_steps >= limit:
+            await self.rollouter.stop_generation.remote()
         await self._fit_validate()
         self._fit_save_checkpoint()
         self._fit_stop_profile(should_profiler=should_profile)
@@ -821,6 +881,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
         then restore the parameters of the current version.
         """
+        if self.trigger_parameter_sync_step == 1:
+            # No later local update reuses this proximal policy. Avoid retaining
+            # a full CPU model copy for a single global-batch iteration.
+            start = time.time()
+            result = super()._compute_old_log_prob(batch)
+            record("old_log_prob", round=int(self.global_steps), wall_start=start)
+            return result
         if self.local_trigger_step == 1:
             self.actor_rollout_wg.save_model_to_cpu(1)
             old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
@@ -966,6 +1033,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         timing = {}
         gpu_publication = self.config.actor_rollout_ref.rollout.weight_publication.get("transport", "ray") == "nccl_gpu"
         with marked_timer("timing_s/weight_snapshot_export", timing):
+            export_start = time.time()
             if gpu_publication:
                 await publisher.begin_gpu_snapshot.remote(self.current_param_version)
                 refs = self.actor_rollout_wg.export_gpu_snapshot(
@@ -1004,6 +1072,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             )
             if snapshot.version != self.current_param_version:
                 raise RuntimeError("Snapshot export returned the wrong parameter version")
+        record("snapshot_ready", version=self.current_param_version, wall_start=export_start)
         with marked_timer("timing_s/weight_publication_admission", timing):
             await publisher.publish.remote(snapshot)
         self._last_published_version = self.current_param_version

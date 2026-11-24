@@ -13,6 +13,7 @@
 # limitations under the License.
 import inspect
 import logging
+import json
 import os
 import socket
 from copy import deepcopy
@@ -152,6 +153,12 @@ class RayResourcePool(ResourcePool):
             bundle[device_name] = 1
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
+            node = json.loads(os.getenv("VERL_RAY_RESOURCE_POOL_NODES", "{}")).get(self.name_prefix)
+            if node is not None:
+                resource = f"node:{node}"
+                if resource not in ray.cluster_resources():
+                    raise ValueError(f"resource pool {self.name_prefix} requests unavailable node {node}")
+                bundle[resource] = 0.001
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
         lifetime = "detached" if self.detached else None

@@ -32,7 +32,12 @@ class WeightPublicationScheduler:
         self.on_commit = on_commit
         self._joint_config = dict(joint_scheduling_config or {})
         self._joint_enabled = bool(self._joint_config.get("enabled", False))
-        self._poll_interval_s = self._joint_config.get("poll_interval_s", 0.1)
+        self._laminar_enabled = self._joint_config.get("policy") == "laminar"
+        self._poll_interval_s = (
+            self._joint_config.get("laminar_poll_interval_s", 5.0)
+            if self._laminar_enabled
+            else self._joint_config.get("poll_interval_s", 0.1)
+        )
         if self._joint_enabled and (
             type(self._poll_interval_s) not in (int, float)
             or not math.isfinite(self._poll_interval_s)
@@ -270,13 +275,20 @@ class WeightPublicationScheduler:
         return version if type(version) is int else -1
 
     async def _transfer(self, snapshot, rank, recovery=False):
+        from time import time
+
+        from verl.experimental.fully_async_policy.rollout_metrics import record
+
         self._active = snapshot
         self._active_rank = rank
         self._active_phase = "replica_update"
         await self._notify()
         try:
+            install_start = time()
             result = await self.manager.update_replica_from_snapshot(snapshot, rank, recovery=recovery)
             entry = result["replicas"][rank]
+            if entry["status"] == "updated":
+                record("replica_install", rank=rank, version=snapshot.version, wall_start=install_start)
             if entry["status"] == "updated" and snapshot.version > self._committed_version:
                 if self.on_commit is not None:
                     self._active_phase = "commit_callback"
@@ -350,7 +362,13 @@ class WeightPublicationScheduler:
                 )
                 if candidates:
                     if self._joint_enabled:
-                        decision = await self.manager.load_balancer.select_replica_for_update.remote(snapshot.version)
+                        router = self.manager.load_balancer
+                        select = (
+                            router.select_laminar_replica_for_update
+                            if self._laminar_enabled
+                            else router.select_replica_for_update
+                        )
+                        decision = await select.remote(snapshot.version)
                         self._last_scheduling_decision = decision
                         if snapshot is not self._latest:
                             snapshot = None

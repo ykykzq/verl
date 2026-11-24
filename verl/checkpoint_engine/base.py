@@ -381,11 +381,34 @@ class CheckpointEngineWorker(Worker):
         if self.rollout_config.weight_publication.transport != "nccl_gpu":
             raise ValueError("GPU snapshot RPC requires nccl_gpu publication")
         if not hasattr(self, "_gpu_snapshot_worker"):
+            if getattr(self.rollout_config.weight_publication.gpu_snapshot, "pipeline_depth", 0):
+                from verl.checkpoint_engine.gpu_snapshot_pipeline import PipelineSnapshotWorker
+
+                GPUSnapshotWorker = PipelineSnapshotWorker
+            elif getattr(self.rollout_config.weight_publication.gpu_snapshot, "bucket_bytes", 0):
+                from verl.checkpoint_engine.gpu_snapshot_bucket import BucketSnapshotWorker
+
+                GPUSnapshotWorker = BucketSnapshotWorker
             self._gpu_snapshot_worker = GPUSnapshotWorker(
                 self.server_adapter, self.rollout_config.weight_publication.gpu_snapshot
             )
         if method.startswith("_") or method not in {
+            "node_id",
+            "initialize_input",
+            "receive_pipeline_input",
+            "convert_pipeline_bucket",
+            "store_pipeline_chunks",
+            "send_pipeline_outputs",
+            "release_pipeline_outputs",
+            "initialize_fetch",
+            "convert_bucket",
+            "store_chunks",
+            "send_outputs",
+            "send_chunks",
+            "receive_chunks",
             "describe",
+            "prepare_conversion_plan",
+            "export_conversion_plan",
             "unique_id",
             "initialize",
             "close",

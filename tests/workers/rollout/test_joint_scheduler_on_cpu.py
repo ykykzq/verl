@@ -80,17 +80,19 @@ async def plan(r, request, required=False):
     )
 
 
-def test_publication_closes_new_admissions_but_not_checkpoint_continuations():
+def test_publication_keeps_admissions_on_latest_installed_replica():
     r, _ = router()
     assign(r, "old", "a")
     r.prepare_weight_update(1)
     assert r.acquire_server("old")[0] == "a"
     r.register_trajectory("new", 16, 48)
-    with pytest.raises(RuntimeError, match="No available servers"):
-        r.acquire_server("new")
+    assert r.acquire_server("new")[0] == "b"
+    r.release_server("b")
+    r.finish_trajectory("new")
     r.begin_replica_update("b", 1)
     r.commit_replica_update("b", 1, metadata(1))
-    assert r.acquire_server("new")[0] == "b"
+    r.register_trajectory("fresh", 16, 48)
+    assert r.acquire_server("fresh")[0] == "b"
 
 
 def test_checkpoint_gaps_still_consume_capacity_and_cannot_be_evicted_by_lru():

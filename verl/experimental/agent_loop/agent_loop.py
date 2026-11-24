@@ -668,7 +668,30 @@ class AgentLoopWorker:
                     self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        outputs = await asyncio.gather(*tasks)
+        group = asyncio.gather(*tasks)
+        try:
+            outputs = await asyncio.shield(group)
+        except BaseException:
+            # Explicitly await every child cleanup before Ray reports completion.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            cleanup = asyncio.gather(*tasks, return_exceptions=True)
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    pass
+            errors = [
+                r
+                for r in cleanup.result()
+                if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError)
+            ]
+            if group.done() and not group.cancelled():
+                group.exception()
+            if errors:
+                raise RuntimeError("agent-loop backend cleanup failed") from errors[0]
+            raise
 
         output = self._postprocess(
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)

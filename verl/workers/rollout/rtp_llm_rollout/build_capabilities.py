@@ -13,6 +13,25 @@
 from collections.abc import Mapping
 
 
+def require_runtime_build_features(*features: str) -> None:
+    """Prove opt-in native behavior before model allocation or profiling."""
+    if not features:
+        return
+    try:
+        from rtp_llm import ops
+
+        capabilities = ops.get_build_capabilities()
+    except Exception as exc:
+        raise RuntimeError("Cannot verify RTP runtime features; install the matching native wheel.") from exc
+    missing = [
+        name
+        for name in features
+        if not isinstance(capabilities, Mapping) or type(capabilities.get(name)) is not int or capabilities[name] != 1
+    ]
+    if missing:
+        raise RuntimeError(f"RTP native wheel lacks verified runtime features: {missing}; rebuild and install it.")
+
+
 def require_remote_cache_build() -> None:
     """Fail closed when the loaded engine cannot prove KVCM build support."""
     rebuild = (
@@ -51,4 +70,22 @@ def require_remote_cache_build() -> None:
         raise RuntimeError(
             "remote_prefix migration requires native prefix write status API version 1; "
             f"the loaded wheel reports {prefix_status!r}. {rebuild}"
+        )
+
+
+def require_selected_checkpoint_build() -> None:
+    """Verify the native selected-stream API before loading model weights."""
+    try:
+        from rtp_llm import ops
+
+        ops.ensure_engine_ops_loaded()
+        supported = callable(getattr(ops.RtpLLMOp, "request_kv_checkpoint", None))
+    except Exception as exc:
+        raise RuntimeError(
+            "Cannot verify native request_kv_checkpoint support; rebuild and install the RTP wheel."
+        ) from exc
+    if not supported:
+        raise RuntimeError(
+            "on_demand remote-prefix migration requires native request_kv_checkpoint; "
+            "rebuild and install the RTP wheel."
         )

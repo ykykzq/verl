@@ -25,6 +25,13 @@ from pprint import pprint
 from typing import Any, Callable, Optional
 
 import ray
+
+from verl.workers.rollout.vllm_rollout.native_libraries import load_nixl_dependencies
+
+# vLLM imports optional NIXL expert-parallel native modules before its plugins.
+# Keep OpenSSL local to the dependency group, as in the validated KV connector.
+load_nixl_dependencies()
+
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
@@ -42,6 +49,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 
 from verl.plugin.platform import get_platform
+from verl.workers.rollout.vllm_rollout.joint_server import JointVLLMServerMixin
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -87,7 +95,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
-class vLLMHttpServer:
+class vLLMHttpServer(JointVLLMServerMixin):
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
     vllm serve --tensor-parallel-size=8 ...
@@ -177,6 +185,7 @@ class vLLMHttpServer:
         self._resume_event.set()
         # Set by abort_all_requests(reject_request=True) when no resume is coming soon.
         self._rejecting = False
+        self._joint_initialize()
 
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
@@ -256,12 +265,24 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
-        await self.engine.collective_rpc(
+        call = self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
             kwargs=kwargs,
         )
+        if method != "update_weights_from_ipc" or not self._joint_enabled:
+            return await call
+        task = asyncio.create_task(call)
+        pending = getattr(self, "_joint_weight_install_tasks", None)
+        if pending is None:
+            self._joint_weight_install_tasks = pending = set()
+        pending.add(task)
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                pending.discard(task)
 
     async def set_pd_peer(
         self,
@@ -351,6 +372,8 @@ class vLLMHttpServer:
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
+
+        self._joint_engine_options(args)
 
         # update profiler args, only on the replica that will actually be profiled: configuring
         # the engine profiler everywhere makes every replica log that profiling is enabled while
@@ -558,7 +581,7 @@ class vLLMHttpServer:
         self.task = asyncio.create_task(asyncio.to_thread(run_headless_wrapper))
         self.task.add_done_callback(on_run_headless_done)
 
-    async def generate(
+    async def _generate_impl(
         self,
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
@@ -662,6 +685,8 @@ class vLLMHttpServer:
             multi_modal_data["audio"] = audio_data
 
         prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        if self._joint_enabled:
+            prompt_kwargs["cache_salt"] = f"{self._joint_run_id}:{self._joint_version()}"
         if mm_processor_kwargs:
             prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
         try:
@@ -704,7 +729,10 @@ class vLLMHttpServer:
                     if not admitted:
                         admitted = True
                         self._admitting -= 1
-                    final_res = output
+                    self._joint_on_output(request_id, output)
+                    # Keep completed partial tokens when a terminal abort has no outputs.
+                    if not self._joint_enabled or output.outputs or final_res is None:
+                        final_res = output
             finally:
                 if not admitted:
                     self._admitting -= 1
@@ -892,7 +920,7 @@ class vLLMHttpServer:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
-        if self.node_rank != 0 or not self.config.free_cache_engine:
+        if self.node_rank != 0 or not self.config.free_cache_engine or not self.config.enable_sleep_mode:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -916,7 +944,7 @@ class vLLMHttpServer:
     async def release_kv_cache(self):
         """Free the kv_cache pool for the duration of a weight sync."""
         # TODO: use the real release_kv_cache() method after vllm supports it (vllm#44890/46438)
-        if self.node_rank != 0 or not self.config.free_cache_engine:
+        if self.node_rank != 0 or not self.config.free_cache_engine or not self.config.enable_sleep_mode:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
@@ -925,7 +953,7 @@ class vLLMHttpServer:
 
     async def resume_kv_cache(self):
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
-        if self.node_rank != 0 or not self.config.free_cache_engine:
+        if self.node_rank != 0 or not self.config.free_cache_engine or not self.config.enable_sleep_mode:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
@@ -1087,6 +1115,13 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return {"aborted_count": 0, "request_ids": []}
 
+        if self._joint_enabled:
+            if abort_only:
+                for state in self._joint_active.values():
+                    state["aborted"] = True
+            else:
+                await self._joint_before_pause()
+
         if abort_only:
             processor = self.engine.output_processor
             # request_states holds in-flight requests. For sampling n>1 those are
@@ -1122,7 +1157,7 @@ class vLLMHttpServer:
             # Snapshot request IDs before pausing for reporting
             request_ids = list(self.engine.output_processor.request_states.keys())
 
-            # pause_generation with wait_for_inflight_requests=False will:
+            # vLLM 0.32 pause_generation(mode="abort") will:
             # 1. Set engine to paused state (new requests are accepted but not scheduled)
             # 2. Abort all in-flight requests
             # 3. Wait for requests to drain
@@ -1132,10 +1167,11 @@ class vLLMHttpServer:
             #    MooncakeStoreConnector) is invalidated along with the
             #    local prefix cache — RL-correct hard-reset at every
             #    weight update boundary, no extra kwargs needed.
-            await self.engine.pause_generation(
-                wait_for_inflight_requests=False,
-                clear_cache=reset_prefix_cache,
-            )
+            pause_generation = self.engine.pause_generation
+            if "mode" in inspect.signature(pause_generation).parameters:
+                await pause_generation(mode="abort", clear_cache=reset_prefix_cache)
+            else:
+                await pause_generation(wait_for_inflight_requests=False, clear_cache=reset_prefix_cache)
 
             logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
@@ -1186,7 +1222,7 @@ class vLLMHttpServer:
         self._admitting += 1
         return None
 
-    async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+    async def _abort_request_impl(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort a specific generation request.
 
         Args:

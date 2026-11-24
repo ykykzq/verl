@@ -70,6 +70,62 @@ class DirectedNCCL:
             self.comm = None
             self.stream = None
 
+    async def broadcast(self, tensor, root=0):
+        """Wait for device completion, retaining payload owners on any failure."""
+        if tensor.device.type != "cuda" or not tensor.is_contiguous():
+            raise ValueError("NCCL broadcast requires contiguous CUDA storage")
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))
+
+        def broadcast(tensor, ready):
+            from cupy.cuda import nccl
+
+            self.stream.wait_event(ready)
+            self.comm.broadcast(
+                tensor.data_ptr(), tensor.data_ptr(), tensor.nbytes, nccl.NCCL_UINT8, root, self.stream.cuda_stream
+            )
+            completed = torch.cuda.Event()
+            completed.record(self.stream)
+            deadline = time.monotonic() + self.timeout_s
+            while not completed.query():
+                self.comm.check_async_error()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("NCCL broadcast did not complete; retain owners and restart")
+                time.sleep(0.002)
+
+        await self._native(broadcast, tensor, ready)
+
+    async def transfer_many(self, operations):
+        """Enqueue a matched batch; wait once and retain every owner on failure."""
+        if not operations:
+            return
+        if any(t.device.type != "cuda" or not t.is_contiguous() for t, _, _ in operations):
+            raise ValueError("NCCL snapshot payloads must be contiguous CUDA storage")
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))
+
+        def transfer(operations, ready):
+            from cupy.cuda import nccl
+
+            self.stream.wait_event(ready)
+            nccl.groupStart()
+            try:
+                for tensor, peer, receive in operations:
+                    operation = self.comm.recv if receive else self.comm.send
+                    operation(tensor.data_ptr(), tensor.nbytes, nccl.NCCL_UINT8, peer, self.stream.cuda_stream)
+            finally:
+                nccl.groupEnd()
+            completed = torch.cuda.Event()
+            completed.record(self.stream)
+            deadline = time.monotonic() + self.timeout_s
+            while not completed.query():
+                self.comm.check_async_error()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("NCCL bucket transfer did not complete; retain owners and restart")
+                time.sleep(0.002)
+
+        await self._native(transfer, operations, ready)
+
     async def transfer(self, tensor, peer, receive=False):
         if tensor.device.type != "cuda" or not tensor.is_contiguous():
             raise ValueError("NCCL snapshot payload must be contiguous CUDA storage")
@@ -138,6 +194,12 @@ class GPUSnapshotWorker:
         if self.transport.failed:
             raise RuntimeError(self.transport.failed)
         self.slots[slot] = {}
+
+    async def prepare_conversion_plan(self, source_layout, transport):
+        return await self.server.prepare_conversion_plan.remote(source_layout, transport)
+
+    async def export_conversion_plan(self):
+        return await self.server.export_conversion_plan.remote()
 
     async def begin_conversion(self, version):
         return await self.server.begin_gpu_snapshot.remote(version, self.config.max_conversion_bytes)
@@ -235,7 +297,11 @@ class GPUSnapshotWorker:
 
         iterator = weights()
         try:
-            await self.adapter.update_weights(iterator, global_steps=snapshot.version, wire_format="runtime_tensors")
+            await self.adapter.update_weights(
+                iterator,
+                global_steps=snapshot.version,
+                wire_format=getattr(self.adapter, "snapshot_wire_format", "runtime_tensors"),
+            )
         except BaseException as error:
             # An IPC consumer may still read its source after a remote failure or cancellation.
             self.transport.failed = f"runtime installation failed: {type(error).__name__}: {error}"

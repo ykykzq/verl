@@ -8,6 +8,13 @@ defaults:
 
 async_training:
 
+  # Optional global batch in trajectories. Must equal minibatch groups * require_batches * rollout.n.
+  global_batch_size: null
+
+  # Disable per-update sample-budget gates; keep bounded result backpressure.
+  sample_budget_enabled: True
+  completed_queue_size: 128
+
   # Maximum samples staleness threshold
   staleness_threshold: 0.1
 

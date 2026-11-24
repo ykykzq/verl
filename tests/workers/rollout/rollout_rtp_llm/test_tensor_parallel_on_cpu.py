@@ -373,6 +373,8 @@ class TestTPLaunch(unittest.IsolatedAsyncioTestCase):
 
                 handle = SimpleNamespace(
                     configure_tp_peers=remote(AsyncMock()),
+                    plan_memory_before_launch=remote(AsyncMock(return_value={"tp_rank": rank})),
+                    freeze_replica_capacity=remote(AsyncMock()),
                     launch_server=remote(launch),
                     start_tp_health_monitor=remote(AsyncMock()),
                     get_server_address=remote(AsyncMock(return_value=("10.0.0.1", 1234))),
@@ -403,6 +405,8 @@ class TestTPLaunch(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["cuda_visible_devices"], "4,5,6,7")
             self.assertEqual(kwargs["workers"], [replica.workers[rank]])
             handles[rank].configure_tp_peers.remote.assert_awaited_once_with(handles[:rank] + handles[rank + 1 :])
+            handles[rank].plan_memory_before_launch.remote.assert_awaited_once_with()
+            handles[rank].freeze_replica_capacity.remote.assert_awaited_once_with([{"tp_rank": i} for i in range(4)])
 
     async def test_partial_boot_failure_terminates_whole_replica(self):
         replica, _, handles = self.make_replica(failure=True)

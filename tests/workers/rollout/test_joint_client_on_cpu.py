@@ -252,7 +252,7 @@ async def test_failed_backend_abort_preserves_reservation(monkeypatch):
 
     registry.abort_trajectory = Remote(abort)
     monkeypatch.setattr(llm_server.LLMServerClient, "generate", generate)
-    with pytest.raises(RuntimeError, match="generation failure"):
+    with pytest.raises(RuntimeError, match="refusing unsafe cleanup"):
         await FullyAsyncLLMServerClient(config(), registry).generate("t", prompt_ids=[1], sampling_params={})
     assert registry.active == {"t": (1, 8)}
     assert registry.events == [("register", "t", 1, 8)]
@@ -268,7 +268,7 @@ async def test_uncertain_abort_response_preserves_reservation(monkeypatch, resul
 
     registry.abort_trajectory = Remote(lambda request_id: result)
     monkeypatch.setattr(llm_server.LLMServerClient, "generate", generate)
-    with pytest.raises(RuntimeError, match="generation failure"):
+    with pytest.raises(RuntimeError, match="refusing unsafe cleanup"):
         await FullyAsyncLLMServerClient(config(), registry).generate("t", prompt_ids=[1], sampling_params={})
     assert registry.active == {"t": (1, 8)}
     assert registry.events == [("register", "t", 1, 8)]
@@ -294,7 +294,7 @@ async def test_unresponsive_abort_has_finite_cleanup_and_retains_capacity(monkey
     task = asyncio.create_task(client.generate("t", prompt_ids=[1], sampling_params={}))
     await decoding.wait()
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(RuntimeError, match="refusing unsafe cleanup"):
         await asyncio.wait_for(task, timeout=1)
     assert registry.active == {"t": (1, 8)}
     assert registry.events == [("register", "t", 1, 8)]

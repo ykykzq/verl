@@ -92,6 +92,27 @@ class TestRemoteCacheBuildPreflight(unittest.TestCase):
                 )
         self.server._build_config.assert_not_called()
 
+    def test_ondemand_rejects_old_native_wheel_before_loading_model(self):
+        self.server.config.trajectory_migration.checkpoint_mode = "on_demand"
+        ops = SimpleNamespace(
+            get_build_capabilities=lambda: {"remote_kv_cache": True, "remote_prefix_write_status": 1},
+            ensure_engine_ops_loaded=lambda: None,
+            RtpLLMOp=SimpleNamespace(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "request_kv_checkpoint.*rebuild"):
+            self.boot_with_ops(ops)
+        self.server._build_config.assert_not_called()
+
+    def test_ondemand_native_api_proceeds_to_configuration(self):
+        self.server.config.trajectory_migration.checkpoint_mode = "on_demand"
+        ops = SimpleNamespace(
+            get_build_capabilities=lambda: {"remote_kv_cache": True, "remote_prefix_write_status": 1},
+            ensure_engine_ops_loaded=lambda: None,
+            RtpLLMOp=SimpleNamespace(request_kv_checkpoint=lambda: None),
+        )
+        with self.assertRaises(_ReachedConfigBuild):
+            self.boot_with_ops(ops)
+
     def test_disabled_migration_does_not_require_the_new_api(self):
         self.server.config.trajectory_migration.enabled = False
         with self.assertRaises(_ReachedConfigBuild):

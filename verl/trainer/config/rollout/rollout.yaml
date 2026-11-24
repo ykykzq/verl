@@ -103,6 +103,17 @@ logprobs_mode: processed_logprobs
 # scheduling policy for vllm rollout
 scheduling_policy: fcfs
 
+# Router-level trajectory RPC limit, independent of native decode capacity.
+max_concurrent_requests_per_replica: null
+
+# RTP-LLM native scheduling and remote-prefix controls.
+rtp_scheduler_mode: fifo
+rtp_decode_prefill_ratio: "1"
+rtp_separate_kv_admission: False
+rtp_remote_cache_lookup_policy: legacy
+rtp_remote_cache_write_policy: legacy
+rtp_reprefill_profile_dir: null
+
 # Which loader to use for rollout model weights: dummy, hf, megatron, etc.
 # safetensors (for huge model, and set use_shm=True); dummy: randomly init model weight
 load_format: dummy
@@ -211,8 +222,17 @@ weight_publication:
     max_conversion_bytes: 8589934592
     max_tensor_bytes: 4294967296
     chunk_bytes: 268435456
+    # Zero keeps per-tensor export; positive values enable aligned tensor buckets.
+    bucket_bytes: 0
+    # 2 enables two input/output slots; requires 2 * bucket_bytes <= max_tensor_bytes.
+    pipeline_depth: 0
     operation_timeout_s: 120.0
     reserve_timeout_s: 600.0
+    conversion_location: rollout
+    trainer_tp_ranks: []
+    cache_conversion_plan: false
+    memory_planning: legacy
+    converter_replica_rank: null
   relay:
     _target_: verl.workers.config.WeightRelayConfig
     device_name: ""
@@ -222,17 +242,27 @@ weight_publication:
   joint_scheduling:
     _target_: verl.workers.config.JointSchedulingConfig
     enabled: False
+    policy: joint
+    laminar_poll_interval_s: 5.0
+    laminar_source_max_kv_usage: 0.5
+    laminar_destination_max_kv_usage: 0.95
     # Required per-replica conservative capacity and profiled decode roofline.
     kv_capacity_tokens: 0
     max_batch_size: 0
     kv_block_size_tokens: 16
+    kv_admission_mode: maximum
+    kv_growth_tokens: 256
     poll_interval_s: 0.1
     update_cooldown_s: 5.0
     min_decode_window_s: 2.0
     min_decode_tokens: 64
-    max_defer_s: 30.0
+    # null disables the maximum update delay.
+    max_defer_s: null
+    # Full queues evict the oldest unconsumed complete group.
+    completed_queue_size: 128
     evacuation_timeout_s: 5.0
     sparse_request_threshold: 1
+    staleness_mode: version_kl
     staleness_version_gap: 2
     tail_tokens: 32
     # Sampled tail KL proxy, not full-vocabulary categorical KL.
@@ -250,12 +280,15 @@ trajectory_migration:
   _target_: verl.workers.config.TrajectoryMigrationConfig
 
   enabled: False
+  scheduling_enabled: True
   # Transfer tokens and force full prefill when source and target versions differ.
   allow_cross_version_recompute: False
 
   # End the current decode request normally after this many tokens, then
   # reconsider placement. Normal completion is required to publish its KV prefix.
   checkpoint_tokens: 64
+  checkpoint_mode: periodic
+  progress_poll_interval_s: 1.0
 
   # Pluggable trajectory x replica scoring policy.
   scorer_class: verl.workers.rollout.trajectory_scheduler.LoadAwareTrajectoryReplicaScorer

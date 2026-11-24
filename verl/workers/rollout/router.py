@@ -14,6 +14,7 @@
 
 import asyncio
 import logging
+import math
 import os
 import random
 from copy import deepcopy
@@ -26,6 +27,7 @@ from omegaconf import OmegaConf
 
 from verl.utils.import_utils import load_class_from_fqn, resolve_config_path
 from verl.workers.rollout.joint_scheduler import JointReplicaScheduler
+from verl.workers.rollout.laminar_scheduler import LaminarReplicaScheduler
 from verl.workers.rollout.trajectory_scheduler import ReplicaSnapshot, TrajectoryScheduler
 
 logger = logging.getLogger(__file__)
@@ -190,15 +192,17 @@ class GlobalRequestLoadBalancer:
         self._metadata_epochs = {sid: object() for sid in servers}
         self._migration_config = dict(trajectory_migration_config or {})
         self._trajectory_scheduler = (
-            TrajectoryScheduler(self._migration_config) if self._migration_config.get("enabled", False) else None
+            TrajectoryScheduler(self._migration_config)
+            if self._migration_config.get("enabled", False) and self._migration_config.get("scheduling_enabled", True)
+            else None
         )
         self._pending_migrations: dict[str, dict[str, Any]] = {}
         self._migration_reservations: dict[str, int] = {sid: 0 for sid in servers}
-        self._joint = (
-            JointReplicaScheduler(joint_scheduling_config)
-            if joint_scheduling_config and joint_scheduling_config.get("enabled", False)
-            else None
-        )
+        self._joint = None
+        if joint_scheduling_config and joint_scheduling_config.get("enabled", False):
+            policy = joint_scheduling_config.get("policy", "joint")
+            scheduler = LaminarReplicaScheduler if policy == "laminar" else JointReplicaScheduler
+            self._joint = scheduler(joint_scheduling_config)
         if self._joint is not None and (
             self._trajectory_scheduler is None or not self._trajectory_scheduler.allow_cross_version_recompute
         ):
@@ -226,7 +230,7 @@ class GlobalRequestLoadBalancer:
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
             # Check if server is still in the active pool
-            if self._is_serving(server_id):
+            if self._is_serving(server_id) and self._has_request_capacity(server_id):
                 self._inflight_requests[server_id] += 1
                 return server_id, self._servers[server_id]
             # Server was removed, clear stale cache entry and re-select
@@ -236,6 +240,9 @@ class GlobalRequestLoadBalancer:
         serving = {sid: count for sid, count in self._inflight_requests.items() if self._is_serving(sid)}
         if not serving:
             raise RuntimeError("No available servers in load balancer")
+        serving = {sid: count for sid, count in serving.items() if self._has_request_capacity(sid)}
+        if not serving:
+            raise RuntimeError("All rollout replicas at request capacity")
 
         if self._full_determinism:
             # Hash only the serving pool; isolation takes precedence over affinity.
@@ -248,6 +255,10 @@ class GlobalRequestLoadBalancer:
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
         return server_id, self._servers[server_id]
+
+    def _has_request_capacity(self, server_id: str) -> bool:
+        limit = self._server_metadata[server_id].get("max_concurrent_requests")
+        return limit is None or self._inflight_requests[server_id] < limit
 
     def release_server(self, server_id: str, request_id: str | None = None) -> None:
         """Release a server after a request completes.
@@ -294,7 +305,7 @@ class GlobalRequestLoadBalancer:
         if self._joint is not None:
             self._joint.finish(request_id)
         self._request_id_to_server.pop(request_id, None)
-        if self._joint is not None:
+        if self._joint is not None and self._retired_server_metadata:
             live_sources = {r.server_id for r in self._joint.trajectories.values()}
             self._retired_server_metadata = {
                 s: m for s, m in self._retired_server_metadata.items() if s in live_sources
@@ -311,6 +322,33 @@ class GlobalRequestLoadBalancer:
         if self._joint is None:
             raise RuntimeError("joint scheduling is disabled")
         return self._joint.select_update(version, self._replica_states, self._server_metadata, self._pending_migrations)
+
+    async def select_laminar_replica_for_update(self, version: int) -> dict:
+        if not isinstance(self._joint, LaminarReplicaScheduler):
+            raise RuntimeError("Laminar Repack is disabled")
+        states = self._replica_states
+        stale = {
+            sid: (self._servers[sid], self._metadata_epochs[sid])
+            for sid, state in states.items()
+            if self._is_serving(sid) and not state.get("pin") and self._joint.version(state["weight_version"]) < version
+        }
+        snapshots = await asyncio.gather(*(server.get_laminar_kv_usage.remote() for server, _ in stale.values()))
+        if any(self._metadata_epochs.get(sid) is not epoch for sid, (_, epoch) in stale.items()):
+            return {"server_id": None, "reason": "Laminar runtime changed during KV snapshot"}
+        eligible = {sid: states[sid] for sid in stale if self._is_serving(sid)}
+        utilization = {}
+        for sid, value in zip(stale, snapshots, strict=True):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0 <= value <= 1
+            ):
+                raise ValueError(f"invalid Laminar KV utilization from replica {sid}: {value!r}")
+            utilization[sid] = value
+        return self._joint.select_repack(
+            version, eligible, self._server_metadata, self._pending_migrations, self._inflight_requests, utilization
+        )
 
     def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
         """Atomically add multiple servers to the load balancer pool.
@@ -475,8 +513,9 @@ class GlobalRequestLoadBalancer:
         source_server_id: str,
         trajectory: dict[str, Any],
         source_metadata: dict[str, Any] | None = None,
+        preview_only: bool = False,
     ) -> dict[str, Any]:
-        """Score all trajectory x replica pairs and reserve an allowed target."""
+        """Score pairs; preview does not reserve capacity or change routes."""
         if self._trajectory_scheduler is None:
             return {"migrate": False, "reason": "trajectory migration is disabled"}
         if request_id in self._pending_migrations:
@@ -549,6 +588,12 @@ class GlobalRequestLoadBalancer:
         )
         if target is None:
             return {"migrate": False, **diagnostics}
+        if preview_only:
+            return {
+                "migrate": target.server_id != source_server_id,
+                "target_server_id": target.server_id,
+                **diagnostics,
+            }
         if self._joint is not None:
             if target.server_id != target_id:
                 return {"migrate": False, "reason": "placement changed during compatibility evaluation"}
@@ -569,6 +614,7 @@ class GlobalRequestLoadBalancer:
                 source_version=source_snapshot_metadata.get("weight_version"),
                 target_version=snapshot_metadata[target.server_id].get("weight_version"),
                 resume_source=diagnostics.get("resume_source", False),
+                mode=diagnostics["mode"],
             )
         self._migration_reservations[target.server_id] += 1
         return {
@@ -595,6 +641,14 @@ class GlobalRequestLoadBalancer:
                 raise RuntimeError("migration target weight version changed")
             self._joint.commit_migration(request_id, target_server_id, pending["resume_source"])
         self._request_id_to_server[request_id] = target_server_id
+        if self._joint is not None and not pending["resume_source"]:
+            from verl.experimental.fully_async_policy.rollout_metrics import record
+
+            record(
+                "migration_commit",
+                target_rank=self._server_metadata[target_server_id].get("replica_rank"),
+                mode=pending["mode"],
+            )
         self._drop_pending_migration(request_id)
         return {"migrated": True, "server_id": target_server_id}
 

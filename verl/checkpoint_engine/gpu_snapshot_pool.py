@@ -39,6 +39,7 @@ class GPUSnapshotPool:
         if len(sizes) != 1:
             raise ValueError("nccl_gpu requires equal TP sizes across rollout replicas")
         self.tp_size = sizes.pop()
+        self.converter_workers = list(range(self.tp_size))
         self.workers = [worker for replica in self.replicas for worker in replica.workers]
         self.config = config
         self.slots = SnapshotSlots(config.slots)
@@ -144,7 +145,7 @@ class GPUSnapshotPool:
             self.metrics["export_version"] = version
             try:
                 await settle([self.call(i, "reserve", slot) for i in range(len(self.workers))])
-                await settle([self.call(i, "begin_conversion", version) for i in range(self.tp_size)])
+                await settle([self.call(i, "begin_conversion", version) for i in self.converter_workers])
             except BaseException as error:
                 self.fatal_error = f"snapshot begin failed: {error}"
                 raise
@@ -255,7 +256,7 @@ class GPUSnapshotPool:
                 expected = {(i, name) for i, layout in enumerate(self.plan.tensors) for name, _, _ in layout}
                 if self.completed != expected:
                     raise ValueError(f"GPU snapshot is incomplete: {len(expected - self.completed)} missing tensors")
-                await settle([self.call(i, "finish_conversion") for i in range(self.tp_size)])
+                await settle([self.call(i, "finish_conversion") for i in self.converter_workers])
                 snapshot = self.staging
                 self.slots.commit(version)
                 self.staging = None
@@ -338,6 +339,10 @@ class GPUSnapshotPool:
                 self.fatal_error = f"GPU snapshot fetch failed: {error}"
                 raise
 
+    async def _drain_ingestion(self):
+        if self.ingest_task is not None:
+            await self.finish_input()
+
     async def quiesce(self):
         """Stop admission and settle owners without entering collective communicator teardown."""
         async with self.shutdown_lock:
@@ -348,12 +353,11 @@ class GPUSnapshotPool:
             try:
                 async with self.reservation_lock:
                     await settle(list(self.install_tasks))
-                    if self.ingest_task is not None:
-                        await self.finish_input()
+                    await self._drain_ingestion()
                     async with self.io_lock:
                         self.healthy()
                         if self.staging is not None:
-                            await settle([self.call(i, "finish_conversion") for i in range(self.tp_size)])
+                            await settle([self.call(i, "finish_conversion") for i in self.converter_workers])
                             self.slots.abort(self.staging.version)
                             self.staging = None
                         self.quiesced = True

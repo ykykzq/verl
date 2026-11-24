@@ -63,6 +63,46 @@ uncertain transfers retain their owners and reject reuse until the affected
 actors restart. Include healthy close/reconfiguration in hardware acceptance;
 CPU lifecycle tests cannot establish native communicator teardown behavior.
 
+## Bucket Pipeline Acceptance
+
+For `gpu_snapshot.bucket_bytes > 0` and `pipeline_depth=2`, also exercise the
+production input broadcast, separate distribution/fetch communicators and
+trainer-local converter selection. The existing synthetic tests above cover
+the original per-tensor transport/storage path; passing them alone does not
+validate the pipeline. On the intended topology, require:
+
+- Byte-exact snapshots across at least three versions, including installation
+  of a pinned older version during publication of the next one, slot reuse and
+  healthy communicator close.
+- A converter on the trainer's node when replica zero is remote. Record
+  `topology.converter_workers` and actor/worker physical node identities.
+- Input/output high-water counts bounded by two, plus a large single tensor
+  exceeding the target bucket size. Check peak memory and backpressure against
+  the aggregate working budget.
+- Failure/cancellation that retains owners until native work settles or the
+  affected actors restart. No acknowledgement may precede CUDA completion.
+- Real RTP conversion/install followed by RL with finite, nonzero parameter
+  updates. Synthetic TP slicing verifies transport, not the model converter.
+
+The supplied `qwen25-pipeline-20261109-handoff.zip` reports 16-GPU communication
+acceptance and Qwen2.5-32B-Instruct + DeepScaleR completing 10 updates and final
+evaluation with all replicas at v10. It reports mean export time 20.05 to
+8.12 seconds and training-step total 670.75 to 630.80 seconds, but total wall
+time including evaluation increased from 972.77 to 1093.38 seconds. The
+16-question evaluation score changed from 0.625 to 0.375. This single historical
+comparison is neither a full-run speedup nor evidence of learning equivalence.
+
+The local integration additionally fixes shutdown admission and partial input
+allocation failure handling. Its CPU tests cover those races, output ownership
+and mocked CUDA completion/cancellation; rerun hardware acceptance for the
+integrated revision. The integration regression run passed 250 CPU tests and
+12 subtests, with the real Ray driver process test excluded. Scoped Ruff,
+formatting and diff checks passed; this run did not rerun cluster validation.
+For quality comparison, first compare all runtime tensor
+hashes for fixed model weights across modes, then use multiple training seeds
+and an adequately sized evaluation set. Retain both the training-step and full
+wall-clock timings.
+
 ## Two-Node L20C Acceptance
 
 The original handoff used two eight-GPU L20C hosts, four trainer GPUs and three
